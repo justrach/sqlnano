@@ -35,6 +35,13 @@ pub const Keyword = enum {
     count,
     is,
     not,
+    like,
+    in,
+    between,
+    sum,
+    min,
+    max,
+    avg,
 };
 
 pub const Kind = enum {
@@ -56,6 +63,11 @@ pub const Kind = enum {
     ge,
     ne,
     dot,
+    plus,
+    minus,
+    slash,
+    percent,
+    concat,
 };
 
 pub const Token = struct {
@@ -132,9 +144,26 @@ pub const Tokenizer = struct {
                 }
                 return error.InvalidCharacter;
             },
+            '+' => return self.single(.plus, start),
+            '-' => {
+                // Line-comment `--` is stripped by skipTrivia; if we got here
+                // it's a real minus. Emit as its own token; unary negation
+                // is handled in the parser's primary.
+                return self.single(.minus, start);
+            },
+            '/' => return self.single(.slash, start),
+            '%' => return self.single(.percent, start),
+            '|' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '|') {
+                    self.pos += 1;
+                    return .{ .kind = .concat, .lexeme = self.input[start..self.pos], .start = start, .end = self.pos };
+                }
+                return error.InvalidCharacter;
+            },
             '\'' => return self.string(start),
             '"', '`', '[' => return self.quotedIdentifier(start),
-            '-', '0'...'9' => return self.integer(start),
+            '0'...'9' => return self.integer(start),
             else => {
                 if (isIdentifierStart(c)) return self.identifier(start);
                 return error.InvalidCharacter;
@@ -234,7 +263,6 @@ pub const Tokenizer = struct {
     }
 
     fn integer(self: *Tokenizer, start: usize) TokenError!Token {
-        if (self.input[self.pos] == '-') self.pos += 1;
         const digits_start = self.pos;
         while (self.pos < self.input.len and std.ascii.isDigit(self.input[self.pos])) self.pos += 1;
         if (self.pos == digits_start) return error.InvalidNumber;
@@ -304,6 +332,13 @@ pub fn keywordFor(text: []const u8) ?Keyword {
         .{ "COUNT", Keyword.count },
         .{ "IS", Keyword.is },
         .{ "NOT", Keyword.not },
+        .{ "LIKE", Keyword.like },
+        .{ "IN", Keyword.in },
+        .{ "BETWEEN", Keyword.between },
+        .{ "SUM", Keyword.sum },
+        .{ "MIN", Keyword.min },
+        .{ "MAX", Keyword.max },
+        .{ "AVG", Keyword.avg },
     }) |entry| {
         if (std.ascii.eqlIgnoreCase(text, entry[0])) return entry[1];
     }

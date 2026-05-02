@@ -51,8 +51,8 @@ pub const features = [_]Feature{
     .{
         .area = "Full SQL grammar",
         .status = .partial,
-        .evidence = "SELECT supports projections (*, col, t.col, t.*, AS aliases), COUNT(*), WHERE with AND/OR/=/!=/</<=/>/>=/<>/IS NULL/IS NOT NULL, INNER JOIN (with qualified names and table aliases, explicit or implicit via 'JOIN'), ORDER BY col [ASC|DESC], LIMIT N. INSERT/UPDATE/DELETE still only accept the tiny legacy forms. No DDL, no subqueries, no GROUP BY / HAVING, no aggregates beyond COUNT(*), no functions.",
-        .next = "SUM/MIN/MAX/AVG aggregates, GROUP BY, LEFT JOIN, subqueries, CTEs, UPDATE/DELETE with richer WHERE, CREATE TABLE / CREATE INDEX.",
+        .evidence = "SELECT supports: projections (*, col, t.col, t.*, expr, AS aliases); aggregates COUNT(*), COUNT(col), SUM, MIN, MAX, AVG (collapse-all only, no GROUP BY yet); WHERE with = != <> < <= > >= AND OR NOT, IS [NOT] NULL, LIKE / NOT LIKE (case-insensitive ASCII, %/_), IN / NOT IN (literal list), BETWEEN / NOT BETWEEN; arithmetic + - * / %, unary -, string concat ||; INNER JOIN with qualified names and aliases; ORDER BY col [ASC|DESC]; LIMIT N. INSERT/UPDATE/DELETE still only accept the tiny legacy forms. No DDL, no subqueries, no GROUP BY / HAVING, no LEFT JOIN, no CASE WHEN, no user functions.",
+        .next = "GROUP BY + HAVING, LEFT JOIN, DISTINCT, CASE WHEN, subqueries, CTEs, UPDATE/DELETE with richer WHERE, CREATE TABLE / CREATE INDEX, scalar functions (LOWER/UPPER/LENGTH/SUBSTR/COALESCE/...).",
     },
     .{
         .area = "Full query planner",

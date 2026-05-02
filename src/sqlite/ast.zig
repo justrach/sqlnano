@@ -37,8 +37,18 @@ pub const BinOp = enum {
     ge,
     and_,
     or_,
-    is_null,
-    is_not_null,
+    is_null, // unary
+    is_not_null, // unary
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    concat,
+    like,
+    not_like,
+    neg, // unary
+    not_, // unary
 };
 
 /// Boolean / comparison expression tree used by SELECT's WHERE and
@@ -53,8 +63,22 @@ pub const Expr = union(enum) {
         rhs: *Expr,
     },
     unary: struct {
-        op: BinOp, // only `is_null` / `is_not_null` are meaningful here
+        op: BinOp, // `is_null` / `is_not_null` / `neg` / `not_`
         operand: *Expr,
+    },
+    /// `value [NOT] IN (items...)`. The list is always literal-shaped
+    /// in practice but we accept arbitrary exprs for flexibility.
+    in_list: struct {
+        value: *Expr,
+        items: []*Expr,
+        negated: bool,
+    },
+    /// `value [NOT] BETWEEN low AND high` (inclusive on both ends).
+    between: struct {
+        value: *Expr,
+        low: *Expr,
+        high: *Expr,
+        negated: bool,
     },
 };
 
@@ -66,6 +90,16 @@ pub fn freeExpr(expr: *Expr, allocator: std.mem.Allocator) void {
             freeExpr(bin.rhs, allocator);
         },
         .unary => |u| freeExpr(u.operand, allocator),
+        .in_list => |il| {
+            freeExpr(il.value, allocator);
+            for (il.items) |it| freeExpr(it, allocator);
+            allocator.free(il.items);
+        },
+        .between => |bt| {
+            freeExpr(bt.value, allocator);
+            freeExpr(bt.low, allocator);
+            freeExpr(bt.high, allocator);
+        },
     }
     allocator.destroy(expr);
 }
@@ -84,6 +118,29 @@ pub const Projection = union(enum) {
     count_star: struct {
         alias: ?[]const u8 = null,
     },
+    /// `SUM/MIN/MAX/AVG/COUNT ( col_or_star )`. The current executor
+    /// only supports column arguments (and `*` for COUNT, which lives
+    /// in `count_star`). Expressions as aggregate args are a future
+    /// extension.
+    aggregate: struct {
+        func: AggregateFunc,
+        column: ColumnRef,
+        alias: ?[]const u8 = null,
+    },
+    /// A general expression projection like `a || ' ' || b` or
+    /// `price * 1.1`. Evaluated per row.
+    expr: struct {
+        expr: *Expr,
+        alias: ?[]const u8 = null,
+    },
+};
+
+pub const AggregateFunc = enum {
+    count, // COUNT(col) — non-null count, distinct from COUNT(*)
+    sum,
+    min,
+    max,
+    avg,
 };
 
 pub const JoinKind = enum { inner };
@@ -122,6 +179,10 @@ pub const SelectStatement = struct {
     pub fn deinit(self: SelectStatement, allocator: std.mem.Allocator) void {
         for (self.joins) |j| freeExpr(j.on, allocator);
         allocator.free(self.joins);
+        for (self.projections) |p| switch (p) {
+            .expr => |e| freeExpr(e.expr, allocator),
+            else => {},
+        };
         allocator.free(self.projections);
         if (self.where_expr) |w| freeExpr(w, allocator);
     }

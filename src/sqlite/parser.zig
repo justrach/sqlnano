@@ -160,44 +160,73 @@ pub const Parser = struct {
 
     fn parseProjections(self: *Parser, allocator: std.mem.Allocator, out: *std.ArrayList(ast.Projection)) ParseError!void {
         while (true) {
-            const proj = try self.parseProjection();
+            const proj = try self.parseProjection(allocator);
             try out.append(allocator, proj);
             if (try self.consume(.comma) != null) continue;
             break;
         }
     }
 
-    fn parseProjection(self: *Parser) ParseError!ast.Projection {
+    fn parseProjection(self: *Parser, allocator: std.mem.Allocator) ParseError!ast.Projection {
         // `SELECT *`
         if (try self.consume(.star) != null) return .star;
 
-        // `COUNT ( * )`
-        if (self.stream.current.isKeyword(.count)) {
-            self.stream.advance() catch return error.InvalidSql;
-            try self.expect(.left_paren, error.UnsupportedSql);
-            try self.expect(.star, error.UnsupportedSql);
-            try self.expect(.right_paren, error.UnsupportedSql);
-            const alias = try self.consumeOptionalAlias();
-            return .{ .count_star = .{ .alias = alias } };
+        // Aggregate functions — `COUNT | SUM | MIN | MAX | AVG ( ... )`.
+        // COUNT has the special `(*)` form; the rest are `(col_ref)`.
+        if (self.stream.current.kind == .keyword) {
+            const maybe_agg: ?ast.AggregateFunc = switch (self.stream.current.keyword.?) {
+                .count => .count,
+                .sum => .sum,
+                .min => .min,
+                .max => .max,
+                .avg => .avg,
+                else => null,
+            };
+            if (maybe_agg) |func| {
+                self.stream.advance() catch return error.InvalidSql;
+                try self.expect(.left_paren, error.UnsupportedSql);
+                if (func == .count and try self.consume(.star) != null) {
+                    try self.expect(.right_paren, error.UnsupportedSql);
+                    const alias = try self.consumeOptionalAlias();
+                    return .{ .count_star = .{ .alias = alias } };
+                }
+                const col = try self.parseColumnRef();
+                try self.expect(.right_paren, error.UnsupportedSql);
+                const alias = try self.consumeOptionalAlias();
+                return .{ .aggregate = .{ .func = func, .column = col, .alias = alias } };
+            }
         }
 
-        // Identifier chain: `ident` | `ident . ident` | `ident . *`
-        const first_tok = self.stream.current;
-        if (first_tok.kind != .identifier and first_tok.kind != .quoted_identifier) return error.UnsupportedSql;
-        const first = first_tok.lexeme;
-        self.stream.advance() catch return error.InvalidSql;
-
-        if (try self.consume(.dot) != null) {
-            if (try self.consume(.star) != null) return .{ .table_star = first };
-            const col_tok = self.stream.current;
-            if (col_tok.kind != .identifier and col_tok.kind != .quoted_identifier) return error.UnsupportedSql;
+        // Speculative `t.*` check — needs two tokens of lookahead and
+        // the AST shape isn't an expression, so we peek before falling
+        // through to the general parseExpr.
+        const t = self.stream.current;
+        if (t.kind == .identifier or t.kind == .quoted_identifier) {
+            const saved = self.stream;
+            const first = t.lexeme;
             self.stream.advance() catch return error.InvalidSql;
-            const alias = try self.consumeOptionalAlias();
-            return .{ .column = .{ .ref = .{ .qualifier = first, .name = col_tok.lexeme }, .alias = alias } };
+            if (try self.consume(.dot) != null and try self.consume(.star) != null) {
+                return .{ .table_star = first };
+            }
+            // Not a `t.*` — rewind and let parseExpr handle it.
+            self.stream = saved;
         }
 
+        // General expression projection. We parse an expression and
+        // then look at its shape to pick the right Projection variant
+        // for better display labels on the common "just a column" case.
+        const expr = try self.parseExpr(allocator);
+        errdefer ast.freeExpr(expr, allocator);
         const alias = try self.consumeOptionalAlias();
-        return .{ .column = .{ .ref = .{ .name = first }, .alias = alias } };
+
+        if (expr.* == .column) {
+            const col = expr.column;
+            // Free the heap-allocated wrapper since we're downgrading
+            // to the Projection.column shape.
+            allocator.destroy(expr);
+            return .{ .column = .{ .ref = col, .alias = alias } };
+        }
+        return .{ .expr = .{ .expr = expr, .alias = alias } };
     }
 
     fn consumeOptionalAlias(self: *Parser) ParseError!?[]const u8 {
@@ -231,7 +260,10 @@ pub const Parser = struct {
         return .{ .name = first };
     }
 
-    /// Expression parser: OR < AND < comparison.
+    /// Full expression parser, ordered loosest-to-tightest:
+    ///   OR < AND < NOT < comparison < additive (+ - ||) < multiplicative (* / %) < unary (- +) < primary
+    /// Comparison itself handles: = != <> < <= > >=, LIKE / NOT LIKE,
+    /// IN / NOT IN (list), BETWEEN / NOT BETWEEN, IS [NOT] NULL.
     pub fn parseExpr(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
         return try self.parseOr(allocator);
     }
@@ -247,26 +279,73 @@ pub const Parser = struct {
     }
 
     fn parseAnd(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
-        var lhs = try self.parseComparison(allocator);
+        var lhs = try self.parseNot(allocator);
         errdefer ast.freeExpr(lhs, allocator);
         while (try self.consumeKeyword(.and_)) {
-            const rhs = try self.parseComparison(allocator);
+            const rhs = try self.parseNot(allocator);
             lhs = try makeBinary(allocator, .and_, lhs, rhs);
         }
         return lhs;
     }
 
+    fn parseNot(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
+        if (try self.consumeKeyword(.not)) {
+            const inner = try self.parseNot(allocator);
+            return try makeUnary(allocator, .not_, inner);
+        }
+        return try self.parseComparison(allocator);
+    }
+
     fn parseComparison(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
-        const lhs = try self.parsePrimary(allocator);
+        const lhs = try self.parseAdditive(allocator);
         errdefer ast.freeExpr(lhs, allocator);
 
-        // IS [NOT] NULL
+        // IS [NOT] NULL — high-ranked postfix.
         if (try self.consumeKeyword(.is)) {
             const is_not = try self.consumeKeyword(.not);
             try self.expectKeyword(.null, error.UnsupportedWhere);
             return try makeUnary(allocator, if (is_not) .is_not_null else .is_null, lhs);
         }
 
+        // NOT prefix in front of LIKE / IN / BETWEEN — SQLite accepts
+        // `x NOT LIKE 'p'` and `x NOT IN (...)` as single compound
+        // operators. Our top-level `parseNot` handles the standalone
+        // `NOT expr` form.
+        const starts_negated = self.stream.current.isKeyword(.not);
+        if (starts_negated) {
+            // Peek past NOT to see if the next keyword is LIKE/IN/BETWEEN.
+            // If not, the NOT wasn't ours; leave it for the outer level.
+            const saved = self.stream;
+            self.stream.advance() catch return error.InvalidSql;
+            const next = self.stream.current;
+            if (next.isKeyword(.like)) {
+                self.stream.advance() catch return error.InvalidSql;
+                const rhs = try self.parseAdditive(allocator);
+                return try makeBinary(allocator, .not_like, lhs, rhs);
+            } else if (next.isKeyword(.in)) {
+                self.stream.advance() catch return error.InvalidSql;
+                return try self.parseInList(allocator, lhs, true);
+            } else if (next.isKeyword(.between)) {
+                self.stream.advance() catch return error.InvalidSql;
+                return try self.parseBetween(allocator, lhs, true);
+            }
+            // Not one of ours — rewind.
+            self.stream = saved;
+        }
+
+        // LIKE / IN / BETWEEN (unnegated).
+        if (try self.consumeKeyword(.like)) {
+            const rhs = try self.parseAdditive(allocator);
+            return try makeBinary(allocator, .like, lhs, rhs);
+        }
+        if (try self.consumeKeyword(.in)) {
+            return try self.parseInList(allocator, lhs, false);
+        }
+        if (try self.consumeKeyword(.between)) {
+            return try self.parseBetween(allocator, lhs, false);
+        }
+
+        // Ordinary comparison ops.
         const op: ?ast.BinOp = switch (self.stream.current.kind) {
             .equals => .eq,
             .ne => .ne,
@@ -278,10 +357,99 @@ pub const Parser = struct {
         };
         if (op) |o| {
             self.stream.advance() catch return error.InvalidSql;
-            const rhs = try self.parsePrimary(allocator);
+            const rhs = try self.parseAdditive(allocator);
             return try makeBinary(allocator, o, lhs, rhs);
         }
         return lhs;
+    }
+
+    fn parseInList(self: *Parser, allocator: std.mem.Allocator, value: *ast.Expr, negated: bool) ParseError!*ast.Expr {
+        try self.expect(.left_paren, error.UnsupportedWhere);
+        var items: std.ArrayList(*ast.Expr) = .empty;
+        errdefer {
+            for (items.items) |it| ast.freeExpr(it, allocator);
+            items.deinit(allocator);
+        }
+        // Empty `IN ()` is legal in SQLite — always false.
+        if (try self.consume(.right_paren) == null) {
+            while (true) {
+                const it = try self.parseAdditive(allocator);
+                try items.append(allocator, it);
+                if (try self.consume(.comma) != null) continue;
+                try self.expect(.right_paren, error.UnsupportedWhere);
+                break;
+            }
+        }
+        const node = try allocator.create(ast.Expr);
+        node.* = .{ .in_list = .{ .value = value, .items = try items.toOwnedSlice(allocator), .negated = negated } };
+        return node;
+    }
+
+    fn parseBetween(self: *Parser, allocator: std.mem.Allocator, value: *ast.Expr, negated: bool) ParseError!*ast.Expr {
+        const low = try self.parseAdditive(allocator);
+        errdefer ast.freeExpr(low, allocator);
+        try self.expectKeyword(.and_, error.UnsupportedWhere);
+        const high = try self.parseAdditive(allocator);
+        const node = try allocator.create(ast.Expr);
+        node.* = .{ .between = .{ .value = value, .low = low, .high = high, .negated = negated } };
+        return node;
+    }
+
+    fn parseAdditive(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
+        var lhs = try self.parseMultiplicative(allocator);
+        errdefer ast.freeExpr(lhs, allocator);
+        while (true) {
+            const op: ?ast.BinOp = switch (self.stream.current.kind) {
+                .plus => .add,
+                .minus => .sub,
+                .concat => .concat,
+                else => null,
+            };
+            if (op == null) break;
+            self.stream.advance() catch return error.InvalidSql;
+            const rhs = try self.parseMultiplicative(allocator);
+            lhs = try makeBinary(allocator, op.?, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    fn parseMultiplicative(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
+        var lhs = try self.parseUnary(allocator);
+        errdefer ast.freeExpr(lhs, allocator);
+        while (true) {
+            const op: ?ast.BinOp = switch (self.stream.current.kind) {
+                .star => .mul,
+                .slash => .div,
+                .percent => .mod,
+                else => null,
+            };
+            if (op == null) break;
+            self.stream.advance() catch return error.InvalidSql;
+            const rhs = try self.parseUnary(allocator);
+            lhs = try makeBinary(allocator, op.?, lhs, rhs);
+        }
+        return lhs;
+    }
+
+    fn parseUnary(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
+        if (try self.consume(.minus) != null) {
+            const inner = try self.parseUnary(allocator);
+            // Constant-fold `-<integer literal>` so the legacy
+            // Literal.integer shape is preserved; otherwise wrap in
+            // a neg unary.
+            if (inner.* == .literal) {
+                if (inner.literal == .integer) {
+                    inner.literal.integer = -inner.literal.integer;
+                    return inner;
+                }
+            }
+            return try makeUnary(allocator, .neg, inner);
+        }
+        if (try self.consume(.plus) != null) {
+            // Unary plus is a no-op; just return the inner expression.
+            return try self.parseUnary(allocator);
+        }
+        return try self.parsePrimary(allocator);
     }
 
     fn parsePrimary(self: *Parser, allocator: std.mem.Allocator) ParseError!*ast.Expr {
