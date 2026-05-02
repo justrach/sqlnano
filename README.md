@@ -4,12 +4,13 @@ A tiny embeddable SQL engine with a SQLite `.db` compatibility track. Written in
 
 ## Why sqlnano?
 
-- **Fast autocommit inserts** — 3.3× native SQLite WAL+NORMAL at 1,000 rows, 1.2× at 10,000 rows (apples-to-apples, matched durability)
+- **Beats native SQLite WAL+NORMAL by 2.5×–3.5×** on autocommit inserts up to 100,000 rows (apples-to-apples, matched durability)
 - **Zero-malloc hot path** — schema parsed once per op, transient state lives in a per-op page-allocator arena, cell envelope builds on a stack buffer
 - **Incremental rightmost-leaf append** — no indexes + room in the page → one cell written directly, no tree rebuild
+- **In-place leaf split** — when the rightmost leaf fills, allocate one new leaf, stamp the new cell alone, append a single divider into the parent interior. O(1) per split instead of a full-tree rebuild
 - **Native WAL** (`*-snwal`) — group commit, configurable `synchronous=full/normal/off`, crash recovery on reopen, torn-WAL fuzzed on every byte offset
 - **In-memory DB image** — `Connection` loads the file once, mutates in RAM, `writeFile` only fires on flush/close
-- **SQLite-compatible b-trees** — table multi-leaf splits that pass `PRAGMA integrity_check`, rowid tables, single-leaf indexes, payload overflow reads
+- **SQLite-compatible b-trees** — multi-leaf table splits validated by `PRAGMA integrity_check` end-to-end, rowid tables, single-leaf indexes, payload overflow reads
 - **Single static binary** — no runtime, no extensions, Zig 0.16
 - **SSPL + author exception** license — same shape as MongoDB/Redis Stack, with full permissive use by the justrach namespace
 
@@ -39,15 +40,15 @@ Both engines compiled `-O3`/`ReleaseFast`, same fixture (`CREATE TABLE t(id INTE
 
 ### Durable autocommit writes (matched durability)
 
-| N      | config  | sqlnano         | SQLite WAL      | ratio             |
-|-------:|---------|----------------:|----------------:|------------------:|
-| 1,000  | FULL    | 37,939 ops/s    | 25,334 ops/s    | **sqlnano 1.50×** |
-| 1,000  | NORMAL  | **399,000**     | 122,000         | **sqlnano 3.3×**  |
-| 10,000 | FULL    | 38,275          | 33,374          | **sqlnano 1.15×** |
-| 10,000 | NORMAL  | **193,000**     | 158,000         | **sqlnano 1.22×** |
-| 50,000 | NORMAL  | 53,000          | 172,000         | SQLite 3.2×       |
+| N         | config  | sqlnano (mean) | SQLite WAL (mean) | ratio              |
+|----------:|---------|---------------:|------------------:|-------------------:|
+| 1,000     | FULL    | 41,555         | 25,208            | **sqlnano 1.65×**  |
+| 1,000     | NORMAL  | **428,000**    | 123,000           | **sqlnano 3.5×**   |
+| 10,000    | NORMAL  | **475,000**    | 168,000           | **sqlnano 2.83×**  |
+| 50,000    | NORMAL  | **453,000**    | 171,000           | **sqlnano 2.65×**  |
+| 100,000   | NORMAL  | **436,000**    | 169,000           | **sqlnano 2.58×**  |
 
-> The 50,000-row cliff is the fast path's fallback — once a leaf fills, the current code rebuilds the whole tree instead of doing an in-place split. That rebuild dominates at large N. Fixing it is the next optimization target.
+> The earlier 50k cliff is gone — when the rightmost leaf fills we now allocate one new leaf, stamp the cell alone, and append a single divider into the parent interior. O(1) per split. The next limit is at ~150k rows when the parent interior page itself fills (~400 dividers per 4KB page); past that we still need recursive interior splits, which is the next item on parity.
 
 ### Reads (same fixture)
 

@@ -232,12 +232,26 @@ pub const Connection = struct {
         _ = try self.wal.write(self.io, txn_id, .row_insert, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
 
-        // Fast path: no indexes, append-at-end, fits in current rightmost
+        // Fast path A: no indexes, append-at-end, fits in current rightmost
         // leaf. Short-circuits the full b-tree rebuild that the generic
         // path would do.
         const fast = try self.tryFastAppendShared(scratch, reader, db_schema, info, values, rowid);
         if (!fast) {
-            _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
+            // Fast path B: no indexes, append-at-end, but the rightmost
+            // leaf is full *and* the tree is already multi-level (root
+            // is interior). Allocate one fresh leaf, stamp the new cell
+            // there alone, and append a single divider into the parent
+            // interior. O(1) per split instead of the full tree rebuild
+            // the slow path would do.
+            //
+            // After a successful split the post-resize `image.items`
+            // backing has moved, so anything pointing into the old
+            // backing (`reader`, `db_schema`, `info`'s string fields) is
+            // dangling. We deliberately don't use them past this point.
+            const split = try self.tryFastSplitAppendShared(scratch, reader, db_schema, info, values, rowid);
+            if (!split) {
+                _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
+            }
         }
         try self.bumpRowidCache(table_name, rowid);
         self.image_dirty = true;
@@ -375,6 +389,139 @@ pub const Connection = struct {
         return true;
     }
 
+    /// Fast path B: rightmost leaf is full but the tree already has an
+    /// interior root, so the split is asymmetric (the new auto-rowid
+    /// cell goes into a brand-new rightmost leaf, alone). Allocates one
+    /// fresh page at the end of the file, stamps the cell, and appends
+    /// one divider into the parent interior. Returns false if any
+    /// precondition isn't met (indexed table, root is leaf, parent
+    /// interior is itself full, etc.) — the caller falls through to the
+    /// full rebuild path.
+    fn tryFastSplitAppendShared(
+        self: *Connection,
+        scratch: Allocator,
+        reader: page.PageReader,
+        db_schema: schema.Schema,
+        info: catalog.TableInfo,
+        values: []const InsertValue,
+        rowid: i64,
+    ) WriteError!bool {
+        for (db_schema.entries) |e| {
+            if (!e.isIndex() or e.root_page <= 0) continue;
+            if (std.ascii.eqlIgnoreCase(e.table_name, info.name)) return false;
+        }
+
+        // The root must already be an interior — splitting a single-leaf
+        // root into an interior + 2 leaves is the slow path.
+        const root_ref = reader.page(info.root_page) catch return false;
+        const root_hdr = btree.PageHeader.parse(root_ref) catch return false;
+        if (root_hdr.page_type != .table_interior) return false;
+
+        // Walk down right-most pointers until the page just above the
+        // rightmost leaf. That's where the new divider goes.
+        const parent_info = rightmostInteriorParent(reader, info.root_page) catch return false;
+        const parent_page = parent_info.parent;
+        const old_rightmost = parent_info.leaf;
+        if (parent_page == 0 or old_rightmost == 0) return false;
+
+        // The divider's separator key is the largest rowid in the leaf
+        // we're closing off (i.e. the last cell of `old_rightmost`).
+        const last_rowid = lastRowidInTableLeaf(reader, old_rightmost) catch return false;
+
+        // Build the divider cell: [u32 BE left_child][varint rowid].
+        var divider_buf: [4 + 9]u8 = undefined;
+        std.mem.writeInt(u32, divider_buf[0..4], old_rightmost, .big);
+        const div_v_len = encodeVarintInto(divider_buf[4..], @intCast(last_rowid));
+        const divider_len: usize = 4 + div_v_len;
+
+        // Verify parent interior has room for the new divider cell + ptr.
+        const page_size: usize = reader.db_header.page_size;
+        const reserved: usize = reader.db_header.reserved_space;
+        const parent_start = (@as(usize, parent_page) - 1) * page_size;
+        const parent_hdr_off: usize = if (parent_page == 1) header.HEADER_SIZE else 0;
+        const parent_base = parent_start + parent_hdr_off;
+        const parent_usable_end = parent_start + page_size - reserved;
+        const cell_count = readU16(self.image.items[parent_base + 3 .. parent_base + 5]);
+        const stored_content_start = readU16(self.image.items[parent_base + 5 .. parent_base + 7]);
+        const content_start_abs_old: usize = if (stored_content_start == 0)
+            parent_start + page_size
+        else
+            parent_start + stored_content_start;
+        if (content_start_abs_old > parent_usable_end) return false;
+        const ptr_slot = parent_base + 12 + @as(usize, cell_count) * 2;
+        if (content_start_abs_old < divider_len) return false;
+        const new_div_start_abs = content_start_abs_old - divider_len;
+        // Pointer slot mustn't collide with cell content area after we
+        // grow the pointer array by one slot (2 bytes).
+        if (new_div_start_abs < ptr_slot + 2) return false;
+
+        // Verify the new leaf will actually hold the cell.
+        const usable: usize = page_size - reserved;
+        const payload = try encodeRecord(info, rowid, values, scratch);
+        const info_pl = btree.tableLeafPayloadInfo(payload.len, usable);
+        if (info_pl.overflow_page != null) return false;
+
+        var stack_cell: [256]u8 = undefined;
+        const cell_total = 2 * 9 + payload.len;
+        const cell_buf: []u8 = if (cell_total <= stack_cell.len)
+            stack_cell[0..]
+        else
+            try scratch.alloc(u8, cell_total);
+        var pos: usize = 0;
+        pos += encodeVarintInto(cell_buf[pos..], @intCast(payload.len));
+        pos += encodeVarintInto(cell_buf[pos..], @intCast(rowid));
+        @memcpy(cell_buf[pos..][0..payload.len], payload);
+        const cell_len = pos + payload.len;
+        // Single-cell leaf: 8-byte header + 2-byte ptr + cell. If even
+        // that doesn't fit, the row is too big for this page size.
+        if (cell_len + 8 + 2 > usable) return false;
+
+        // ── Past this point we mutate `self.image`. No earlier returns. ──
+
+        const old_image_len = self.image.items.len;
+        const file_pages: u32 = @intCast(old_image_len / page_size);
+        const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
+        const new_page_num: u32 = effective_page_count + 1;
+        const new_image_len: usize = @as(usize, new_page_num) * page_size;
+        if (new_image_len > old_image_len) {
+            try self.image.resize(self.gpa, new_image_len);
+            @memset(self.image.items[old_image_len..], 0);
+        }
+        const mutable = self.image.items;
+
+        // Header: bump database_page_count + file_change_counter (and
+        // mirror into version_valid_for so WAL-aware readers stay sane).
+        writeU32(mutable[28..32], new_page_num);
+        const current_change = readU32(mutable[24..28]);
+        writeU32(mutable[24..28], current_change +% 1);
+        if (mutable.len >= 96) writeU32(mutable[92..96], current_change +% 1);
+
+        // Write the new leaf at `new_page_num`: 8-byte header, 2-byte
+        // pointer to the single cell, cell at the end of the page.
+        const new_leaf_start = (@as(usize, new_page_num) - 1) * page_size;
+        const new_leaf_usable_end = new_leaf_start + page_size - reserved;
+        const new_cell_start_abs = new_leaf_usable_end - cell_len;
+        @memcpy(mutable[new_cell_start_abs..][0..cell_len], cell_buf[0..cell_len]);
+        const new_cell_rel: u16 = @intCast(new_cell_start_abs - new_leaf_start);
+        const new_leaf_base = new_leaf_start; // never page 1 — it's freshly allocated.
+        mutable[new_leaf_base] = @intFromEnum(btree.PageType.table_leaf);
+        writeU16(mutable[new_leaf_base + 1 .. new_leaf_base + 3], 0);
+        writeU16(mutable[new_leaf_base + 3 .. new_leaf_base + 5], 1);
+        writeU16(mutable[new_leaf_base + 5 .. new_leaf_base + 7], new_cell_rel);
+        mutable[new_leaf_base + 7] = 0;
+        writeU16(mutable[new_leaf_base + 8 .. new_leaf_base + 10], new_cell_rel);
+
+        // Append the divider into the parent interior + repoint right_most.
+        @memcpy(mutable[new_div_start_abs..][0..divider_len], divider_buf[0..divider_len]);
+        const new_div_rel: u16 = @intCast(new_div_start_abs - parent_start);
+        writeU16(mutable[ptr_slot..][0..2], new_div_rel);
+        writeU16(mutable[parent_base + 3 .. parent_base + 5], cell_count + 1);
+        writeU16(mutable[parent_base + 5 .. parent_base + 7], new_div_rel);
+        writeU32(mutable[parent_base + 8 .. parent_base + 12], new_page_num);
+
+        return true;
+    }
+
     pub fn update(self: *Connection, stmt: @import("ast.zig").UpdateStatement) WriteError!usize {
         const payload = try wal_codec.encodeUpdate(self.gpa, stmt);
         defer self.gpa.free(payload);
@@ -422,6 +569,44 @@ fn rightmostTableLeaf(reader: page.PageReader, start_page: u32) !u32 {
             else => return error.UnexpectedPageType,
         }
     }
+}
+
+/// Walk down right-most pointers from `start_page` and return the
+/// interior page whose `right_most_pointer` points directly at the
+/// rightmost leaf, plus that leaf's page number. Returns an error if
+/// the start page is itself a leaf (no interior parent exists yet).
+fn rightmostInteriorParent(reader: page.PageReader, start_page: u32) !struct { parent: u32, leaf: u32 } {
+    var current = start_page;
+    while (true) {
+        const ref = try reader.page(current);
+        const hdr = try btree.PageHeader.parse(ref);
+        switch (hdr.page_type) {
+            .table_leaf => return error.NoInteriorParent,
+            .table_interior => {
+                const right = hdr.right_most_pointer orelse return error.MalformedInterior;
+                const child_ref = try reader.page(right);
+                const child_hdr = try btree.PageHeader.parse(child_ref);
+                if (child_hdr.page_type == .table_leaf) {
+                    return .{ .parent = current, .leaf = right };
+                }
+                current = right;
+            },
+            else => return error.UnexpectedPageType,
+        }
+    }
+}
+
+/// Read the rowid of the last cell in `leaf_page`. Used to derive the
+/// separator key when promoting a full leaf into an interior divider.
+fn lastRowidInTableLeaf(reader: page.PageReader, leaf_page: u32) !i64 {
+    const ref = try reader.page(leaf_page);
+    const hdr = try btree.PageHeader.parse(ref);
+    if (hdr.page_type != .table_leaf) return error.UnexpectedPageType;
+    if (hdr.cell_count == 0) return error.EmptyLeaf;
+    const cell = try hdr.cell(ref, hdr.cell_count - 1);
+    const payload_size_v = @import("varint.zig").parse(cell) catch return error.InvalidTableCell;
+    const rowid_v = @import("varint.zig").parse(cell[payload_size_v.len..]) catch return error.InvalidTableCell;
+    return @intCast(rowid_v.value);
 }
 
 fn readU32(bytes: []const u8) u32 {

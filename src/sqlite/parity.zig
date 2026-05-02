@@ -45,8 +45,8 @@ pub const features = [_]Feature{
     .{
         .area = "SQLite-compatible writes",
         .status = .partial,
-        .evidence = "INSERT/UPDATE/DELETE on rowid tables are logged through a native WAL (group commit + crash recovery). `Connection` keeps the data file image in memory so ops mutate the buffer; writeFile happens only at flush/close. Auto-rowid inserts on indexless tables take the fast path (O(1) rightmost-leaf append + per-table rowid cache) and fall back to the full-rebuild path when the leaf is full or indexes are involved. Sustained append throughput is ~10x native SQLite autocommit on macOS APFS. Tables grow past one page via interior-root + multi-leaf splits verified by `PRAGMA integrity_check`.",
-        .next = "Bring the fast path to indexed tables (incremental index-leaf insert), multi-leaf index splits, freelist handling to reclaim orphaned leaves, rollback journal + SQLite WAL frame format, and broader crash fixtures.",
+        .evidence = "INSERT/UPDATE/DELETE on rowid tables are logged through a native WAL (group commit + crash recovery). `Connection` keeps the data file image in memory so ops mutate the buffer; writeFile happens only at flush/close. Auto-rowid inserts on indexless tables take a two-stage fast path: (a) stamp the cell into the rightmost leaf when it fits, (b) when the leaf fills, allocate one fresh leaf and append one divider into the parent interior — both O(1). Falls back to the full-rebuild path only on indexed tables, the very first leaf->interior promotion, or when the parent interior fills. Sustained throughput at 100k rows: 2.5x native SQLite WAL+NORMAL on macOS APFS. Tables grow past one page via interior-root + multi-leaf splits verified by `PRAGMA integrity_check`.",
+        .next = "Recursive interior splits to scale past ~150k rows (parent-interior overflow), bring the fast path to indexed tables (incremental index-leaf insert), multi-leaf index splits, freelist handling to reclaim orphaned leaves, rollback journal + SQLite WAL frame format, and broader crash fixtures.",
     },
     .{
         .area = "Full SQL grammar",
