@@ -126,6 +126,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "bench-query")) {
+        const path = args.next() orelse return error.MissingDatabasePath;
+        const query = args.next() orelse return error.MissingQuery;
+        const iterations_text = args.next() orelse return error.MissingIterationCount;
+        if (args.next() != null) return error.TooManyArguments;
+        try benchQuery(init, stdout, path, query, iterations_text);
+        try stdout.flush();
+        return;
+    }
+
     if (std.mem.eql(u8, command, "parity")) {
         if (args.next() != null) {
             try stderr.print("error: too many arguments\n\n", .{});
@@ -401,6 +411,58 @@ fn execSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, sql
         },
         .select => return error.SelectNotSupportedByExec,
     }
+}
+
+/// General-purpose query benchmark — runs `executeSelect` N times and
+/// reports per-iteration nanoseconds. Unlike `bench-read` this routes
+/// through the full SELECT executor (joins, aggregates, ORDER BY,
+/// arbitrary WHERE), so it's the apples-to-apples way to compare
+/// query latency vs SQLite's prepared-statement step loop.
+fn benchQuery(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, query: []const u8, iterations_text: []const u8) !void {
+    const iterations = try std.fmt.parseInt(usize, iterations_text, 10);
+    if (iterations == 0) return error.InvalidIterationCount;
+
+    var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
+    defer mf.deinit();
+    mf.advise(.willneed) catch {};
+    mf.advise(.sequential) catch {};
+
+    const reader = try sqlnano.sqlite.PageReader.init(mf.items);
+    const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
+    defer schema.deinit(init.gpa);
+
+    var sink: i64 = 0;
+    var rows_total: usize = 0;
+    const start = std.Io.Clock.awake.now(init.io).toNanoseconds();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const result = try sqlnano.sqlite.sql_mod.executeSelect(reader, schema, query, init.gpa);
+        defer result.deinit(init.gpa);
+        rows_total += result.rows.len;
+        // Touch every cell so the optimizer can't elide column decoding,
+        // mirroring SQLite's bench harness which reads every column.
+        for (result.rows) |row| {
+            sink +%= row.rowid;
+            for (row.values) |v| switch (v.value) {
+                .integer => |x| sink +%= x,
+                .real => |x| sink +%= @intFromFloat(x),
+                .text => |t| sink +%= @intCast(t.len),
+                .blob => |b| sink +%= @intCast(b.len),
+                .null => {},
+            };
+        }
+    }
+    const end = std.Io.Clock.awake.now(init.io).toNanoseconds();
+    const elapsed_ns_i96 = end - start;
+    const elapsed_ns: f64 = @floatFromInt(elapsed_ns_i96);
+    const iters_f: f64 = @floatFromInt(iterations);
+
+    try writer.print("iterations: {d}\n", .{iterations});
+    try writer.print("rows_total: {d}\n", .{rows_total});
+    try writer.print("elapsed_ms: {d:.3}\n", .{elapsed_ns / std.time.ns_per_ms});
+    try writer.print("ns_per_iter: {d:.0}\n", .{elapsed_ns / iters_f});
+    try writer.print("iters_per_sec: {d:.0}\n", .{iters_f * std.time.ns_per_s / elapsed_ns});
+    std.mem.doNotOptimizeAway(sink);
 }
 
 fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, query: []const u8, iterations_text: []const u8) !void {
