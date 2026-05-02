@@ -170,6 +170,11 @@ pub const Connection = struct {
         if (self.next_rowid_cache.fetchRemove(table_name)) |kv| self.gpa.free(kv.key);
     }
 
+    /// Set the WAL durability mode. See `wal.SyncMode`. Defaults to `.full`.
+    pub fn setSyncMode(self: *Connection, mode: wal_mod.SyncMode) void {
+        self.wal.sync_mode = mode;
+    }
+
     /// Persist the image (if dirty), then checkpoint + compact the WAL.
     /// Safe to call at any point; no-op when image is clean and WAL is
     /// empty.

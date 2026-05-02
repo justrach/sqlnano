@@ -158,13 +158,14 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             return error.MissingIterations;
         };
+        const sync_text = args.next();
         if (args.next() != null) {
             try stderr.print("error: too many arguments\n\n", .{});
             try printUsage(stderr);
             try stderr.flush();
             return error.TooManyArguments;
         }
-        try benchWrite(init, stdout, path, table_name, iters_text);
+        try benchWrite(init, stdout, path, table_name, iters_text, sync_text);
         try stdout.flush();
         return;
     }
@@ -462,12 +463,32 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     try writer.print("rows_per_sec: {d:.0}\n", .{total_rows_f * std.time.ns_per_s / elapsed_ns});
 }
 
-fn benchWrite(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, table_name: []const u8, iters_text: []const u8) !void {
+fn benchWrite(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    table_name: []const u8,
+    iters_text: []const u8,
+    sync_text: ?[]const u8,
+) !void {
     const iterations = try std.fmt.parseInt(usize, iters_text, 10);
     if (iterations == 0) return error.InvalidIterationCount;
 
+    const sync_mode: sqlnano.sqlite.wal_mod.SyncMode = if (sync_text) |s|
+        if (std.ascii.eqlIgnoreCase(s, "full"))
+            .full
+        else if (std.ascii.eqlIgnoreCase(s, "normal"))
+            .normal
+        else if (std.ascii.eqlIgnoreCase(s, "off"))
+            .off
+        else
+            return error.InvalidSyncMode
+    else
+        .full;
+
     var conn = try sqlnano.sqlite.Connection.open(init.gpa, init.io, path);
     defer conn.close();
+    conn.setSyncMode(sync_mode);
 
     const start = std.Io.Clock.awake.now(init.io).toNanoseconds();
     var i: usize = 0;
@@ -482,7 +503,7 @@ fn benchWrite(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, 
 
     const elapsed_ns: f64 = @floatFromInt(end - start);
     const iters_f: f64 = @floatFromInt(iterations);
-    try writer.print("mode: connection-batch\n", .{});
+    try writer.print("mode: connection-batch synchronous={s}\n", .{@tagName(sync_mode)});
     try writer.print("iterations: {d}\n", .{iterations});
     try writer.print("elapsed_ms: {d:.3}\n", .{elapsed_ns / std.time.ns_per_ms});
     try writer.print("us_per_op: {d:.1}\n", .{elapsed_ns / 1000.0 / iters_f});

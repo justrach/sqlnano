@@ -113,6 +113,17 @@ fn entryChecksum(header_bytes: []const u8, payload: []const u8) u32 {
     return h.final();
 }
 
+/// Mirrors SQLite's `PRAGMA synchronous`:
+///   * `.full`   — fsync after every commit AND every checkpoint.
+///     Power-loss safe. Default.
+///   * `.normal` — fsync only on checkpoint. Commits return after
+///     `write(2)` but before `fsync(2)`; an OS crash is safe but
+///     hard power loss can lose the last window of commits. This is
+///     what SQLite WAL+NORMAL does and is where SQLite's real
+///     throughput numbers come from.
+///   * `.off`    — never fsync. Data may be lost on any crash.
+pub const SyncMode = enum { full, normal, off };
+
 pub const Wal = struct {
     file: std.Io.File,
     write_buf: std.ArrayList(u8),
@@ -126,6 +137,8 @@ pub const Wal = struct {
     checkpoint_lsn: u64,
     /// Highest LSN known to be on durable storage.
     synced_lsn: u64,
+    /// Chosen durability mode. See `SyncMode`.
+    sync_mode: SyncMode,
 
     mu: std.Io.Mutex,
     cond: std.Io.Condition,
@@ -152,6 +165,7 @@ pub const Wal = struct {
             .next_lsn = std.atomic.Value(u64).init(1),
             .checkpoint_lsn = 0,
             .synced_lsn = 0,
+            .sync_mode = .full,
             .mu = .init,
             .cond = .init,
             .flushing = false,
@@ -248,7 +262,8 @@ pub const Wal = struct {
             self.mu.unlock(io);
             return;
         }
-        try self.flushAndUnlock(io);
+        // Best-effort idle flush — honor sync_mode rather than forcing.
+        try self.flushAndUnlock(io, false);
     }
 
     /// Append a `txn_commit` record and block until it is durable.
@@ -270,7 +285,10 @@ pub const Wal = struct {
             self.mu.unlock(io);
             return;
         }
-        try self.flushAndUnlock(io);
+        // Commit path: let `sync_mode` decide whether to fsync. `.full`
+        // fsyncs here (one fsync per commit); `.normal` and `.off` skip
+        // and rely on checkpoint for durability.
+        try self.flushAndUnlock(io, false);
     }
 
     /// Force-flush the current buffer (waiting if another flush is in
@@ -289,19 +307,25 @@ pub const Wal = struct {
             self.checkpoint_lsn = lsn;
             return;
         }
-        try self.flushAndUnlock(io);
+        // Checkpoint: force fsync unless explicitly `.off`. This is the
+        // durability boundary for `.normal` mode.
+        try self.flushAndUnlock(io, self.sync_mode != .off);
         self.checkpoint_lsn = lsn;
     }
 
     /// Caller must hold `mu`. On return the lock has been released and any
-    /// I/O error from the flush has been raised.
-    fn flushAndUnlock(self: *Wal, io: std.Io) !void {
+    /// I/O error from the flush has been raised. `must_sync` overrides the
+    /// current `sync_mode` when callers absolutely need disk durability
+    /// (e.g. checkpoint or close). When false, we still honor `sync_mode`:
+    /// `.full` syncs, `.normal`/`.off` skip the fsync.
+    fn flushAndUnlock(self: *Wal, io: std.Io, must_sync: bool) !void {
         self.flushing = true;
         var to_write = self.write_buf;
         self.write_buf = .empty;
         const target = self.next_lsn.load(.monotonic) -| 1;
         const off = self.end_offset;
         self.end_offset += to_write.items.len;
+        const should_sync = must_sync or (self.sync_mode == .full);
         self.mu.unlock(io);
 
         var io_err: ?anyerror = null;
@@ -309,7 +333,7 @@ pub const Wal = struct {
             io_err = e;
         };
         to_write.deinit(self.allocator);
-        if (io_err == null) {
+        if (io_err == null and should_sync) {
             self.file.sync(io) catch |e| {
                 io_err = e;
             };
