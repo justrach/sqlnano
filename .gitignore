@@ -2,3 +2,5 @@
 zig-out/
 zig-cache/
 *.snwal
+.devin/
+codedb.snapshot

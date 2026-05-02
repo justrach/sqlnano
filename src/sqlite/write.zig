@@ -35,8 +35,10 @@ fn walPathFor(allocator: Allocator, db_path: []const u8) ![]u8 {
 
 const ReplayContext = struct {
     gpa: Allocator,
-    io: Io,
-    db_path: []const u8,
+    image: *std.ArrayList(u8),
+    /// Flipped to true by any successful apply. Callers use it to decide
+    /// whether the post-recovery image needs a `writeFile`.
+    dirty: bool,
 };
 
 fn replayApply(entry: wal_mod.Entry, ctx: ?*anyopaque) anyerror!void {
@@ -45,18 +47,21 @@ fn replayApply(entry: wal_mod.Entry, ctx: ?*anyopaque) anyerror!void {
         .row_insert => {
             const dec = try wal_codec.decodeInsert(rc.gpa, entry.payload);
             defer dec.deinit(rc.gpa);
-            _ = applyInsertCore(rc.gpa, rc.io, rc.db_path, dec.table_name, dec.values, dec.rowid, .idempotent) catch |err| switch (err) {
+            _ = applyInsertCore(rc.gpa, rc.image, dec.table_name, dec.values, dec.rowid, .idempotent) catch |err| switch (err) {
                 error.AlreadyApplied => return,
                 else => return err,
             };
+            rc.dirty = true;
         },
         .row_update => {
             const dec = try wal_codec.decodeUpdate(entry.payload);
-            _ = try applyUpdateCore(rc.gpa, rc.io, rc.db_path, dec.statement);
+            const changed = try applyUpdateCore(rc.gpa, rc.image, dec.statement);
+            if (changed > 0) rc.dirty = true;
         },
         .row_delete => {
             const dec = try wal_codec.decodeDelete(entry.payload);
-            _ = try applyDeleteCore(rc.gpa, rc.io, rc.db_path, dec.statement);
+            const changed = try applyDeleteCore(rc.gpa, rc.image, dec.statement);
+            if (changed > 0) rc.dirty = true;
         },
         else => {},
     }
@@ -64,19 +69,22 @@ fn replayApply(entry: wal_mod.Entry, ctx: ?*anyopaque) anyerror!void {
 
 const ApplyMode = enum { fresh, idempotent };
 
-/// Long-lived database handle. Opens the WAL once, runs recovery once,
-/// then services many ops without reopening the WAL or rescanning it.
+/// Long-lived database handle. Holds the data file image in memory, runs
+/// every mutation against the in-memory buffer, and only touches the file
+/// when `flush` fires (at `close`, at `checkpoint_threshold_bytes` of WAL,
+/// or on an explicit caller request).
 ///
-/// Hot path per op: encode payload → `wal.write` → `wal.commit` (one fsync)
-/// → apply to data file. Checkpoint + compact are deferred until the WAL
-/// grows past `checkpoint_threshold_bytes` or `close` / `flush` is called.
-/// This keeps steady-state cost at ~1 fsync per op instead of 3.
+/// Hot path per op: encode payload → `wal.write` → `wal.commit` (one
+/// fsync) → mutate the in-memory image. No file I/O on the data file
+/// per op. This turns a tight insert loop from O(N * file_size) total
+/// bytes written into O(1) data-file writes per checkpoint.
 ///
-/// Crash recovery stays correct because every applied entry is also
-/// committed to the WAL: on reopen, recovery replays every committed
-/// entry past the most recent checkpoint, and row apply is idempotent
-/// (rowid collisions on INSERT → no-op; UPDATE/DELETE rebuild the leaf
-/// from scanned rows, so re-applying after successful apply is a no-op).
+/// Crash recovery: on open we load the file image, then replay every
+/// committed WAL entry past the last checkpoint into that image. Every
+/// entry's apply is idempotent (INSERT returns `AlreadyApplied` on rowid
+/// clash; UPDATE/DELETE rebuild from in-memory row state so a second
+/// apply is a no-op). After recovery the post-replay image is flushed
+/// and the WAL is checkpointed+compacted.
 ///
 /// The `db_path` slice is borrowed and must outlive the connection.
 pub const Connection = struct {
@@ -85,11 +93,17 @@ pub const Connection = struct {
     db_path: []const u8,
     wal_path: []u8,
     wal: wal_mod.Wal,
+    /// Mutable in-memory copy of the data file. All writes go through
+    /// this buffer; `flush` is the only code that writes it to disk.
+    image: std.ArrayList(u8),
+    /// Set by any op that mutates `image`. `flush` clears it after a
+    /// successful `writeFile`.
+    image_dirty: bool,
 
-    /// When the on-disk WAL (including the just-appended op) grows past
-    /// this many bytes, `maybeCheckpoint` flushes + checkpoints +
-    /// compacts. Small enough that crash replay stays cheap; large enough
-    /// that a batch of inserts avoids a checkpoint fsync per op.
+    /// When the on-disk WAL grows past this many bytes, `maybeCheckpoint`
+    /// flushes the image and compacts the WAL. Big enough that a batch
+    /// of small ops avoids paying a file rewrite per op; small enough
+    /// that crash replay stays cheap.
     pub const checkpoint_threshold_bytes: u64 = 64 * 1024;
 
     pub fn open(gpa: Allocator, io: Io, db_path: []const u8) WriteError!Connection {
@@ -99,32 +113,52 @@ pub const Connection = struct {
         var wal = try wal_mod.Wal.open(std.Io.Dir.cwd(), io, gpa, wal_path);
         errdefer wal.close(io);
 
+        // Load the full data file into memory. The buffer is owned by
+        // `Connection` from here until `close`.
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, db_path, gpa, .limited(1024 * 1024 * 1024));
+        defer gpa.free(bytes);
+
+        var image: std.ArrayList(u8) = .empty;
+        errdefer image.deinit(gpa);
+        try image.appendSlice(gpa, bytes);
+
         var conn = Connection{
             .gpa = gpa,
             .io = io,
             .db_path = db_path,
             .wal_path = wal_path,
             .wal = wal,
+            .image = image,
+            .image_dirty = false,
         };
 
-        var rc = ReplayContext{ .gpa = gpa, .io = io, .db_path = db_path };
+        var rc = ReplayContext{ .gpa = gpa, .image = &conn.image, .dirty = false };
         try conn.wal.recover(io, 0, replayApply, &rc);
+        // Recovery may have mutated the image; propagate that so `flush`
+        // writes the post-recovery state to disk before compacting the WAL.
+        if (rc.dirty) conn.image_dirty = true;
         try conn.flush();
 
         return conn;
     }
 
     pub fn close(self: *Connection) void {
-        // Best-effort final checkpoint so the on-disk WAL is empty on
-        // clean shutdown and the next open is a no-op recovery.
+        // Best-effort final flush so the on-disk state reflects every
+        // committed op and the WAL is empty.
         self.flush() catch {};
         self.wal.close(self.io);
+        self.image.deinit(self.gpa);
         self.gpa.free(self.wal_path);
     }
 
-    /// Force a checkpoint + compact right now. Safe to call at any point;
-    /// no-op if the WAL is already clean.
+    /// Persist the image (if dirty), then checkpoint + compact the WAL.
+    /// Safe to call at any point; no-op when image is clean and WAL is
+    /// empty.
     pub fn flush(self: *Connection) WriteError!void {
+        if (self.image_dirty) {
+            try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.db_path, .data = self.image.items });
+            self.image_dirty = false;
+        }
         if (self.wal.end_offset == 0 and self.wal.synced_lsn == self.wal.checkpoint_lsn) return;
         if (self.wal.synced_lsn > self.wal.checkpoint_lsn) {
             try self.wal.checkpoint(self.io, wal_mod.DB_TAG_SQLITE);
@@ -138,13 +172,14 @@ pub const Connection = struct {
     }
 
     pub fn insert(self: *Connection, table_name: []const u8, values: []const InsertValue) WriteError!i64 {
-        const rowid = try resolveInsertRowid(self.gpa, self.io, self.db_path, table_name, values);
+        const rowid = try resolveInsertRowid(self.gpa, &self.image, table_name, values);
         const payload = try wal_codec.encodeInsert(self.gpa, table_name, rowid, values);
         defer self.gpa.free(payload);
         const txn_id = nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_insert, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
-        _ = try applyInsertCore(self.gpa, self.io, self.db_path, table_name, values, rowid, .fresh);
+        _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
+        self.image_dirty = true;
         try self.maybeCheckpoint();
         return rowid;
     }
@@ -155,7 +190,8 @@ pub const Connection = struct {
         const txn_id = nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_update, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
-        const changed = try applyUpdateCore(self.gpa, self.io, self.db_path, stmt);
+        const changed = try applyUpdateCore(self.gpa, &self.image, stmt);
+        if (changed > 0) self.image_dirty = true;
         try self.maybeCheckpoint();
         return changed;
     }
@@ -166,7 +202,8 @@ pub const Connection = struct {
         const txn_id = nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_delete, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
-        const changed = try applyDeleteCore(self.gpa, self.io, self.db_path, stmt);
+        const changed = try applyDeleteCore(self.gpa, &self.image, stmt);
+        if (changed > 0) self.image_dirty = true;
         try self.maybeCheckpoint();
         return changed;
     }
@@ -183,12 +220,23 @@ pub fn recoverAndCompact(gpa: Allocator, io: Io, db_path: []const u8) WriteError
     var wal = try wal_mod.Wal.open(std.Io.Dir.cwd(), io, gpa, wal_path);
     defer wal.close(io);
 
-    var rc = ReplayContext{ .gpa = gpa, .io = io, .db_path = db_path };
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, db_path, gpa, .limited(1024 * 1024 * 1024));
+    defer gpa.free(bytes);
+
+    var image: std.ArrayList(u8) = .empty;
+    defer image.deinit(gpa);
+    try image.appendSlice(gpa, bytes);
+
+    var rc = ReplayContext{ .gpa = gpa, .image = &image, .dirty = false };
     try wal.recover(io, 0, replayApply, &rc);
 
-    // If recovery actually replayed anything, the entries it walked were
-    // already past the latest checkpoint. Stamp a fresh checkpoint to make
-    // them legal to compact.
+    // Persist the post-recovery image so the WAL entries we just replayed
+    // are on stable storage before we checkpoint them away. Only touch
+    // disk when recovery actually changed anything.
+    if (rc.dirty) {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = db_path, .data = image.items });
+    }
+
     if (wal.synced_lsn > wal.checkpoint_lsn) {
         try wal.checkpoint(io, wal_mod.DB_TAG_SQLITE);
     }
@@ -211,11 +259,8 @@ pub fn insertSimple(gpa: Allocator, io: Io, path: []const u8, table_name: []cons
 /// Determine the rowid the next INSERT would receive without mutating the
 /// database. Mirrors the rowid-resolution arm of `applyInsertCore` so the
 /// public wrapper can log the resolved rowid before applying.
-fn resolveInsertRowid(gpa: Allocator, io: Io, path: []const u8, table_name: []const u8, values: []const InsertValue) WriteError!i64 {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024 * 1024));
-    defer gpa.free(bytes);
-
-    const reader = try page.PageReader.init(bytes);
+fn resolveInsertRowid(gpa: Allocator, image: *std.ArrayList(u8), table_name: []const u8, values: []const InsertValue) WriteError!i64 {
+    const reader = try page.PageReader.init(image.items);
     if (reader.db_header.isWal()) return error.WalModeUnsupported;
     const db_schema = try schema.readSchema(reader, gpa);
     defer db_schema.deinit(gpa);
@@ -255,17 +300,13 @@ fn resolveInsertRowid(gpa: Allocator, io: Io, path: []const u8, table_name: []co
 /// can swallow it.
 fn applyInsertCore(
     gpa: Allocator,
-    io: Io,
-    path: []const u8,
+    image: *std.ArrayList(u8),
     table_name: []const u8,
     values: []const InsertValue,
     explicit_rowid: i64,
     mode: ApplyMode,
 ) WriteError!i64 {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024 * 1024));
-    defer gpa.free(bytes);
-
-    const reader = try page.PageReader.init(bytes);
+    const reader = try page.PageReader.init(image.items);
     if (reader.db_header.isWal()) return error.WalModeUnsupported;
     const db_schema = try schema.readSchema(reader, gpa);
     defer db_schema.deinit(gpa);
@@ -299,7 +340,7 @@ fn applyInsertCore(
     try rows.append(gpa, .{ .rowid = explicit_rowid, .values = try dupeInsertValues(values, gpa) });
     sortMutableRows(rows.items);
 
-    try rebuildTableAndIndexes(gpa, io, path, bytes, reader.db_header, reader, db_schema, info, rows.items);
+    try rebuildTableAndIndexes(gpa, image, reader.db_header, reader, db_schema, info, rows.items);
     return explicit_rowid;
 }
 
@@ -309,11 +350,8 @@ pub fn updateSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast
     return conn.update(stmt);
 }
 
-fn applyUpdateCore(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").UpdateStatement) WriteError!usize {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024 * 1024));
-    defer gpa.free(bytes);
-
-    const reader = try page.PageReader.init(bytes);
+fn applyUpdateCore(gpa: Allocator, image: *std.ArrayList(u8), stmt: @import("ast.zig").UpdateStatement) WriteError!usize {
+    const reader = try page.PageReader.init(image.items);
     if (reader.db_header.isWal()) return error.WalModeUnsupported;
     const db_schema = try schema.readSchema(reader, gpa);
     defer db_schema.deinit(gpa);
@@ -346,7 +384,7 @@ fn applyUpdateCore(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.
     }
     if (changed == 0) return 0;
 
-    try rebuildTableAndIndexes(gpa, io, path, bytes, reader.db_header, reader, db_schema, info, rows.items);
+    try rebuildTableAndIndexes(gpa, image, reader.db_header, reader, db_schema, info, rows.items);
     return changed;
 }
 
@@ -356,11 +394,8 @@ pub fn deleteSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast
     return conn.delete(stmt);
 }
 
-fn applyDeleteCore(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").DeleteStatement) WriteError!usize {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024 * 1024));
-    defer gpa.free(bytes);
-
-    const reader = try page.PageReader.init(bytes);
+fn applyDeleteCore(gpa: Allocator, image: *std.ArrayList(u8), stmt: @import("ast.zig").DeleteStatement) WriteError!usize {
+    const reader = try page.PageReader.init(image.items);
     if (reader.db_header.isWal()) return error.WalModeUnsupported;
     const db_schema = try schema.readSchema(reader, gpa);
     defer db_schema.deinit(gpa);
@@ -401,7 +436,7 @@ fn applyDeleteCore(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.
     }
     defer deinitMutableRows(kept, gpa);
 
-    try rebuildTableAndIndexes(gpa, io, path, bytes, reader.db_header, reader, db_schema, info, kept.items);
+    try rebuildTableAndIndexes(gpa, image, reader.db_header, reader, db_schema, info, kept.items);
     return changed;
 }
 
@@ -816,11 +851,11 @@ const IndexPlan = struct {
 };
 
 /// Rebuild the data file image for `info`'s table and every index that
-/// references it, then write the new image to disk.
+/// references it, mutating `image` in place.
 ///
 /// Both tables and indexes get b-tree splits: rows pack into one leaf when
 /// they fit, otherwise across N leaves with an interior root. Growing the
-/// tree grows the file: new leaf pages are appended at the end and
+/// tree grows the image: new leaf pages are appended at the end and
 /// `database_page_count` in the header is bumped. Old leaves no longer
 /// referenced leak for now — a real freelist can recycle them later. The
 /// flow is:
@@ -830,14 +865,18 @@ const IndexPlan = struct {
 ///   3. Walk every existing tree to discover reusable non-root leaves.
 ///   4. Assign page numbers; this is also where we discover how many
 ///      brand-new pages we need.
-///   5. Allocate a buffer sized for the new file extent, copy the original
-///      bytes in, then write each leaf and (if multi-leaf) each interior
-///      root.
+///   5. Resize `image` for the new file extent, zero the new tail, then
+///      write each leaf and (if multi-leaf) each interior root directly
+///      into `image.items`. No file I/O — the caller flushes.
+///
+/// Important: `reader`, `db_schema`, and any slice fields that alias
+/// `image.items` BEFORE the step-5 resize must not be used afterwards.
+/// `image.resize` can relocate the backing buffer; only scalar fields
+/// (page numbers, counts) and gpa-owned cell buffers are safe to use
+/// after the resize.
 fn rebuildTableAndIndexes(
     gpa: Allocator,
-    io: Io,
-    path: []const u8,
-    orig_bytes: []const u8,
+    image: *std.ArrayList(u8),
     db_header: header.Header,
     reader: page.PageReader,
     db_schema: schema.Schema,
@@ -852,7 +891,7 @@ fn rebuildTableAndIndexes(
     // back to the file size. Trusting it blindly would let us allocate
     // "fresh" page numbers that actually overlap existing pages (e.g. the
     // index root). Use the larger of the header field and the file size.
-    const file_pages: u32 = @intCast(orig_bytes.len / db_header.page_size);
+    const file_pages: u32 = @intCast(image.items.len / db_header.page_size);
     const effective_page_count: u32 = @max(db_header.database_page_count, file_pages);
 
     // ── Step 1: build table leaf cells ──
@@ -1024,26 +1063,39 @@ fn rebuildTableAndIndexes(
         }
     }
 
-    // ── Step 5: allocate buffer at final file size and write ──
+    // ── Step 5: resize the image to the new file extent, then write
+    //    everything in place. Past this point, DO NOT use `reader`,
+    //    `db_schema`, `info`, or any slice that aliased `image.items`
+    //    before the resize — `image.resize` is allowed to relocate.
     const final_page_count: u32 = @max(effective_page_count, next_fresh_page - 1);
     const new_file_size: usize = @as(usize, final_page_count) * @as(usize, db_header.page_size);
 
-    const mutable = try gpa.alloc(u8, new_file_size);
-    defer gpa.free(mutable);
-    @memcpy(mutable[0..orig_bytes.len], orig_bytes);
-    if (new_file_size > orig_bytes.len) @memset(mutable[orig_bytes.len..], 0);
+    const info_root_page = info.root_page; // u32, survives resize.
 
+    const old_len = image.items.len;
+    try image.resize(gpa, new_file_size);
+    if (new_file_size > old_len) @memset(image.items[old_len..], 0);
+    const mutable = image.items;
+
+    // Bump the header page count and file change counter. Writers that
+    // bump file_change_counter let SQLite-aware readers notice the image
+    // moved. Mirror it into version_valid_for for WAL-aware readers too.
     writeU32(mutable[28..32], final_page_count);
+    if (mutable.len >= 28) {
+        writeU32(mutable[24..28], db_header.file_change_counter +% 1);
+        if (mutable.len >= 96) writeU32(mutable[92..96], db_header.file_change_counter +% 1);
+    }
 
     // Table leaves + interior root.
     for (table_leaves, 0..) |leaf_cells, i| {
         try rewriteLeafPage(mutable, db_header, table_leaf_pages[i], .table_leaf, leaf_cells);
     }
     if (table_leaves.len >= 2) {
-        try writeInteriorTableRoot(mutable, db_header, info.root_page, table_leaf_pages, table_leaves, gpa);
+        try writeInteriorTableRoot(mutable, db_header, info_root_page, table_leaf_pages, table_leaves, gpa);
     }
 
-    // Index leaves + (if multi-leaf) interior roots.
+    // Index leaves + (if multi-leaf) interior roots. `plan.schema_entry`
+    // may alias the old `image.items`, so only read its scalar fields.
     for (index_plans.items) |plan| {
         for (plan.layout_leaves, 0..) |leaf_cells, i| {
             try rewriteLeafPage(mutable, db_header, plan.leaf_pages[i], .index_leaf, leaf_cells);
@@ -1053,8 +1105,6 @@ fn rebuildTableAndIndexes(
             try writeInteriorIndexRoot(mutable, db_header, idx_root, plan.leaf_pages, plan.divider_cells, gpa);
         }
     }
-
-    try writeDatabaseImage(io, path, mutable, db_header);
 }
 
 /// Greedy leaf packing: fill each leaf until adding the next cell would
@@ -1469,16 +1519,6 @@ fn rewriteLeafPage(
     mutable[base + 7] = 0; // fragmented free bytes
 }
 
-fn writeDatabaseImage(io: Io, path: []const u8, mutable: []u8, db_header: header.Header) WriteError!void {
-    // Bump the file change counter so SQLite knows the image changed.
-    if (mutable.len >= 28) {
-        writeU32(mutable[24..28], db_header.file_change_counter +% 1);
-        // Mirror into version-valid-for so WAL-aware readers stay consistent.
-        if (mutable.len >= 96) writeU32(mutable[92..96], db_header.file_change_counter +% 1);
-    }
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = mutable });
-}
-
 test "encode record for insert" {
     const entry = schema.SchemaEntry{
         .rowid = 1,
@@ -1712,8 +1752,11 @@ test "batched inserts defer checkpoint and recover after simulated crash" {
         // The WAL should still hold committed-but-uncheckpointed entries.
         try testing.expect(conn.wal.end_offset > 0);
         try testing.expect(conn.wal.synced_lsn > conn.wal.checkpoint_lsn);
-        // Simulate crash: close the WAL file without flushing.
+        // Simulate crash: drop the handle's resources without flushing.
+        // We skip the writeFile that `close` would do, leaving the on-disk
+        // data file behind while the WAL still holds the unapplied commits.
         conn.wal.close(testing.io);
+        conn.image.deinit(testing.allocator);
         testing.allocator.free(conn.wal_path);
     }
 

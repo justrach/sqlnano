@@ -45,8 +45,8 @@ pub const features = [_]Feature{
     .{
         .area = "SQLite-compatible writes",
         .status = .partial,
-        .evidence = "INSERT/UPDATE/DELETE on rowid tables are logged through a native WAL (group commit + crash recovery), tables grow past one page via interior-root + multi-leaf splits verified by `PRAGMA integrity_check`, and simple single-leaf non-unique single-column indexes are maintained.",
-        .next = "Finish multi-leaf index splits (the helpers exist; debugging the table+index allocator interaction is the open item), add freelist handling to reclaim orphaned leaves, implement a rollback journal + SQLite WAL frame format, and broaden crash fixtures.",
+        .evidence = "INSERT/UPDATE/DELETE on rowid tables are logged through a native WAL (group commit + crash recovery). `Connection` holds the data file image in memory so ops mutate the buffer rather than rewriting the file per call; writeFile happens only at flush/close. Tables grow past one page via interior-root + multi-leaf splits verified by `PRAGMA integrity_check`. Simple single-leaf non-unique single-column indexes are maintained.",
+        .next = "Incremental in-place leaf inserts (the current rebuild-from-scratch path is O(n) per op, giving O(n^2) on large batches), multi-leaf index splits, freelist handling to reclaim orphaned leaves, rollback journal + SQLite WAL frame format, and broader crash fixtures.",
     },
     .{
         .area = "Full SQL grammar",
