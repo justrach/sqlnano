@@ -460,6 +460,16 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
         }
     }
 
+    // Hint the kernel: COUNT(*) and full scans walk every leaf page
+    // sequentially, so `MADV_WILLNEED` gets us the same eager
+    // readahead SQLite's pager-with-pread enjoys. Point lookups stay
+    // on default — they touch ~3 pages and don't benefit from a
+    // file-wide prefetch.
+    if (rowid == null and indexed_rowids == null) {
+        mf.advise(.willneed) catch {};
+        mf.advise(.sequential) catch {};
+    }
+
     var total_rows: usize = 0;
     const start = std.Io.Clock.awake.now(init.io).toNanoseconds();
     var i: usize = 0;

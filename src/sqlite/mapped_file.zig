@@ -44,6 +44,16 @@ const MS_SYNC: i32 = switch (builtin.os.tag) {
     else => 0x10,
 };
 
+/// `madvise` advice codes. Linux and BSD/Darwin agree on the integer
+/// values for the four hints we use, which is why we hardcode rather
+/// than thread `posix.MADV` (whose tag spelling differs by platform).
+pub const Advice = enum(u32) {
+    normal = 0,
+    random = 1,
+    sequential = 2,
+    willneed = 3,
+};
+
 pub const OpenMode = enum { read_only, read_write };
 
 pub const MappedFile = struct {
@@ -155,6 +165,27 @@ pub const MappedFile = struct {
         if (self.mode != .read_write) return;
         if (self.map.len == 0) return;
         try posix.msync(self.map, MS_SYNC);
+    }
+
+    /// Hint the kernel about access pattern over the entire mapping.
+    /// `.sequential` enables aggressive readahead for table scans;
+    /// `.willneed` triggers an immediate prefetch (kernel populates
+    /// the page cache eagerly); `.random` disables readahead. We use
+    /// these to close the cold-cache gap vs SQLite's pread-based
+    /// pager, which gets readahead from the kernel for free.
+    pub fn advise(self: *MappedFile, advice: Advice) !void {
+        if (self.map.len == 0) return;
+        try posix.madvise(self.map.ptr, self.map.len, @intFromEnum(advice));
+    }
+
+    pub fn adviseRange(self: *MappedFile, offset: u64, size: u64, advice: Advice) !void {
+        if (self.map.len == 0) return;
+        if (offset + size > self.map.len) return error.OutOfBounds;
+        const sys_page: u64 = @intCast(std.heap.page_size_min);
+        const aligned_off: u64 = offset & ~(sys_page - 1);
+        const slice_ptr = self.map.ptr + aligned_off;
+        const slice_len: usize = @intCast(@min(self.map.len - aligned_off, offset + size - aligned_off));
+        try posix.madvise(@alignCast(slice_ptr), slice_len, @intFromEnum(advice));
     }
 
     fn mapFullFile(self: *MappedFile, new_len: u64) !void {
