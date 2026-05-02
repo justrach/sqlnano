@@ -1,6 +1,8 @@
 # sqlnano
 
-A tiny embeddable SQL engine with a SQLite `.db` compatibility track. Written in Zig. Reads and writes existing SQLite files, logs every mutation through a native crash-safe WAL, and out-performs native release-build SQLite on autocommit insert benchmarks.
+A tiny embeddable SQL engine with a SQLite `.db` compatibility track. Written in Zig.
+
+> **Why does this exist?** For fun, and to see how much faster I could make autocommit inserts than native SQLite if I rewrote the write path from scratch in Zig. SQLite is a 23-year-old engineering masterpiece and absolutely the right answer for production. sqlnano is a curiosity-driven rewrite that turned out, on the narrow workload it's tuned for, to beat native release-build SQLite by 2.5×–3.5×. None of this should be mistaken for a real-world production database — it's a benchmark project that happens to read and write valid SQLite files.
 
 ## Why sqlnano?
 
