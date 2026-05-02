@@ -56,39 +56,67 @@ sqlnano parity
 
 ## Benchmarks
 
-All engines built with `-O3` / `ReleaseFast` against the same fixture:
-a 10,000-row table `t(id INTEGER PRIMARY KEY, n INTEGER)` in a
-`DELETE`-journaled SQLite `.db`, durable mode (`PRAGMA synchronous=FULL`),
-warm fs cache. `sqlnano` test suite passes all 54 tests.
+Both engines compiled `-O3`/`ReleaseFast`, same fixture
+(`CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)`), same SQL, same
+prepared-statement autocommit loop, macOS APFS, warm fs cache. SQLite
+is the release-build amalgamation 3.50.0.
 
-| Test | sqlnano | SQLite native C | Ratio |
+**Inserts (matched durability — this is the only fair comparison):**
+
+| N | config | sqlnano | SQLite | ratio |
+|---:|---|---:|---:|---:|
+| 1,000  | FULL   | 37,939  | 25,334  (WAL)  | **sqlnano 1.50x** |
+| 1,000  | NORMAL | **399k** | 122k (WAL) | **sqlnano 3.3x** |
+| 10,000 | FULL   | 38,275  | 33,374  (WAL)  | **sqlnano 1.15x** |
+| 10,000 | NORMAL | **193k** | 158k (WAL) | **sqlnano 1.22x** |
+| 50,000 | NORMAL | 53k  | 172k (WAL) | SQLite 3.2x |
+
+At 50k rows SQLite pulls ahead because sqlnano's fast path
+(O(1) rightmost-leaf append) falls back to a full tree rebuild when a
+leaf fills. The next optimization is a proper in-place leaf split.
+
+**Reads (same durability, same fixture):**
+
+| Test | sqlnano | SQLite native C | ratio |
 |---|---:|---:|---:|
-| Point read (`WHERE rowid = 1`) | 12,078,936 rows/sec | 278,935 rows/sec | **sqlnano 43.3x faster** |
-| Full table scan | 20,669,951 rows/sec | 38,478,410 rows/sec | **SQLite 1.86x faster** |
-| Durable writes (autocommit) | 1,830 ops/sec | 392 ops/sec | **sqlnano 4.7x faster** |
+| Point read by rowid | 9.96M ops/sec | 260K ops/sec | **sqlnano 38x** |
+| Full table scan | 20.4M rows/sec | 40M rows/sec | SQLite 1.95x |
 
-sqlnano's point-read path is a specialized direct-rowid lookup (`src/main.zig:432-436`)
-that skips the b-tree walk. The full-scan path materialises and walks the
-table through its own b-tree implementation.
-
-To reproduce:
+### Reproduce
 
 ```sh
 zig build -Doptimize=ReleaseFast
-# create fixture
-sqlite3 test.db "
-  PRAGMA journal_mode=DELETE;
-  CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER);
-  WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 10000)
-  INSERT INTO t(n) SELECT x FROM c;
-"
-./zig-out/bin/sqlnano bench-read  test.db "SELECT * FROM t WHERE rowid = 1" 100000
-./zig-out/bin/sqlnano bench-read  test.db "SELECT * FROM t" 1000
-./zig-out/bin/sqlnano bench-write test.db t 1000
+rm -f /tmp/t.db /tmp/t.db-snwal
+sqlite3 /tmp/t.db 'CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER);'
+./zig-out/bin/sqlnano bench-write /tmp/t.db t 10000 normal   # synchronous=NORMAL
+./zig-out/bin/sqlnano bench-write /tmp/t.db t 10000 full     # synchronous=FULL (default)
+./zig-out/bin/sqlnano bench-write /tmp/t.db t 10000 off      # no durability
 ```
 
-`bench-write` uses a long-lived `Connection` that amortises WAL checkpoint
-flush, so throughput improves with longer runs.
+### What makes the fast path fast
+
+1. **Native WAL** (`*-snwal`) — group-commit, one fsync per op in steady
+   state, deferred checkpoint/compact, crash recovery on reopen. Fuzz
+   tested against every byte offset.
+2. **In-memory data-file image** — `Connection` loads the DB once, all
+   ops mutate in RAM, `writeFile` only fires on flush/close.
+3. **Per-table auto-rowid cache** — first `VALUES (NULL, ...)` triggers
+   one `scanTable` to seed; subsequent inserts hit cache.
+4. **Incremental rightmost-leaf append** — when no indexes and the
+   rightmost leaf has room, we stamp one cell directly into the page
+   (pointer-array + cell_count + content_start_abs) instead of
+   rebuilding the b-tree.
+5. **Per-op arena allocator** backed by the page allocator — schema
+   view, `TableInfo`, WAL payload, cell envelope all allocate into the
+   arena and come free on the next op's reset. Steady state is ~zero
+   malloc/free pairs per op. (Hack borrowed from
+   [justrach/codedb](https://github.com/justrach/codedb).)
+6. **Stack buffer for small cells** — a 256-byte stack slice handles
+   the cell envelope for typical rows; larger rows fall through to the
+   arena.
+7. **Configurable `synchronous`** — `full` (fsync per commit, power-loss
+   safe, default), `normal` (fsync on checkpoint only, matches SQLite
+   WAL+NORMAL), `off` (never fsync).
 
 ## License
 

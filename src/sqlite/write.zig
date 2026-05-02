@@ -105,6 +105,13 @@ pub const Connection = struct {
     /// could shift rowids (explicit rowid INSERT, DELETE, ROLLBACK once
     /// that exists) invalidates the matching entry.
     next_rowid_cache: std.StringHashMap(i64),
+    /// Per-op scratch arena. Reset at the top of every mutating op. Used
+    /// for everything transient in the hot path — parsed schema view,
+    /// table info, WAL payload, cell buffer — so the steady state is
+    /// zero malloc/free pairs per insert. Backed by the page allocator
+    /// so released memory goes straight to the OS instead of being
+    /// retained by the GPA. Inspired by the same hack in justrach/codedb.
+    scratch_arena: std.heap.ArenaAllocator,
 
     /// When the on-disk WAL grows past this many bytes, `maybeCheckpoint`
     /// flushes the image and compacts the WAL. Big enough that a batch
@@ -137,8 +144,12 @@ pub const Connection = struct {
             .image = image,
             .image_dirty = false,
             .next_rowid_cache = std.StringHashMap(i64).init(gpa),
+            .scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         };
-        errdefer conn.deinitCache();
+        errdefer {
+            conn.deinitCache();
+            conn.scratch_arena.deinit();
+        }
 
         var rc = ReplayContext{ .gpa = gpa, .image = &conn.image, .dirty = false };
         try conn.wal.recover(io, 0, replayApply, &rc);
@@ -157,6 +168,7 @@ pub const Connection = struct {
         self.wal.close(self.io);
         self.image.deinit(self.gpa);
         self.deinitCache();
+        self.scratch_arena.deinit();
         self.gpa.free(self.wal_path);
     }
 
@@ -196,18 +208,34 @@ pub const Connection = struct {
     }
 
     pub fn insert(self: *Connection, table_name: []const u8, values: []const InsertValue) WriteError!i64 {
-        const rowid = try self.resolveRowid(table_name, values);
-        const payload = try wal_codec.encodeInsert(self.gpa, table_name, rowid, values);
-        defer self.gpa.free(payload);
+        // One arena reset per op. All transient allocations below use
+        // `scratch` and become zero-cost after the final reset in a
+        // tight loop — no free, no fragmentation, pages reused.
+        _ = self.scratch_arena.reset(.retain_capacity);
+        const scratch = self.scratch_arena.allocator();
+
+        // Parse schema + catalog info ONCE. Both the rowid resolver and
+        // the fast-path apply need them; the previous version parsed
+        // schema twice per insert.
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return error.WalModeUnsupported;
+        const db_schema = try schema.readSchema(reader, scratch);
+        const entry = db_schema.findTable(table_name) orelse return error.TableNotFound;
+        const info = try catalog.tableInfo(entry, scratch);
+        if (values.len != info.columns.len) return error.ColumnCountMismatch;
+        if (info.root_page == 1) return error.UnsupportedInsert;
+
+        const rowid = try self.resolveRowidShared(scratch, reader, db_schema, info, table_name, values);
+
+        const payload = try wal_codec.encodeInsert(scratch, table_name, rowid, values);
         const txn_id = nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_insert, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
 
         // Fast path: no indexes, append-at-end, fits in current rightmost
         // leaf. Short-circuits the full b-tree rebuild that the generic
-        // path would do. On any condition we don't want to handle here
-        // the function returns `false` and we fall through.
-        const fast = try self.tryFastAppendInsert(table_name, values, rowid);
+        // path would do.
+        const fast = try self.tryFastAppendShared(scratch, reader, db_schema, info, values, rowid);
         if (!fast) {
             _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
         }
@@ -218,19 +246,17 @@ pub const Connection = struct {
     }
 
     /// Compute the rowid a `VALUES (NULL, ...)` insert would receive,
-    /// using the per-table cache to skip the `scanTable` scan when
-    /// possible. For explicit rowids we defer to the old slow path.
-    fn resolveRowid(self: *Connection, table_name: []const u8, values: []const InsertValue) WriteError!i64 {
-        const reader = try page.PageReader.init(self.image.items);
-        if (reader.db_header.isWal()) return error.WalModeUnsupported;
-        const db_schema = try schema.readSchema(reader, self.gpa);
-        defer db_schema.deinit(self.gpa);
-        const entry = db_schema.findTable(table_name) orelse return error.TableNotFound;
-        var info = try catalog.tableInfo(entry, self.gpa);
-        defer info.deinit(self.gpa);
-        if (values.len != info.columns.len) return error.ColumnCountMismatch;
-        if (info.root_page == 1) return error.UnsupportedInsert;
-
+    /// reusing already-parsed schema + info from the caller. Falls back
+    /// to a full scan only on a cache miss.
+    fn resolveRowidShared(
+        self: *Connection,
+        scratch: Allocator,
+        reader: page.PageReader,
+        _: schema.Schema,
+        info: catalog.TableInfo,
+        table_name: []const u8,
+        values: []const InsertValue,
+    ) WriteError!i64 {
         const is_auto = blk: {
             if (info.integer_primary_key_index) |ipk| {
                 break :blk switch (values[ipk]) {
@@ -239,20 +265,19 @@ pub const Connection = struct {
                     else => return error.UnsupportedRowid,
                 };
             }
-            break :blk true; // No integer PK; rowid auto-increments.
+            break :blk true;
         };
 
         if (!is_auto) {
             // Explicit rowid — cache can't help; defer to the scan-based
-            // resolver, which also checks for duplicate.
+            // resolver, which also checks for duplicates.
             return resolveInsertRowid(self.gpa, &self.image, table_name, values);
         }
 
         if (self.next_rowid_cache.get(table_name)) |cached| return cached;
 
         // Cold path: one scan to find the current max rowid, then cache.
-        const scanned = try table.scanTable(reader, info.root_page, self.gpa);
-        defer scanned.deinit(self.gpa);
+        const scanned = try table.scanTable(reader, info.root_page, scratch);
         var max: i64 = 0;
         for (scanned.rows) |row| max = @max(max, row.rowid);
         return max + 1;
@@ -268,31 +293,20 @@ pub const Connection = struct {
         }
     }
 
-    /// If the table has no indexes and its rightmost leaf has room for
-    /// the new cell, append the cell in place and return true. Otherwise
-    /// return false — the caller falls through to the full rebuild.
-    ///
-    /// The row's rowid must already be greater than every rowid in the
-    /// table (enforced by the auto-rowid cache). This keeps the leaf's
-    /// rowid ordering intact without rescanning.
-    fn tryFastAppendInsert(
+    /// Same fast path as before, but taking already-parsed schema/info
+    /// from the caller and building the cell on the scratch arena. The
+    /// row's rowid must already be > every rowid in the table (enforced
+    /// upstream by the auto-rowid cache).
+    fn tryFastAppendShared(
         self: *Connection,
-        table_name: []const u8,
+        scratch: Allocator,
+        reader: page.PageReader,
+        db_schema: schema.Schema,
+        info: catalog.TableInfo,
         values: []const InsertValue,
         rowid: i64,
     ) WriteError!bool {
-        const reader = try page.PageReader.init(self.image.items);
-        if (reader.db_header.isWal()) return false;
-        const db_schema = try schema.readSchema(reader, self.gpa);
-        defer db_schema.deinit(self.gpa);
-        const entry = db_schema.findTable(table_name) orelse return false;
-        var info = try catalog.tableInfo(entry, self.gpa);
-        defer info.deinit(self.gpa);
-        if (values.len != info.columns.len) return false;
-        if (info.root_page == 1) return false;
-
-        // Any index on this table → defer to the rebuild path, which
-        // keeps indexes in sync.
+        // Any index on this table → let the rebuild path keep indexes in sync.
         for (db_schema.entries) |e| {
             if (!e.isIndex() or e.root_page <= 0) continue;
             if (std.ascii.eqlIgnoreCase(e.table_name, info.name)) return false;
@@ -303,20 +317,30 @@ pub const Connection = struct {
         // surface a real error.
         const rightmost = rightmostTableLeaf(reader, info.root_page) catch return false;
 
-        // Build the cell bytes.
-        const payload = try encodeRecord(info, rowid, values, self.gpa);
-        defer self.gpa.free(payload);
+        const payload = try encodeRecord(info, rowid, values, scratch);
         const page_size: usize = reader.db_header.page_size;
         const reserved: usize = reader.db_header.reserved_space;
         const usable = page_size - reserved;
         const info_pl = btree.tableLeafPayloadInfo(payload.len, usable);
         if (info_pl.overflow_page != null) return false;
 
-        var cell: std.ArrayList(u8) = .empty;
-        defer cell.deinit(self.gpa);
-        try appendVarint(&cell, self.gpa, @intCast(payload.len));
-        try appendVarint(&cell, self.gpa, @intCast(rowid));
-        try cell.appendSlice(self.gpa, payload);
+        // Stack buffer for the cell envelope when it fits. `2 * 9` is
+        // the max size of two varints (payload_size + rowid) and the
+        // typical payload for a small row is well under 128 bytes, so
+        // almost every insert stays in the stack fast path.
+        var stack_cell: [256]u8 = undefined;
+        const cell_head_max: usize = 2 * 9;
+        const cell_total = cell_head_max + payload.len;
+        const cell_buf: []u8 = if (cell_total <= stack_cell.len)
+            stack_cell[0..]
+        else
+            try scratch.alloc(u8, cell_total);
+
+        var writer_pos: usize = 0;
+        writer_pos += encodeVarintInto(cell_buf[writer_pos..], @intCast(payload.len));
+        writer_pos += encodeVarintInto(cell_buf[writer_pos..], @intCast(rowid));
+        @memcpy(cell_buf[writer_pos..][0..payload.len], payload);
+        const cell_len = writer_pos + payload.len;
 
         const mutable = self.image.items;
         const page_start = (@as(usize, rightmost) - 1) * page_size;
@@ -333,20 +357,17 @@ pub const Connection = struct {
             page_start + stored_content_start;
 
         const ptr_slot = base + 8 + @as(usize, cell_count) * 2;
-        const new_cell_start_abs = content_start_abs_old - cell.items.len;
+        const new_cell_start_abs = content_start_abs_old - cell_len;
         // Must fit: new cell content can't collide with the pointer array
         // after we grow that array by one more slot.
         if (new_cell_start_abs < ptr_slot + 2) return false;
 
-        @memcpy(mutable[new_cell_start_abs..][0..cell.items.len], cell.items);
+        @memcpy(mutable[new_cell_start_abs..][0..cell_len], cell_buf[0..cell_len]);
         const new_rel_off: u16 = @intCast(new_cell_start_abs - page_start);
         writeU16(mutable[ptr_slot..][0..2], new_rel_off);
         writeU16(mutable[base + 3 .. base + 5], cell_count + 1);
         writeU16(mutable[base + 5 .. base + 7], new_rel_off);
 
-        // Bump the file change counter so SQLite notices the mutation on
-        // a reopen. The duplicate write into `version_valid_for` keeps
-        // WAL-aware readers consistent.
         const current_change = readU32(mutable[24..28]);
         writeU32(mutable[24..28], current_change +% 1);
         if (mutable.len >= 96) writeU32(mutable[92..96], current_change +% 1);
@@ -902,6 +923,16 @@ fn appendVarint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u
     var buf: [9]u8 = undefined;
     const n = encodeVarint(&buf, value);
     try list.appendSlice(allocator, buf[0..n]);
+}
+
+/// Like `encodeVarint` but writes into the first bytes of `dst` instead
+/// of a fixed-size array. `dst` must hold at least 9 bytes. Returns the
+/// number of bytes written.
+fn encodeVarintInto(dst: []u8, value: u64) usize {
+    var buf: [9]u8 = undefined;
+    const n = encodeVarint(&buf, value);
+    @memcpy(dst[0..n], buf[0..n]);
+    return n;
 }
 
 fn encodeVarint(out: *[9]u8, value: u64) usize {
