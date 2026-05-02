@@ -360,17 +360,27 @@ pub const Connection = struct {
         if (values.len != info.columns.len) return error.ColumnCountMismatch;
         if (info.root_page == 1) return error.UnsupportedInsert;
 
-        const rowid = try self.resolveRowidShared(scratch, reader, db_schema, info, table_name, values);
+        const resolved = try self.resolveRowidShared(scratch, reader, db_schema, info, table_name, values);
+        const rowid = resolved.rowid;
 
         const payload = try wal_codec.encodeInsert(scratch, table_name, rowid, values);
         const txn_id = nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_insert, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
 
+        // The append-only fast paths (A/B/C) assume the new rowid is
+        // strictly greater than every existing rowid in the rightmost
+        // leaf — true for auto-rowid and for explicit rowids that
+        // happen to extend the key space, but NOT in general. An
+        // explicit rowid smaller than the current max would silently
+        // corrupt b-tree ordering. Gate them behind an in-order check.
+        const is_auto = resolved.is_auto;
+        const in_order = is_auto or self.explicitRowidExtendsTable(reader, info, rowid);
+
         // Fast path A: no indexes, append-at-end, fits in current rightmost
         // leaf. Short-circuits the full b-tree rebuild that the generic
         // path would do.
-        const fast = try self.tryFastAppendShared(scratch, reader, db_schema, info, values, rowid);
+        const fast = in_order and try self.tryFastAppendShared(scratch, reader, db_schema, info, values, rowid);
         if (!fast) {
             // Fast path B: rightmost leaf is full, parent interior has
             // room for one more divider. Allocate one fresh leaf, stamp
@@ -381,7 +391,7 @@ pub const Connection = struct {
             // backing has moved, so anything pointing into the old
             // backing (`reader`, `db_schema`, `info`'s string fields) is
             // dangling. We deliberately don't use them past this point.
-            const split = try self.tryFastSplitAppendShared(scratch, reader, db_schema, info, values, rowid);
+            const split = in_order and try self.tryFastSplitAppendShared(scratch, reader, db_schema, info, values, rowid);
             if (!split) {
                 // Fast path C: rightmost leaf is full AND the parent IS
                 // the root AND the root is itself full. Promote the root
@@ -390,7 +400,7 @@ pub const Connection = struct {
                 // sibling interior pointing to the new leaf, and the new
                 // leaf itself. Past this point the tree depth grows by 1
                 // and subsequent splits go back through path B.
-                const promoted = try self.tryFastPromoteRoot(scratch, reader, db_schema, info, values, rowid);
+                const promoted = in_order and try self.tryFastPromoteRoot(scratch, reader, db_schema, info, values, rowid);
                 if (!promoted) {
                     // Generic rebuild can move row data across pages at
                     // will; force the next flush to rewrite everything.
@@ -405,6 +415,8 @@ pub const Connection = struct {
         return rowid;
     }
 
+    const ResolvedRowid = struct { rowid: i64, is_auto: bool };
+
     /// Compute the rowid a `VALUES (NULL, ...)` insert would receive,
     /// reusing already-parsed schema + info from the caller. Falls back
     /// to a full scan only on a cache miss.
@@ -416,7 +428,7 @@ pub const Connection = struct {
         info: catalog.TableInfo,
         table_name: []const u8,
         values: []const InsertValue,
-    ) WriteError!i64 {
+    ) WriteError!ResolvedRowid {
         const is_auto = blk: {
             if (info.integer_primary_key_index) |ipk| {
                 break :blk switch (values[ipk]) {
@@ -431,16 +443,34 @@ pub const Connection = struct {
         if (!is_auto) {
             // Explicit rowid — cache can't help; defer to the scan-based
             // resolver, which also checks for duplicates.
-            return resolveInsertRowid(self.gpa, &self.image, table_name, values);
+            const rid = try resolveInsertRowid(self.gpa, &self.image, table_name, values);
+            return .{ .rowid = rid, .is_auto = false };
         }
 
-        if (self.next_rowid_cache.get(table_name)) |cached| return cached;
+        if (self.next_rowid_cache.get(table_name)) |cached| {
+            return .{ .rowid = cached, .is_auto = true };
+        }
 
         // Cold path: one scan to find the current max rowid, then cache.
         const scanned = try table.scanTable(reader, info.root_page, scratch);
         var max: i64 = 0;
         for (scanned.rows) |row| max = @max(max, row.rowid);
-        return max + 1;
+        return .{ .rowid = max + 1, .is_auto = true };
+    }
+
+    /// True iff `rowid` is strictly greater than every rowid currently
+    /// in `info.root_page`'s tree — i.e. the append-only fast paths
+    /// are safe. Reuses the rowid cache when populated (O(1)); only
+    /// scans the table on a cache miss. Called only for explicit
+    /// rowids, which are rare in practice.
+    fn explicitRowidExtendsTable(self: *Connection, reader: page.PageReader, info: catalog.TableInfo, rowid: i64) bool {
+        _ = reader;
+        if (self.next_rowid_cache.get(info.name)) |cached| {
+            return rowid >= cached;
+        }
+        // Conservative: no cache yet → fall through to the slow path,
+        // which doesn't care about ordering.
+        return false;
     }
 
     fn bumpRowidCache(self: *Connection, table_name: []const u8, last_rowid: i64) !void {

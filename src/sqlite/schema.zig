@@ -78,21 +78,46 @@ pub const Schema = struct {
 };
 
 pub fn readSchema(reader: page.PageReader, allocator: std.mem.Allocator) SchemaError!Schema {
-    const root = try reader.page(1);
-    const root_header = try btree.PageHeader.parse(root);
-    if (root_header.page_type != .table_leaf) return error.UnsupportedSchemaBTree;
-
     var entries: std.ArrayList(SchemaEntry) = .empty;
     errdefer entries.deinit(allocator);
 
-    var i: usize = 0;
-    while (i < root_header.cell_count) : (i += 1) {
-        const cell = try root_header.cell(root, i);
-        const entry = try parseSchemaCell(cell, allocator);
-        try entries.append(allocator, entry);
-    }
+    try walkSchemaPage(reader, 1, allocator, &entries);
 
     return .{ .entries = try entries.toOwnedSlice(allocator) };
+}
+
+/// Recursively walk `sqlite_schema`'s b-tree starting at `page_number`.
+/// Page 1 is special-cased by `PageHeader.parse`, which skips the
+/// first 100 bytes of the DB header. Large schemas (many tables +
+/// many indexes) spill page 1 from a leaf into an interior root, so
+/// we walk down the right-most / left-child pointers the same way
+/// `scanTable` does for user tables.
+fn walkSchemaPage(reader: page.PageReader, page_number: u32, allocator: std.mem.Allocator, entries: *std.ArrayList(SchemaEntry)) SchemaError!void {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+
+    switch (header.page_type) {
+        .table_leaf => {
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                const entry = try parseSchemaCell(cell, allocator);
+                try entries.append(allocator, entry);
+            }
+        },
+        .table_interior => {
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                if (cell.len < 5) return error.InvalidSchemaCell;
+                const left_child = std.mem.readInt(u32, cell[0..4], .big);
+                try walkSchemaPage(reader, left_child, allocator, entries);
+            }
+            const right = header.right_most_pointer orelse return error.UnsupportedSchemaBTree;
+            try walkSchemaPage(reader, right, allocator, entries);
+        },
+        else => return error.UnsupportedSchemaBTree,
+    }
 }
 
 fn parseSchemaCell(cell: []const u8, allocator: std.mem.Allocator) SchemaError!SchemaEntry {
