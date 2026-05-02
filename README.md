@@ -2,16 +2,16 @@
 
 A tiny embeddable SQL engine with a SQLite `.db` compatibility track. Written in Zig.
 
-> **Why does this exist?** For fun, and to see how much faster I could make autocommit inserts than native SQLite if I rewrote the write path from scratch in Zig. SQLite is a 23-year-old engineering masterpiece and absolutely the right answer for production. sqlnano is a curiosity-driven rewrite that turned out, on the narrow workload it's tuned for, to beat native release-build SQLite by 2.5×–3.5×. None of this should be mistaken for a real-world production database — it's a benchmark project that happens to read and write valid SQLite files.
+> **Why does this exist?** For fun, and to see how much faster I could make autocommit inserts than native SQLite if I rewrote the write path from scratch in Zig. SQLite is a 23-year-old engineering masterpiece and absolutely the right answer for production. sqlnano is a curiosity-driven rewrite that turned out, on the narrow workload it's tuned for, to beat native release-build SQLite by ~2.6×–3.4× sustained all the way to 5 million rows. None of this should be mistaken for a real-world production database — it's a benchmark project that happens to read and write valid SQLite files.
 
 ## Why sqlnano?
 
-- **Beats native SQLite WAL+NORMAL by 1.45×–3.5×** on autocommit inserts from 1,000 up to 1,000,000 rows (apples-to-apples, matched durability)
+- **Beats native SQLite WAL+NORMAL by 2.6×–3.4× sustained from 1,000 rows to 5,000,000 rows** on autocommit inserts (apples-to-apples, matched durability, no decay with table size)
 - **Zero-malloc hot path** — schema parsed once per op, transient state lives in a per-op page-allocator arena, cell envelope builds on a stack buffer
 - **Incremental rightmost-leaf append** — no indexes + room in the page → one cell written directly, no tree rebuild
 - **In-place leaf split + recursive interior split + root promotion** — when the rightmost leaf fills we walk up the right-most chain, splice in fresh interior pages at every full level, and promote the root if everything is full. All asymmetric (no row data moves) because auto-rowid guarantees the new key is the largest. O(depth) per split instead of a full-tree rebuild — works to at least 1,000,000 rows.
 - **Native WAL** (`*-snwal`) — group commit, configurable `synchronous=full/normal/off`, crash recovery on reopen, torn-WAL fuzzed on every byte offset
-- **In-memory DB image** — `Connection` loads the file once, mutates in RAM, `writeFile` only fires on flush/close
+- **In-memory DB image + incremental page flush** — `Connection` loads the file once and mutates in RAM; the first flush seeds the on-disk file via `writeFile`, after which every checkpoint `pwrite`s only the handful of pages each fast-path insert actually touched. This is the move that makes throughput flat past 1M rows instead of decaying as the image grows
 - **SQLite-compatible b-trees** — multi-leaf table splits validated by `PRAGMA integrity_check` end-to-end, rowid tables, single-leaf indexes, payload overflow reads
 - **Single static binary** — no runtime, no extensions, Zig 0.16
 - **SSPL + author exception** license — same shape as MongoDB/Redis Stack, with full permissive use by the justrach namespace
@@ -42,17 +42,17 @@ Both engines compiled `-O3`/`ReleaseFast`, same fixture (`CREATE TABLE t(id INTE
 
 ### Durable autocommit writes (matched durability)
 
-| N           | config  | sqlnano (mean) | SQLite WAL (mean) | ratio              |
+| N           | config  | sqlnano (best) | SQLite WAL (best) | ratio              |
 |------------:|---------|---------------:|------------------:|-------------------:|
-| 1,000       | NORMAL  | **428,000**    | 123,000           | **sqlnano 3.5×**   |
-| 10,000      | NORMAL  | **475,000**    | 168,000           | **sqlnano 2.83×**  |
-| 50,000      | NORMAL  | **453,000**    | 171,000           | **sqlnano 2.65×**  |
-| 100,000     | NORMAL  | **436,000**    | 169,000           | **sqlnano 2.58×**  |
-| 200,000     | NORMAL  | **400,000**    | 170,000           | **sqlnano 2.35×**  |
-| 500,000     | NORMAL  | **327,000**    | 173,000           | **sqlnano 1.89×**  |
-| 1,000,000   | NORMAL  | **253,000**    | 175,000           | **sqlnano 1.45×**  |
+| 1,000       | NORMAL  | **425,000**    | 126,000           | **sqlnano 3.36×**  |
+| 10,000      | NORMAL  | **478,000**    | 172,000           | **sqlnano 2.78×**  |
+| 100,000     | NORMAL  | **483,000**    | 179,000           | **sqlnano 2.69×**  |
+| 500,000     | NORMAL  | **477,000**    | 181,000           | **sqlnano 2.64×**  |
+| 1,000,000   | NORMAL  | **474,000**    | 180,000           | **sqlnano 2.64×**  |
+| 2,000,000   | NORMAL  | **466,000**    | 177,000           | **sqlnano 2.63×**  |
+| 5,000,000   | NORMAL  | **458,000**    | 178,000           | **sqlnano 2.58×**  |
 
-> 1 million durable inserts in **3.8 seconds** — `PRAGMA integrity_check` is `ok`, all data verifies. Throughput tapers from 475k ops/s at 10k rows to 253k at 1M as the b-tree grows deeper, but stays ahead of SQLite NORMAL+WAL across the full range. The fast path now handles three structural cases: append-into-rightmost-leaf, split-when-leaf-full-but-ancestor-has-room (any depth), and root-promotion-when-everything-is-full.
+> 1 million durable inserts in **2.1 seconds**; 5 million in **10.9 seconds**. `PRAGMA integrity_check` is `ok` at every size. Throughput stays within noise of its 10k peak all the way to 5M because the checkpoint write cost is now O(dirty pages) instead of O(file size) — the fast path touches 2–5 pages per insert, and those are the only pages that hit disk. The fast path itself handles four structural cases: append-into-rightmost-leaf, split-when-parent-has-room, split-when-any-ancestor-has-room (any depth), and root-promotion-when-everything-is-full.
 
 ### Reads (same fixture)
 

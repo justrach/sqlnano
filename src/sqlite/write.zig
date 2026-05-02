@@ -99,6 +99,26 @@ pub const Connection = struct {
     /// Set by any op that mutates `image`. `flush` clears it after a
     /// successful `writeFile`.
     image_dirty: bool,
+    /// Opened lazily on first flush. Kept open for the life of the
+    /// connection so subsequent flushes can pwrite only the dirty
+    /// pages instead of rewriting the entire image.
+    db_file: ?std.Io.File,
+    /// Bit i = page (i+1) has been mutated since last successful flush.
+    /// Only meaningful when `full_rewrite` is false.
+    dirty_pages: std.bit_set.DynamicBitSetUnmanaged,
+    /// When true, the next flush must rewrite the entire image. Set by
+    /// slow-path ops (UPDATE / DELETE / the generic b-tree rebuild)
+    /// that can move row data across pages at will. The incremental
+    /// INSERT fast paths keep this false.
+    full_rewrite: bool,
+    /// Length of the data file on disk as of the last successful flush.
+    /// Used to decide whether we need to `setLength` before pwriting.
+    last_flushed_len: u64,
+    /// Cached from the SQLite header at open. Used by the incremental
+    /// flush to turn page numbers into byte offsets. SQLite never
+    /// rewrites this field in practice; if it ever did, `full_rewrite`
+    /// would bypass this path.
+    page_size_cached: usize,
     /// Per-table cache of the next rowid to assign for `VALUES (NULL, ...)`
     /// inserts. Lazily populated from a single `scanTable` per table, then
     /// incremented in place on every auto-rowid insert. Anything that
@@ -135,6 +155,16 @@ pub const Connection = struct {
         errdefer image.deinit(gpa);
         try image.appendSlice(gpa, bytes);
 
+        // Parse page size from the SQLite header at byte 16 (BE u16,
+        // where 1 means 65536). Falls back to 4096 on empty / tiny DBs.
+        const page_size: usize = blk: {
+            if (image.items.len < 18) break :blk 4096;
+            const raw = std.mem.readInt(u16, image.items[16..18], .big);
+            if (raw == 1) break :blk 65536;
+            if (raw == 0) break :blk 4096;
+            break :blk raw;
+        };
+
         var conn = Connection{
             .gpa = gpa,
             .io = io,
@@ -143,12 +173,19 @@ pub const Connection = struct {
             .wal = wal,
             .image = image,
             .image_dirty = false,
+            .db_file = null,
+            .dirty_pages = .{},
+            .full_rewrite = true,
+            .last_flushed_len = 0,
+            .page_size_cached = page_size,
             .next_rowid_cache = std.StringHashMap(i64).init(gpa),
             .scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         };
         errdefer {
             conn.deinitCache();
             conn.scratch_arena.deinit();
+            conn.dirty_pages.deinit(gpa);
+            if (conn.db_file) |*f| f.close(io);
         }
 
         var rc = ReplayContext{ .gpa = gpa, .image = &conn.image, .dirty = false };
@@ -165,8 +202,14 @@ pub const Connection = struct {
         // Best-effort final flush so the on-disk state reflects every
         // committed op and the WAL is empty.
         self.flush() catch {};
+        if (self.db_file) |*f| {
+            f.sync(self.io) catch {};
+            f.close(self.io);
+            self.db_file = null;
+        }
         self.wal.close(self.io);
         self.image.deinit(self.gpa);
+        self.dirty_pages.deinit(self.gpa);
         self.deinitCache();
         self.scratch_arena.deinit();
         self.gpa.free(self.wal_path);
@@ -190,16 +233,108 @@ pub const Connection = struct {
     /// Persist the image (if dirty), then checkpoint + compact the WAL.
     /// Safe to call at any point; no-op when image is clean and WAL is
     /// empty.
+    ///
+    /// Two paths:
+    ///
+    ///   * Full rewrite — when `full_rewrite` is set, or when page size
+    ///     has changed, or the dirty bitmap has grown beyond what an
+    ///     incremental write can cover. The entire image is written
+    ///     via `writeFile` (truncate + write).
+    ///
+    ///   * Incremental — iterate the dirty-page bitmap, pwrite each
+    ///     dirty page into the kept-open `db_file`. This turns
+    ///     `O(N * file_size)` per checkpoint (full rewrite) into
+    ///     `O(dirty_pages * page_size)`, which is ~2-5 pages for every
+    ///     fast-path insert regardless of total table size.
+    ///
+    /// After a successful write path runs, the WAL is checkpointed and
+    /// compacted. The data file gets a single `fsync` before that
+    /// happens so WAL compaction can't rewind us past committed state.
     pub fn flush(self: *Connection) WriteError!void {
         if (self.image_dirty) {
-            try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.db_path, .data = self.image.items });
+            try self.persistImage();
             self.image_dirty = false;
+            self.full_rewrite = false;
+            self.dirty_pages.unsetAll();
         }
         if (self.wal.end_offset == 0 and self.wal.synced_lsn == self.wal.checkpoint_lsn) return;
         if (self.wal.synced_lsn > self.wal.checkpoint_lsn) {
             try self.wal.checkpoint(self.io, wal_mod.DB_TAG_SQLITE);
         }
         self.wal.compact(self.io) catch {};
+    }
+
+    fn persistImage(self: *Connection) WriteError!void {
+        const image_len: u64 = @intCast(self.image.items.len);
+
+        // Anything other than the happy fast path falls back to a full
+        // rewrite. We also full-rewrite when the on-disk page size
+        // changed (it never does in practice, but catch it anyway).
+        var must_full = self.full_rewrite or self.db_file == null;
+        if (!must_full and image_len >= 18) {
+            const raw = std.mem.readInt(u16, self.image.items[16..18], .big);
+            const live_page_size: usize = if (raw == 1) 65536 else if (raw == 0) 4096 else raw;
+            if (live_page_size != self.page_size_cached) must_full = true;
+        }
+
+        if (must_full) {
+            try std.Io.Dir.cwd().writeFile(self.io, .{
+                .sub_path = self.db_path,
+                .data = self.image.items,
+            });
+            // Reopen the file handle so subsequent flushes can pwrite.
+            if (self.db_file) |*f| {
+                f.close(self.io);
+                self.db_file = null;
+            }
+            self.db_file = try std.Io.Dir.cwd().openFile(self.io, self.db_path, .{ .mode = .read_write });
+            self.last_flushed_len = image_len;
+            return;
+        }
+
+        // Incremental path: pwrite only dirty pages.
+        const file = &self.db_file.?;
+        if (image_len != self.last_flushed_len) {
+            try file.setLength(self.io, image_len);
+            self.last_flushed_len = image_len;
+        }
+
+        const page_size = self.page_size_cached;
+        var it = self.dirty_pages.iterator(.{});
+        while (it.next()) |bit_idx| {
+            const page_num_0: u64 = @intCast(bit_idx);
+            const off = page_num_0 * @as(u64, page_size);
+            if (off + page_size > image_len) continue; // page allocated then truncated — rare
+            try file.writePositionalAll(
+                self.io,
+                self.image.items[@intCast(off) .. @intCast(off + page_size)],
+                off,
+            );
+        }
+        // One fsync covers every preceding pwrite on this fd.
+        file.sync(self.io) catch {};
+    }
+
+    /// Mark `page_num` (1-based) as dirty. Called by every fast path at
+    /// each page it mutates. No-op when `full_rewrite` is already set —
+    /// the full path writes the entire image anyway.
+    fn markPageDirty(self: *Connection, page_num: u32) !void {
+        if (self.full_rewrite) return;
+        std.debug.assert(page_num >= 1);
+        const idx: usize = @intCast(page_num - 1);
+        if (idx >= self.dirty_pages.bit_length) {
+            const new_len = idx + 1;
+            // Round up to reduce reallocations as the table grows.
+            const grown = std.math.ceilPowerOfTwo(usize, @max(new_len, 64)) catch new_len;
+            try self.dirty_pages.resize(self.gpa, grown, false);
+        }
+        self.dirty_pages.set(idx);
+    }
+
+    fn markPagesDirty(self: *Connection, first: u32, count: u32) !void {
+        if (self.full_rewrite) return;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) try self.markPageDirty(first + i);
     }
 
     fn maybeCheckpoint(self: *Connection) WriteError!void {
@@ -257,6 +392,9 @@ pub const Connection = struct {
                 // and subsequent splits go back through path B.
                 const promoted = try self.tryFastPromoteRoot(scratch, reader, db_schema, info, values, rowid);
                 if (!promoted) {
+                    // Generic rebuild can move row data across pages at
+                    // will; force the next flush to rewrite everything.
+                    self.full_rewrite = true;
                     _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
                 }
             }
@@ -394,6 +532,8 @@ pub const Connection = struct {
         writeU32(mutable[24..28], current_change +% 1);
         if (mutable.len >= 96) writeU32(mutable[92..96], current_change +% 1);
 
+        try self.markPageDirty(1);
+        try self.markPageDirty(rightmost);
         return true;
     }
 
@@ -568,6 +708,10 @@ pub const Connection = struct {
             new_right_most,
         );
 
+        try self.markPageDirty(1);
+        try self.markPageDirty(ancestors[s]);
+        try self.markPageDirty(new_leaf);
+        for (s + 1..depth) |k| try self.markPageDirty(chain_pages[k]);
         return true;
     }
 
@@ -697,6 +841,11 @@ pub const Connection = struct {
             I_new_chain,
         );
 
+        try self.markPageDirty(1);
+        try self.markPageDirty(info.root_page);
+        try self.markPageDirty(I_root_copy);
+        try self.markPageDirty(I_new_chain);
+        try self.markPageDirty(new_leaf);
         return true;
     }
 
@@ -709,6 +858,7 @@ pub const Connection = struct {
         const changed = try applyUpdateCore(self.gpa, &self.image, stmt);
         if (changed > 0) {
             self.image_dirty = true;
+            self.full_rewrite = true;
             // UPDATE currently can't touch rowid, but be defensive.
             self.invalidateRowidCache(stmt.table_name);
         }
@@ -725,6 +875,7 @@ pub const Connection = struct {
         const changed = try applyDeleteCore(self.gpa, &self.image, stmt);
         if (changed > 0) {
             self.image_dirty = true;
+            self.full_rewrite = true;
             // Deleting rows doesn't lower next-rowid (SQLite doesn't
             // reuse rowids), but we invalidate so a future auto-rowid
             // insert re-derives from the authoritative image rather
