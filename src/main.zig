@@ -256,8 +256,9 @@ fn printParity(writer: *std.Io.Writer) !void {
 }
 
 fn inspectDatabase(init: std.process.Init, writer: *std.Io.Writer, path: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(max_database_bytes));
-    defer init.gpa.free(bytes);
+    var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
+    defer mf.deinit();
+    const bytes = mf.items;
 
     const reader = try sqlnano.sqlite.PageReader.init(bytes);
     const header = reader.db_header;
@@ -321,8 +322,9 @@ fn inspectDatabase(init: std.process.Init, writer: *std.Io.Writer, path: []const
 }
 
 fn selectTable(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, table_name: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(max_database_bytes));
-    defer init.gpa.free(bytes);
+    var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
+    defer mf.deinit();
+    const bytes = mf.items;
 
     const reader = try sqlnano.sqlite.PageReader.init(bytes);
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
@@ -349,8 +351,9 @@ fn selectTable(init: std.process.Init, writer: *std.Io.Writer, path: []const u8,
 }
 
 fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, query: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(max_database_bytes));
-    defer init.gpa.free(bytes);
+    var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
+    defer mf.deinit();
+    const bytes = mf.items;
 
     const reader = try sqlnano.sqlite.PageReader.init(bytes);
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
@@ -404,8 +407,9 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     const iterations = try std.fmt.parseInt(usize, iterations_text, 10);
     if (iterations == 0) return error.InvalidIterationCount;
 
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(max_database_bytes));
-    defer init.gpa.free(bytes);
+    var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
+    defer mf.deinit();
+    const bytes = mf.items;
 
     const reader = try sqlnano.sqlite.PageReader.init(bytes);
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
