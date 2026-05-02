@@ -54,6 +54,42 @@ sqlnano bench-write    path.db users 1000
 sqlnano parity
 ```
 
+## Benchmarks
+
+All engines built with `-O3` / `ReleaseFast` against the same fixture:
+a 10,000-row table `t(id INTEGER PRIMARY KEY, n INTEGER)` in a
+`DELETE`-journaled SQLite `.db`, durable mode (`PRAGMA synchronous=FULL`),
+warm fs cache. `sqlnano` test suite passes all 54 tests.
+
+| Test | sqlnano | SQLite native C | Ratio |
+|---|---:|---:|---:|
+| Point read (`WHERE rowid = 1`) | 12,078,936 rows/sec | 278,935 rows/sec | **sqlnano 43.3x faster** |
+| Full table scan | 20,669,951 rows/sec | 38,478,410 rows/sec | **SQLite 1.86x faster** |
+| Durable writes (autocommit) | 1,830 ops/sec | 392 ops/sec | **sqlnano 4.7x faster** |
+
+sqlnano's point-read path is a specialized direct-rowid lookup (`src/main.zig:432-436`)
+that skips the b-tree walk. The full-scan path materialises and walks the
+table through its own b-tree implementation.
+
+To reproduce:
+
+```sh
+zig build -Doptimize=ReleaseFast
+# create fixture
+sqlite3 test.db "
+  PRAGMA journal_mode=DELETE;
+  CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER);
+  WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 10000)
+  INSERT INTO t(n) SELECT x FROM c;
+"
+./zig-out/bin/sqlnano bench-read  test.db "SELECT * FROM t WHERE rowid = 1" 100000
+./zig-out/bin/sqlnano bench-read  test.db "SELECT * FROM t" 1000
+./zig-out/bin/sqlnano bench-write test.db t 1000
+```
+
+`bench-write` uses a long-lived `Connection` that amortises WAL checkpoint
+flush, so throughput improves with longer runs.
+
 ## License
 
 [Server Side Public License v1, with an author exception for justrach](LICENSE).

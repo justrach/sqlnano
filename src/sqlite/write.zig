@@ -99,6 +99,12 @@ pub const Connection = struct {
     /// Set by any op that mutates `image`. `flush` clears it after a
     /// successful `writeFile`.
     image_dirty: bool,
+    /// Per-table cache of the next rowid to assign for `VALUES (NULL, ...)`
+    /// inserts. Lazily populated from a single `scanTable` per table, then
+    /// incremented in place on every auto-rowid insert. Anything that
+    /// could shift rowids (explicit rowid INSERT, DELETE, ROLLBACK once
+    /// that exists) invalidates the matching entry.
+    next_rowid_cache: std.StringHashMap(i64),
 
     /// When the on-disk WAL grows past this many bytes, `maybeCheckpoint`
     /// flushes the image and compacts the WAL. Big enough that a batch
@@ -130,7 +136,9 @@ pub const Connection = struct {
             .wal = wal,
             .image = image,
             .image_dirty = false,
+            .next_rowid_cache = std.StringHashMap(i64).init(gpa),
         };
+        errdefer conn.deinitCache();
 
         var rc = ReplayContext{ .gpa = gpa, .image = &conn.image, .dirty = false };
         try conn.wal.recover(io, 0, replayApply, &rc);
@@ -148,7 +156,18 @@ pub const Connection = struct {
         self.flush() catch {};
         self.wal.close(self.io);
         self.image.deinit(self.gpa);
+        self.deinitCache();
         self.gpa.free(self.wal_path);
+    }
+
+    fn deinitCache(self: *Connection) void {
+        var it = self.next_rowid_cache.iterator();
+        while (it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.next_rowid_cache.deinit();
+    }
+
+    fn invalidateRowidCache(self: *Connection, table_name: []const u8) void {
+        if (self.next_rowid_cache.fetchRemove(table_name)) |kv| self.gpa.free(kv.key);
     }
 
     /// Persist the image (if dirty), then checkpoint + compact the WAL.
@@ -172,16 +191,162 @@ pub const Connection = struct {
     }
 
     pub fn insert(self: *Connection, table_name: []const u8, values: []const InsertValue) WriteError!i64 {
-        const rowid = try resolveInsertRowid(self.gpa, &self.image, table_name, values);
+        const rowid = try self.resolveRowid(table_name, values);
         const payload = try wal_codec.encodeInsert(self.gpa, table_name, rowid, values);
         defer self.gpa.free(payload);
         const txn_id = nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_insert, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
-        _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
+
+        // Fast path: no indexes, append-at-end, fits in current rightmost
+        // leaf. Short-circuits the full b-tree rebuild that the generic
+        // path would do. On any condition we don't want to handle here
+        // the function returns `false` and we fall through.
+        const fast = try self.tryFastAppendInsert(table_name, values, rowid);
+        if (!fast) {
+            _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
+        }
+        try self.bumpRowidCache(table_name, rowid);
         self.image_dirty = true;
         try self.maybeCheckpoint();
         return rowid;
+    }
+
+    /// Compute the rowid a `VALUES (NULL, ...)` insert would receive,
+    /// using the per-table cache to skip the `scanTable` scan when
+    /// possible. For explicit rowids we defer to the old slow path.
+    fn resolveRowid(self: *Connection, table_name: []const u8, values: []const InsertValue) WriteError!i64 {
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return error.WalModeUnsupported;
+        const db_schema = try schema.readSchema(reader, self.gpa);
+        defer db_schema.deinit(self.gpa);
+        const entry = db_schema.findTable(table_name) orelse return error.TableNotFound;
+        var info = try catalog.tableInfo(entry, self.gpa);
+        defer info.deinit(self.gpa);
+        if (values.len != info.columns.len) return error.ColumnCountMismatch;
+        if (info.root_page == 1) return error.UnsupportedInsert;
+
+        const is_auto = blk: {
+            if (info.integer_primary_key_index) |ipk| {
+                break :blk switch (values[ipk]) {
+                    .null => true,
+                    .integer => |v| if (v <= 0) return error.UnsupportedRowid else false,
+                    else => return error.UnsupportedRowid,
+                };
+            }
+            break :blk true; // No integer PK; rowid auto-increments.
+        };
+
+        if (!is_auto) {
+            // Explicit rowid — cache can't help; defer to the scan-based
+            // resolver, which also checks for duplicate.
+            return resolveInsertRowid(self.gpa, &self.image, table_name, values);
+        }
+
+        if (self.next_rowid_cache.get(table_name)) |cached| return cached;
+
+        // Cold path: one scan to find the current max rowid, then cache.
+        const scanned = try table.scanTable(reader, info.root_page, self.gpa);
+        defer scanned.deinit(self.gpa);
+        var max: i64 = 0;
+        for (scanned.rows) |row| max = @max(max, row.rowid);
+        return max + 1;
+    }
+
+    fn bumpRowidCache(self: *Connection, table_name: []const u8, last_rowid: i64) !void {
+        const gop = try self.next_rowid_cache.getOrPut(table_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.gpa.dupe(u8, table_name);
+            gop.value_ptr.* = last_rowid + 1;
+        } else if (gop.value_ptr.* <= last_rowid) {
+            gop.value_ptr.* = last_rowid + 1;
+        }
+    }
+
+    /// If the table has no indexes and its rightmost leaf has room for
+    /// the new cell, append the cell in place and return true. Otherwise
+    /// return false — the caller falls through to the full rebuild.
+    ///
+    /// The row's rowid must already be greater than every rowid in the
+    /// table (enforced by the auto-rowid cache). This keeps the leaf's
+    /// rowid ordering intact without rescanning.
+    fn tryFastAppendInsert(
+        self: *Connection,
+        table_name: []const u8,
+        values: []const InsertValue,
+        rowid: i64,
+    ) WriteError!bool {
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return false;
+        const db_schema = try schema.readSchema(reader, self.gpa);
+        defer db_schema.deinit(self.gpa);
+        const entry = db_schema.findTable(table_name) orelse return false;
+        var info = try catalog.tableInfo(entry, self.gpa);
+        defer info.deinit(self.gpa);
+        if (values.len != info.columns.len) return false;
+        if (info.root_page == 1) return false;
+
+        // Any index on this table → defer to the rebuild path, which
+        // keeps indexes in sync.
+        for (db_schema.entries) |e| {
+            if (!e.isIndex() or e.root_page <= 0) continue;
+            if (std.ascii.eqlIgnoreCase(e.table_name, info.name)) return false;
+        }
+
+        // Walk to the rightmost leaf. A malformed tree aborts the fast
+        // path quietly; the rebuild caller will either succeed or
+        // surface a real error.
+        const rightmost = rightmostTableLeaf(reader, info.root_page) catch return false;
+
+        // Build the cell bytes.
+        const payload = try encodeRecord(info, rowid, values, self.gpa);
+        defer self.gpa.free(payload);
+        const page_size: usize = reader.db_header.page_size;
+        const reserved: usize = reader.db_header.reserved_space;
+        const usable = page_size - reserved;
+        const info_pl = btree.tableLeafPayloadInfo(payload.len, usable);
+        if (info_pl.overflow_page != null) return false;
+
+        var cell: std.ArrayList(u8) = .empty;
+        defer cell.deinit(self.gpa);
+        try appendVarint(&cell, self.gpa, @intCast(payload.len));
+        try appendVarint(&cell, self.gpa, @intCast(rowid));
+        try cell.appendSlice(self.gpa, payload);
+
+        const mutable = self.image.items;
+        const page_start = (@as(usize, rightmost) - 1) * page_size;
+        if (page_start + page_size > mutable.len) return false;
+        const hdr_off: usize = if (rightmost == 1) header.HEADER_SIZE else 0;
+        const base = page_start + hdr_off;
+        if (mutable[base] != @intFromEnum(btree.PageType.table_leaf)) return false;
+
+        const cell_count = readU16(mutable[base + 3 .. base + 5]);
+        const stored_content_start = readU16(mutable[base + 5 .. base + 7]);
+        const content_start_abs_old: usize = if (stored_content_start == 0)
+            page_start + page_size
+        else
+            page_start + stored_content_start;
+
+        const ptr_slot = base + 8 + @as(usize, cell_count) * 2;
+        const new_cell_start_abs = content_start_abs_old - cell.items.len;
+        // Must fit: new cell content can't collide with the pointer array
+        // after we grow that array by one more slot.
+        if (new_cell_start_abs < ptr_slot + 2) return false;
+
+        @memcpy(mutable[new_cell_start_abs..][0..cell.items.len], cell.items);
+        const new_rel_off: u16 = @intCast(new_cell_start_abs - page_start);
+        writeU16(mutable[ptr_slot..][0..2], new_rel_off);
+        writeU16(mutable[base + 3 .. base + 5], cell_count + 1);
+        writeU16(mutable[base + 5 .. base + 7], new_rel_off);
+
+        // Bump the file change counter so SQLite notices the mutation on
+        // a reopen. The duplicate write into `version_valid_for` keeps
+        // WAL-aware readers consistent.
+        const current_change = readU32(mutable[24..28]);
+        writeU32(mutable[24..28], current_change +% 1);
+        if (mutable.len >= 96) writeU32(mutable[92..96], current_change +% 1);
+
+        return true;
     }
 
     pub fn update(self: *Connection, stmt: @import("ast.zig").UpdateStatement) WriteError!usize {
@@ -191,7 +356,11 @@ pub const Connection = struct {
         _ = try self.wal.write(self.io, txn_id, .row_update, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
         const changed = try applyUpdateCore(self.gpa, &self.image, stmt);
-        if (changed > 0) self.image_dirty = true;
+        if (changed > 0) {
+            self.image_dirty = true;
+            // UPDATE currently can't touch rowid, but be defensive.
+            self.invalidateRowidCache(stmt.table_name);
+        }
         try self.maybeCheckpoint();
         return changed;
     }
@@ -203,11 +372,35 @@ pub const Connection = struct {
         _ = try self.wal.write(self.io, txn_id, .row_delete, wal_mod.DB_TAG_SQLITE, 0, payload);
         try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
         const changed = try applyDeleteCore(self.gpa, &self.image, stmt);
-        if (changed > 0) self.image_dirty = true;
+        if (changed > 0) {
+            self.image_dirty = true;
+            // Deleting rows doesn't lower next-rowid (SQLite doesn't
+            // reuse rowids), but we invalidate so a future auto-rowid
+            // insert re-derives from the authoritative image rather
+            // than a stale count.
+            self.invalidateRowidCache(stmt.table_name);
+        }
         try self.maybeCheckpoint();
         return changed;
     }
 };
+
+fn rightmostTableLeaf(reader: page.PageReader, start_page: u32) !u32 {
+    var p = start_page;
+    while (true) {
+        const ref = try reader.page(p);
+        const hdr = try btree.PageHeader.parse(ref);
+        switch (hdr.page_type) {
+            .table_leaf => return p,
+            .table_interior => p = hdr.right_most_pointer orelse return error.MalformedInterior,
+            else => return error.UnexpectedPageType,
+        }
+    }
+}
+
+fn readU32(bytes: []const u8) u32 {
+    return std.mem.readInt(u32, bytes[0..4], .big);
+}
 
 /// Open the WAL beside `db_path`, replay any committed-but-unapplied
 /// entries against the data file, then truncate the WAL if it ends in a
@@ -1757,6 +1950,7 @@ test "batched inserts defer checkpoint and recover after simulated crash" {
         // data file behind while the WAL still holds the unapplied commits.
         conn.wal.close(testing.io);
         conn.image.deinit(testing.allocator);
+        conn.deinitCache();
         testing.allocator.free(conn.wal_path);
     }
 
