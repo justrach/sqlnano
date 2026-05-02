@@ -6,10 +6,10 @@ A tiny embeddable SQL engine with a SQLite `.db` compatibility track. Written in
 
 ## Why sqlnano?
 
-- **Beats native SQLite WAL+NORMAL by 2.5×–3.5×** on autocommit inserts up to 100,000 rows (apples-to-apples, matched durability)
+- **Beats native SQLite WAL+NORMAL by 1.45×–3.5×** on autocommit inserts from 1,000 up to 1,000,000 rows (apples-to-apples, matched durability)
 - **Zero-malloc hot path** — schema parsed once per op, transient state lives in a per-op page-allocator arena, cell envelope builds on a stack buffer
 - **Incremental rightmost-leaf append** — no indexes + room in the page → one cell written directly, no tree rebuild
-- **In-place leaf split** — when the rightmost leaf fills, allocate one new leaf, stamp the new cell alone, append a single divider into the parent interior. O(1) per split instead of a full-tree rebuild
+- **In-place leaf split + recursive interior split + root promotion** — when the rightmost leaf fills we walk up the right-most chain, splice in fresh interior pages at every full level, and promote the root if everything is full. All asymmetric (no row data moves) because auto-rowid guarantees the new key is the largest. O(depth) per split instead of a full-tree rebuild — works to at least 1,000,000 rows.
 - **Native WAL** (`*-snwal`) — group commit, configurable `synchronous=full/normal/off`, crash recovery on reopen, torn-WAL fuzzed on every byte offset
 - **In-memory DB image** — `Connection` loads the file once, mutates in RAM, `writeFile` only fires on flush/close
 - **SQLite-compatible b-trees** — multi-leaf table splits validated by `PRAGMA integrity_check` end-to-end, rowid tables, single-leaf indexes, payload overflow reads
@@ -42,15 +42,17 @@ Both engines compiled `-O3`/`ReleaseFast`, same fixture (`CREATE TABLE t(id INTE
 
 ### Durable autocommit writes (matched durability)
 
-| N         | config  | sqlnano (mean) | SQLite WAL (mean) | ratio              |
-|----------:|---------|---------------:|------------------:|-------------------:|
-| 1,000     | FULL    | 41,555         | 25,208            | **sqlnano 1.65×**  |
-| 1,000     | NORMAL  | **428,000**    | 123,000           | **sqlnano 3.5×**   |
-| 10,000    | NORMAL  | **475,000**    | 168,000           | **sqlnano 2.83×**  |
-| 50,000    | NORMAL  | **453,000**    | 171,000           | **sqlnano 2.65×**  |
-| 100,000   | NORMAL  | **436,000**    | 169,000           | **sqlnano 2.58×**  |
+| N           | config  | sqlnano (mean) | SQLite WAL (mean) | ratio              |
+|------------:|---------|---------------:|------------------:|-------------------:|
+| 1,000       | NORMAL  | **428,000**    | 123,000           | **sqlnano 3.5×**   |
+| 10,000      | NORMAL  | **475,000**    | 168,000           | **sqlnano 2.83×**  |
+| 50,000      | NORMAL  | **453,000**    | 171,000           | **sqlnano 2.65×**  |
+| 100,000     | NORMAL  | **436,000**    | 169,000           | **sqlnano 2.58×**  |
+| 200,000     | NORMAL  | **400,000**    | 170,000           | **sqlnano 2.35×**  |
+| 500,000     | NORMAL  | **327,000**    | 173,000           | **sqlnano 1.89×**  |
+| 1,000,000   | NORMAL  | **253,000**    | 175,000           | **sqlnano 1.45×**  |
 
-> The earlier 50k cliff is gone — when the rightmost leaf fills we now allocate one new leaf, stamp the cell alone, and append a single divider into the parent interior. O(1) per split. The next limit is at ~150k rows when the parent interior page itself fills (~400 dividers per 4KB page); past that we still need recursive interior splits, which is the next item on parity.
+> 1 million durable inserts in **3.8 seconds** — `PRAGMA integrity_check` is `ok`, all data verifies. Throughput tapers from 475k ops/s at 10k rows to 253k at 1M as the b-tree grows deeper, but stays ahead of SQLite NORMAL+WAL across the full range. The fast path now handles three structural cases: append-into-rightmost-leaf, split-when-leaf-full-but-ancestor-has-room (any depth), and root-promotion-when-everything-is-full.
 
 ### Reads (same fixture)
 

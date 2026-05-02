@@ -237,12 +237,10 @@ pub const Connection = struct {
         // path would do.
         const fast = try self.tryFastAppendShared(scratch, reader, db_schema, info, values, rowid);
         if (!fast) {
-            // Fast path B: no indexes, append-at-end, but the rightmost
-            // leaf is full *and* the tree is already multi-level (root
-            // is interior). Allocate one fresh leaf, stamp the new cell
-            // there alone, and append a single divider into the parent
-            // interior. O(1) per split instead of the full tree rebuild
-            // the slow path would do.
+            // Fast path B: rightmost leaf is full, parent interior has
+            // room for one more divider. Allocate one fresh leaf, stamp
+            // the new cell there alone, append a single divider into the
+            // parent. O(1) per split.
             //
             // After a successful split the post-resize `image.items`
             // backing has moved, so anything pointing into the old
@@ -250,7 +248,17 @@ pub const Connection = struct {
             // dangling. We deliberately don't use them past this point.
             const split = try self.tryFastSplitAppendShared(scratch, reader, db_schema, info, values, rowid);
             if (!split) {
-                _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
+                // Fast path C: rightmost leaf is full AND the parent IS
+                // the root AND the root is itself full. Promote the root
+                // to a level-2 interior — 3 fresh pages: a copy of the
+                // old root holding the existing 400-ish leaves, a fresh
+                // sibling interior pointing to the new leaf, and the new
+                // leaf itself. Past this point the tree depth grows by 1
+                // and subsequent splits go back through path B.
+                const promoted = try self.tryFastPromoteRoot(scratch, reader, db_schema, info, values, rowid);
+                if (!promoted) {
+                    _ = try applyInsertCore(self.gpa, &self.image, table_name, values, rowid, .fresh);
+                }
             }
         }
         try self.bumpRowidCache(table_name, rowid);
@@ -389,14 +397,34 @@ pub const Connection = struct {
         return true;
     }
 
-    /// Fast path B: rightmost leaf is full but the tree already has an
-    /// interior root, so the split is asymmetric (the new auto-rowid
-    /// cell goes into a brand-new rightmost leaf, alone). Allocates one
-    /// fresh page at the end of the file, stamps the cell, and appends
-    /// one divider into the parent interior. Returns false if any
-    /// precondition isn't met (indexed table, root is leaf, parent
-    /// interior is itself full, etc.) — the caller falls through to the
-    /// full rebuild path.
+    /// Fast path B: the rightmost leaf is full. Find the lowest interior
+    /// page on the right-most chain that has room for one more divider
+    /// cell, allocate exactly the new pages we need to splice in a fresh
+    /// rightmost leaf at that level, and stamp the new cell into it.
+    ///
+    /// The shape of the splice depends on where the room is:
+    ///
+    ///   * If the rightmost leaf's parent has room → just one new leaf,
+    ///     one new divider in the parent. (The original O(1) fast split.)
+    ///
+    ///   * If the parent is full but a higher ancestor has room → we
+    ///     allocate one fresh interior at every level between that
+    ///     ancestor and the leaf, plus the new leaf itself. The chain
+    ///     of fresh interiors all carry only a right-most pointer (zero
+    ///     divider cells). The ancestor with room gets one new divider
+    ///     pointing at its previous right-most subtree, and its
+    ///     right_most_pointer is repointed at the top of the fresh
+    ///     chain. This handles the case where a freshly-promoted
+    ///     interior fills up after ~400 rows past the previous root
+    ///     promotion.
+    ///
+    ///   * If no ancestor has room (the root itself is full) → bail and
+    ///     let `tryFastPromoteRoot` grow the tree depth.
+    ///
+    /// All bookkeeping is on the right edge of the tree. Auto-rowid
+    /// guarantees the new cell has the largest rowid by construction,
+    /// so this is a strictly-asymmetric split: existing row data is
+    /// never moved.
     fn tryFastSplitAppendShared(
         self: *Connection,
         scratch: Allocator,
@@ -411,51 +439,58 @@ pub const Connection = struct {
             if (std.ascii.eqlIgnoreCase(e.table_name, info.name)) return false;
         }
 
-        // The root must already be an interior — splitting a single-leaf
-        // root into an interior + 2 leaves is the slow path.
         const root_ref = reader.page(info.root_page) catch return false;
         const root_hdr = btree.PageHeader.parse(root_ref) catch return false;
         if (root_hdr.page_type != .table_interior) return false;
 
-        // Walk down right-most pointers until the page just above the
-        // rightmost leaf. That's where the new divider goes.
-        const parent_info = rightmostInteriorParent(reader, info.root_page) catch return false;
-        const parent_page = parent_info.parent;
-        const old_rightmost = parent_info.leaf;
-        if (parent_page == 0 or old_rightmost == 0) return false;
+        // Walk root → leaf via right-most pointers, collecting the
+        // interior chain. depth = number of interior levels.
+        const max_depth = 8;
+        var ancestors: [max_depth]u32 = undefined;
+        var depth: usize = 0;
+        var walking: u32 = info.root_page;
+        while (depth < max_depth) {
+            const ref = reader.page(walking) catch return false;
+            const hdr = btree.PageHeader.parse(ref) catch return false;
+            switch (hdr.page_type) {
+                .table_leaf => break,
+                .table_interior => {
+                    ancestors[depth] = walking;
+                    depth += 1;
+                    walking = hdr.right_most_pointer orelse return false;
+                },
+                else => return false,
+            }
+        }
+        if (depth == 0) return false; // root is leaf — handled by the slow path
+        if (depth >= max_depth) return false; // tree too deep for this fast path
+        const old_rightmost_leaf = walking;
 
-        // The divider's separator key is the largest rowid in the leaf
-        // we're closing off (i.e. the last cell of `old_rightmost`).
-        const last_rowid = lastRowidInTableLeaf(reader, old_rightmost) catch return false;
+        const last_rowid = lastRowidInTableLeaf(reader, old_rightmost_leaf) catch return false;
 
-        // Build the divider cell: [u32 BE left_child][varint rowid].
+        // Divider template; left_child filled in below depending on `s`.
         var divider_buf: [4 + 9]u8 = undefined;
-        std.mem.writeInt(u32, divider_buf[0..4], old_rightmost, .big);
         const div_v_len = encodeVarintInto(divider_buf[4..], @intCast(last_rowid));
         const divider_len: usize = 4 + div_v_len;
 
-        // Verify parent interior has room for the new divider cell + ptr.
         const page_size: usize = reader.db_header.page_size;
         const reserved: usize = reader.db_header.reserved_space;
-        const parent_start = (@as(usize, parent_page) - 1) * page_size;
-        const parent_hdr_off: usize = if (parent_page == 1) header.HEADER_SIZE else 0;
-        const parent_base = parent_start + parent_hdr_off;
-        const parent_usable_end = parent_start + page_size - reserved;
-        const cell_count = readU16(self.image.items[parent_base + 3 .. parent_base + 5]);
-        const stored_content_start = readU16(self.image.items[parent_base + 5 .. parent_base + 7]);
-        const content_start_abs_old: usize = if (stored_content_start == 0)
-            parent_start + page_size
-        else
-            parent_start + stored_content_start;
-        if (content_start_abs_old > parent_usable_end) return false;
-        const ptr_slot = parent_base + 12 + @as(usize, cell_count) * 2;
-        if (content_start_abs_old < divider_len) return false;
-        const new_div_start_abs = content_start_abs_old - divider_len;
-        // Pointer slot mustn't collide with cell content area after we
-        // grow the pointer array by one slot (2 bytes).
-        if (new_div_start_abs < ptr_slot + 2) return false;
 
-        // Verify the new leaf will actually hold the cell.
+        // Find the lowest ancestor with room for a new divider.
+        var split_at: ?usize = null;
+        var i_iter: usize = depth;
+        while (i_iter > 0) {
+            i_iter -= 1;
+            if (interiorHasRoomForDivider(self.image.items, ancestors[i_iter], page_size, reserved, divider_len)) {
+                split_at = i_iter;
+                break;
+            }
+        }
+        if (split_at == null) return false; // root and all intermediates full → path C
+        const s = split_at.?;
+
+        // Build the new row's cell so we can bail before resize if it
+        // would never fit a leaf.
         const usable: usize = page_size - reserved;
         const payload = try encodeRecord(info, rowid, values, scratch);
         const info_pl = btree.tableLeafPayloadInfo(payload.len, usable);
@@ -467,57 +502,200 @@ pub const Connection = struct {
             stack_cell[0..]
         else
             try scratch.alloc(u8, cell_total);
-        var pos: usize = 0;
-        pos += encodeVarintInto(cell_buf[pos..], @intCast(payload.len));
-        pos += encodeVarintInto(cell_buf[pos..], @intCast(rowid));
-        @memcpy(cell_buf[pos..][0..payload.len], payload);
-        const cell_len = pos + payload.len;
-        // Single-cell leaf: 8-byte header + 2-byte ptr + cell. If even
-        // that doesn't fit, the row is too big for this page size.
+        var cpos: usize = 0;
+        cpos += encodeVarintInto(cell_buf[cpos..], @intCast(payload.len));
+        cpos += encodeVarintInto(cell_buf[cpos..], @intCast(rowid));
+        @memcpy(cell_buf[cpos..][0..payload.len], payload);
+        const cell_len = cpos + payload.len;
         if (cell_len + 8 + 2 > usable) return false;
 
-        // ── Past this point we mutate `self.image`. No earlier returns. ──
+        // ── Past this point we mutate `self.image`. ──
+
+        // Pages we allocate: one intermediate interior at each level in
+        // (s, depth-1] plus the new leaf.
+        const intermediate_chain: usize = depth - 1 - s;
+        const new_pages_needed: usize = intermediate_chain + 1;
 
         const old_image_len = self.image.items.len;
         const file_pages: u32 = @intCast(old_image_len / page_size);
         const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
-        const new_page_num: u32 = effective_page_count + 1;
-        const new_image_len: usize = @as(usize, new_page_num) * page_size;
-        if (new_image_len > old_image_len) {
-            try self.image.resize(self.gpa, new_image_len);
-            @memset(self.image.items[old_image_len..], 0);
-        }
+        const first_new_page: u32 = effective_page_count + 1;
+        const final_page_count: u32 = effective_page_count + @as(u32, @intCast(new_pages_needed));
+        const new_image_len: usize = @as(usize, final_page_count) * page_size;
+        try self.image.resize(self.gpa, new_image_len);
+        @memset(self.image.items[old_image_len..], 0);
         const mutable = self.image.items;
 
-        // Header: bump database_page_count + file_change_counter (and
-        // mirror into version_valid_for so WAL-aware readers stay sane).
-        writeU32(mutable[28..32], new_page_num);
+        writeU32(mutable[28..32], final_page_count);
         const current_change = readU32(mutable[24..28]);
         writeU32(mutable[24..28], current_change +% 1);
         if (mutable.len >= 96) writeU32(mutable[92..96], current_change +% 1);
 
-        // Write the new leaf at `new_page_num`: 8-byte header, 2-byte
-        // pointer to the single cell, cell at the end of the page.
-        const new_leaf_start = (@as(usize, new_page_num) - 1) * page_size;
-        const new_leaf_usable_end = new_leaf_start + page_size - reserved;
-        const new_cell_start_abs = new_leaf_usable_end - cell_len;
-        @memcpy(mutable[new_cell_start_abs..][0..cell_len], cell_buf[0..cell_len]);
-        const new_cell_rel: u16 = @intCast(new_cell_start_abs - new_leaf_start);
-        const new_leaf_base = new_leaf_start; // never page 1 — it's freshly allocated.
-        mutable[new_leaf_base] = @intFromEnum(btree.PageType.table_leaf);
-        writeU16(mutable[new_leaf_base + 1 .. new_leaf_base + 3], 0);
-        writeU16(mutable[new_leaf_base + 3 .. new_leaf_base + 5], 1);
-        writeU16(mutable[new_leaf_base + 5 .. new_leaf_base + 7], new_cell_rel);
-        mutable[new_leaf_base + 7] = 0;
-        writeU16(mutable[new_leaf_base + 8 .. new_leaf_base + 10], new_cell_rel);
+        // Page-number layout for the freshly-allocated pages.
+        //   chain_pages[k] for k in [s+1, depth-1]: intermediate interiors
+        //   new_leaf                              : the new rightmost leaf
+        var chain_pages: [max_depth]u32 = undefined;
+        for (0..intermediate_chain) |k| {
+            chain_pages[s + 1 + k] = first_new_page + @as(u32, @intCast(k));
+        }
+        const new_leaf: u32 = first_new_page + @as(u32, @intCast(intermediate_chain));
 
-        // Append the divider into the parent interior + repoint right_most.
-        @memcpy(mutable[new_div_start_abs..][0..divider_len], divider_buf[0..divider_len]);
-        const new_div_rel: u16 = @intCast(new_div_start_abs - parent_start);
-        writeU16(mutable[ptr_slot..][0..2], new_div_rel);
-        writeU16(mutable[parent_base + 3 .. parent_base + 5], cell_count + 1);
-        writeU16(mutable[parent_base + 5 .. parent_base + 7], new_div_rel);
-        writeU32(mutable[parent_base + 8 .. parent_base + 12], new_page_num);
+        writeSingleCellLeafPage(mutable, new_leaf, page_size, reserved, cell_buf[0..cell_len]);
+
+        if (intermediate_chain > 0) {
+            // Bottom of the chain points at the new leaf; the rest of
+            // the chain points at its successor.
+            writeEmptyInteriorPage(mutable, chain_pages[depth - 1], page_size, reserved, new_leaf);
+            for (s + 1..depth - 1) |k| {
+                writeEmptyInteriorPage(mutable, chain_pages[k], page_size, reserved, chain_pages[k + 1]);
+            }
+        }
+
+        // Append a new divider to the ancestor that has room. The
+        // divider's left_child is whatever the ancestor's right-most
+        // child was a moment ago — i.e. the OLD rightmost subtree at
+        // that level. Its right_most_pointer is repointed to the head
+        // of our freshly-allocated chain (or the new leaf, if no chain).
+        const new_left_child: u32 = if (s == depth - 1) old_rightmost_leaf else ancestors[s + 1];
+        const new_right_most: u32 = if (intermediate_chain == 0) new_leaf else chain_pages[s + 1];
+        std.mem.writeInt(u32, divider_buf[0..4], new_left_child, .big);
+        appendInteriorDivider(
+            mutable,
+            ancestors[s],
+            page_size,
+            reserved,
+            divider_buf[0..divider_len],
+            new_right_most,
+        );
+
+        return true;
+    }
+
+    /// Fast path C: the rightmost leaf is full, its parent is the root,
+    /// and the root is itself full. We can't append a divider in place
+    /// — we need to grow the tree's depth by one. Allocate three fresh
+    /// pages:
+    ///
+    ///   * `I_root_copy`  — a verbatim copy of the old root's bytes.
+    ///   * `I_new_chain`  — a brand-new interior whose right_most_pointer
+    ///                       is the new leaf and which has zero divider
+    ///                       cells.
+    ///   * `new_leaf`     — a fresh leaf containing only the new cell.
+    ///
+    /// Then rewrite the root page in place as a level-2 interior with a
+    /// single divider:
+    ///
+    ///     cell[0] = [u32 BE I_root_copy] [varint last_rowid_in_old_rightmost]
+    ///     right_most_pointer = I_new_chain
+    ///
+    /// Asymmetry is fine: the new cell has the largest rowid in the
+    /// table by construction (auto-rowid + the per-table cache), so the
+    /// only divider key we need is the previous rightmost-leaf's last
+    /// rowid.
+    ///
+    /// Bails when the table has any indexes, when the parent of the
+    /// rightmost leaf is not the root (depth > 1; deeper trees aren't
+    /// handled here yet), or when the root happens to be page 1 (which
+    /// would collide with `sqlite_schema` — never the case for a real
+    /// user table from `sqlite3`).
+    fn tryFastPromoteRoot(
+        self: *Connection,
+        scratch: Allocator,
+        reader: page.PageReader,
+        db_schema: schema.Schema,
+        info: catalog.TableInfo,
+        values: []const InsertValue,
+        rowid: i64,
+    ) WriteError!bool {
+        for (db_schema.entries) |e| {
+            if (!e.isIndex() or e.root_page <= 0) continue;
+            if (std.ascii.eqlIgnoreCase(e.table_name, info.name)) return false;
+        }
+
+        if (info.root_page == 1) return false;
+        const root_ref = reader.page(info.root_page) catch return false;
+        const root_hdr = btree.PageHeader.parse(root_ref) catch return false;
+        if (root_hdr.page_type != .table_interior) return false;
+
+        // Depth = 1 only: rightmost leaf's parent must BE the root.
+        const parent_info = rightmostInteriorParent(reader, info.root_page) catch return false;
+        if (parent_info.parent != info.root_page) return false;
+        const old_rightmost_leaf = parent_info.leaf;
+
+        const last_rowid = lastRowidInTableLeaf(reader, old_rightmost_leaf) catch return false;
+
+        // Build the new row's cell up front so we can bail before resize
+        // if it would never fit a leaf.
+        const page_size: usize = reader.db_header.page_size;
+        const reserved: usize = reader.db_header.reserved_space;
+        const usable: usize = page_size - reserved;
+        const payload = try encodeRecord(info, rowid, values, scratch);
+        const info_pl = btree.tableLeafPayloadInfo(payload.len, usable);
+        if (info_pl.overflow_page != null) return false;
+
+        var stack_cell: [256]u8 = undefined;
+        const cell_total = 2 * 9 + payload.len;
+        const cell_buf: []u8 = if (cell_total <= stack_cell.len)
+            stack_cell[0..]
+        else
+            try scratch.alloc(u8, cell_total);
+        var cpos: usize = 0;
+        cpos += encodeVarintInto(cell_buf[cpos..], @intCast(payload.len));
+        cpos += encodeVarintInto(cell_buf[cpos..], @intCast(rowid));
+        @memcpy(cell_buf[cpos..][0..payload.len], payload);
+        const cell_len = cpos + payload.len;
+        if (cell_len + 8 + 2 > usable) return false;
+
+        // ── Past this point we mutate `self.image`. ──
+
+        const old_image_len = self.image.items.len;
+        const file_pages: u32 = @intCast(old_image_len / page_size);
+        const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
+        const I_root_copy: u32 = effective_page_count + 1;
+        const I_new_chain: u32 = effective_page_count + 2;
+        const new_leaf: u32 = effective_page_count + 3;
+        const final_page_count: u32 = effective_page_count + 3;
+        const new_image_len: usize = @as(usize, final_page_count) * page_size;
+        try self.image.resize(self.gpa, new_image_len);
+        @memset(self.image.items[old_image_len..], 0);
+        const mutable = self.image.items;
+
+        writeU32(mutable[28..32], final_page_count);
+        const current_change = readU32(mutable[24..28]);
+        writeU32(mutable[24..28], current_change +% 1);
+        if (mutable.len >= 96) writeU32(mutable[92..96], current_change +% 1);
+
+        // Copy the entire old root page to I_root_copy. The new
+        // `cell_content_start`, pointer array, etc. are byte-for-byte
+        // identical, so I_root_copy is now a fully-valid interior page
+        // covering the same subtree the old root did.
+        const root_page_start: usize = (@as(usize, info.root_page) - 1) * page_size;
+        const I_root_copy_start: usize = (@as(usize, I_root_copy) - 1) * page_size;
+        @memcpy(
+            mutable[I_root_copy_start .. I_root_copy_start + page_size],
+            mutable[root_page_start .. root_page_start + page_size],
+        );
+
+        // Stamp the new leaf with the single new cell.
+        writeSingleCellLeafPage(mutable, new_leaf, page_size, reserved, cell_buf[0..cell_len]);
+
+        // Build I_new_chain — empty interior, only a right-most pointer.
+        writeEmptyInteriorPage(mutable, I_new_chain, page_size, reserved, new_leaf);
+
+        // Rewrite the (well-known) root page in place as a level-2
+        // interior with one divider cell.
+        var divider_buf: [4 + 9]u8 = undefined;
+        std.mem.writeInt(u32, divider_buf[0..4], I_root_copy, .big);
+        const div_v_len = encodeVarintInto(divider_buf[4..], @intCast(last_rowid));
+        const divider_len: usize = 4 + div_v_len;
+        writeInteriorWithSingleDivider(
+            mutable,
+            info.root_page,
+            page_size,
+            reserved,
+            divider_buf[0..divider_len],
+            I_new_chain,
+        );
 
         return true;
     }
@@ -607,6 +785,153 @@ fn lastRowidInTableLeaf(reader: page.PageReader, leaf_page: u32) !i64 {
     const payload_size_v = @import("varint.zig").parse(cell) catch return error.InvalidTableCell;
     const rowid_v = @import("varint.zig").parse(cell[payload_size_v.len..]) catch return error.InvalidTableCell;
     return @intCast(rowid_v.value);
+}
+
+/// Stamp `page_num` (must not be page 1) as a fresh `table_leaf`
+/// containing exactly `cell` and nothing else. Used by fast paths that
+/// allocate a new rightmost leaf for a single row append.
+fn writeSingleCellLeafPage(
+    mutable: []u8,
+    page_num: u32,
+    page_size: usize,
+    reserved: usize,
+    cell: []const u8,
+) void {
+    std.debug.assert(page_num != 1);
+    const start: usize = (@as(usize, page_num) - 1) * page_size;
+    const usable_end = start + page_size - reserved;
+    const cell_off_abs = usable_end - cell.len;
+    @memcpy(mutable[cell_off_abs..][0..cell.len], cell);
+    const cell_rel: u16 = @intCast(cell_off_abs - start);
+    mutable[start + 0] = @intFromEnum(btree.PageType.table_leaf);
+    writeU16(mutable[start + 1 .. start + 3], 0); // first freeblock
+    writeU16(mutable[start + 3 .. start + 5], 1); // cell_count
+    writeU16(mutable[start + 5 .. start + 7], cell_rel); // cell_content_start
+    mutable[start + 7] = 0; // fragmented free
+    writeU16(mutable[start + 8 .. start + 10], cell_rel);
+}
+
+/// Stamp `page_num` (must not be page 1) as a fresh `table_interior`
+/// with zero divider cells and a single right-most pointer. Used by the
+/// root-promotion path to add a brand-new interior chain on the right
+/// edge of the tree.
+fn writeEmptyInteriorPage(
+    mutable: []u8,
+    page_num: u32,
+    page_size: usize,
+    reserved: usize,
+    right_most_pointer: u32,
+) void {
+    std.debug.assert(page_num != 1);
+    const start: usize = (@as(usize, page_num) - 1) * page_size;
+    // For a 0-cell page, `cell_content_start` is the end of the usable
+    // area (cells would START there if any existed). SQLite's encoding
+    // of `cell_content_start` reads a stored 0 as 65536, so for a
+    // 65536-byte page we MUST store 0; for any smaller page size we
+    // store the actual offset, otherwise integrity_check flags
+    // "free space corruption" because SQLite thinks the cell content
+    // area extends past the end of the page.
+    const usable_end_rel: usize = page_size - reserved;
+    const stored_content_start: u16 = if (usable_end_rel == 65536)
+        0
+    else
+        @intCast(usable_end_rel);
+    mutable[start + 0] = @intFromEnum(btree.PageType.table_interior);
+    writeU16(mutable[start + 1 .. start + 3], 0); // first freeblock
+    writeU16(mutable[start + 3 .. start + 5], 0); // cell_count
+    writeU16(mutable[start + 5 .. start + 7], stored_content_start);
+    mutable[start + 7] = 0; // fragmented free
+    writeU32(mutable[start + 8 .. start + 12], right_most_pointer);
+}
+
+/// True iff the given `table_interior` page has enough free bytes to
+/// hold one more divider cell of `divider_len` bytes plus its 2-byte
+/// pointer-array slot. Cheap O(1) check on the page header — does no
+/// allocation.
+fn interiorHasRoomForDivider(
+    image: []const u8,
+    page_num: u32,
+    page_size: usize,
+    reserved: usize,
+    divider_len: usize,
+) bool {
+    const start = (@as(usize, page_num) - 1) * page_size;
+    const hdr_off: usize = if (page_num == 1) header.HEADER_SIZE else 0;
+    const base = start + hdr_off;
+    const usable_end = start + page_size - reserved;
+    if (base + 12 > usable_end) return false;
+    const cell_count = readU16(image[base + 3 .. base + 5]);
+    const stored_content_start = readU16(image[base + 5 .. base + 7]);
+    const content_start_abs: usize = if (stored_content_start == 0)
+        start + page_size
+    else
+        start + stored_content_start;
+    if (content_start_abs > usable_end) return false;
+    const ptr_slot = base + 12 + @as(usize, cell_count) * 2;
+    if (content_start_abs < divider_len) return false;
+    const new_div_start = content_start_abs - divider_len;
+    return new_div_start >= ptr_slot + 2;
+}
+
+/// Append `divider_cell` to an existing `table_interior` page, set its
+/// right-most pointer to `new_right_most`, and update the page header
+/// (cell_count, cell_content_start). The caller must have verified
+/// space via `interiorHasRoomForDivider` first; this routine performs
+/// no bounds checks.
+fn appendInteriorDivider(
+    mutable: []u8,
+    page_num: u32,
+    page_size: usize,
+    reserved: usize,
+    divider_cell: []const u8,
+    new_right_most: u32,
+) void {
+    _ = reserved;
+    const start = (@as(usize, page_num) - 1) * page_size;
+    const hdr_off: usize = if (page_num == 1) header.HEADER_SIZE else 0;
+    const base = start + hdr_off;
+    const cell_count = readU16(mutable[base + 3 .. base + 5]);
+    const stored_content_start = readU16(mutable[base + 5 .. base + 7]);
+    const content_start_abs_old: usize = if (stored_content_start == 0)
+        start + page_size
+    else
+        start + stored_content_start;
+    const new_cell_start_abs = content_start_abs_old - divider_cell.len;
+    @memcpy(mutable[new_cell_start_abs..][0..divider_cell.len], divider_cell);
+    const new_cell_rel: u16 = @intCast(new_cell_start_abs - start);
+    const ptr_slot = base + 12 + @as(usize, cell_count) * 2;
+    writeU16(mutable[ptr_slot..][0..2], new_cell_rel);
+    writeU16(mutable[base + 3 .. base + 5], cell_count + 1);
+    writeU16(mutable[base + 5 .. base + 7], new_cell_rel);
+    writeU32(mutable[base + 8 .. base + 12], new_right_most);
+}
+
+/// Stamp `page_num` (which may be the existing root page; the caller is
+/// expected to have copied the old contents elsewhere first) as a fresh
+/// `table_interior` containing exactly one divider cell, plus a
+/// right-most pointer. Used by root promotion when the existing root
+/// fills.
+fn writeInteriorWithSingleDivider(
+    mutable: []u8,
+    page_num: u32,
+    page_size: usize,
+    reserved: usize,
+    divider_cell: []const u8,
+    right_most_pointer: u32,
+) void {
+    std.debug.assert(page_num != 1);
+    const start: usize = (@as(usize, page_num) - 1) * page_size;
+    const usable_end = start + page_size - reserved;
+    const cell_off_abs = usable_end - divider_cell.len;
+    @memcpy(mutable[cell_off_abs..][0..divider_cell.len], divider_cell);
+    const cell_rel: u16 = @intCast(cell_off_abs - start);
+    mutable[start + 0] = @intFromEnum(btree.PageType.table_interior);
+    writeU16(mutable[start + 1 .. start + 3], 0); // first freeblock
+    writeU16(mutable[start + 3 .. start + 5], 1); // cell_count
+    writeU16(mutable[start + 5 .. start + 7], cell_rel); // cell_content_start
+    mutable[start + 7] = 0; // fragmented free
+    writeU32(mutable[start + 8 .. start + 12], right_most_pointer);
+    writeU16(mutable[start + 12 .. start + 14], cell_rel); // pointer to cell 0
 }
 
 fn readU32(bytes: []const u8) u32 {
