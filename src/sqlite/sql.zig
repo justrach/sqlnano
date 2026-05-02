@@ -38,6 +38,7 @@ pub const SqlError = error{
     UnsupportedIndexBTree,
     InvalidIndexCell,
     RowNotFound,
+    TooManyColumns,
 };
 
 pub const SelectStatement = ast.SelectStatement;

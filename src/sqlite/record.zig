@@ -8,6 +8,7 @@ pub const RecordError = error{
     ValueOutOfBounds,
     VarintTooSmall,
     VarintOverflow,
+    TooManyColumns,
 };
 
 pub const Value = union(enum) {
@@ -25,6 +26,48 @@ pub const Record = struct {
         allocator.free(self.values);
     }
 };
+
+/// Maximum column count the zero-alloc `parseInline` path will accept.
+/// Real-world SQLite schemas are effectively always under this — the
+/// engine's own hard limit is 2000 but 99% of tables are <20 cols.
+pub const MAX_INLINE_VALUES = 64;
+
+/// Stack-allocated record view. Fields are valid only as long as the
+/// backing cell bytes outlive the view.
+pub const InlineRecord = struct {
+    values: [MAX_INLINE_VALUES]Value,
+    len: usize,
+
+    pub fn slice(self: *const InlineRecord) []const Value {
+        return self.values[0..self.len];
+    }
+};
+
+/// Parse a SQLite record into a stack-allocated buffer — no heap
+/// allocation at all. Returns `error.TooManyColumns` when the record
+/// has more than `MAX_INLINE_VALUES` columns; the caller should fall
+/// back to the heap-based `parse` for wide rows. Decoded text/blob
+/// values point directly into `bytes`.
+pub fn parseInline(bytes: []const u8, out: *InlineRecord) RecordError!void {
+    const header_size_varint = try parseVarint(bytes);
+    const header_size: usize = @intCast(header_size_varint.value);
+    if (header_size == 0 or header_size > bytes.len) return error.InvalidHeaderSize;
+
+    var header_pos: usize = header_size_varint.len;
+    var body_pos = header_size;
+    var n: usize = 0;
+    while (header_pos < header_size) {
+        if (n >= MAX_INLINE_VALUES) return error.TooManyColumns;
+        const serial = try parseVarint(bytes[header_pos..header_size]);
+        header_pos += serial.len;
+        const decoded = try decodeValue(serial.value, bytes[body_pos..]);
+        out.values[n] = decoded.value;
+        body_pos += decoded.len;
+        n += 1;
+    }
+    if (header_pos != header_size) return error.InvalidHeaderSize;
+    out.len = n;
+}
 
 pub fn parse(bytes: []const u8, allocator: std.mem.Allocator) RecordError!Record {
     const header_size_varint = try parseVarint(bytes);

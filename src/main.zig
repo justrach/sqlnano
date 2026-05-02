@@ -417,7 +417,15 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     var info = try sqlnano.sqlite.tableInfo(entry, init.gpa);
     defer info.deinit(init.gpa);
 
-    var mode: []const u8 = "full-scan";
+    // Detect `SELECT COUNT(*) FROM t` (no WHERE) — SQLite's fast
+    // COUNT path also just sums leaf-header cell counts, so we match
+    // its apples-to-apples shape by doing the same.
+    const is_count_star = stmt.where_expr == null and
+        stmt.joins.len == 0 and
+        stmt.projections.len == 1 and
+        stmt.projections[0] == .count_star;
+
+    var mode: []const u8 = if (is_count_star) "count-star" else "full-scan";
     var rowid: ?i64 = null;
     var indexed_rowids: ?[]i64 = null;
     defer if (indexed_rowids) |ids| init.gpa.free(ids);
@@ -464,10 +472,39 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
                     found.deinit(init.gpa);
                 }
             }
+        } else if (is_count_star) {
+            const n = try sqlnano.sqlite.table_mod.countRows(reader, info.root_page);
+            total_rows += @intCast(n);
         } else {
-            const tbl = try sqlnano.sqlite.scanTable(reader, info.root_page, init.gpa);
-            total_rows += tbl.rows.len;
-            tbl.deinit(init.gpa);
+            // Zero-alloc full scan. `scanTableForEach` streams rows
+            // through a stack-backed `InlineRecord` view and fires the
+            // `Counter.tick` callback per row — the whole scan allocates
+            // nothing per row (and nothing at all beyond the initial
+            // page reads). This is what makes the reported
+            // `rows_per_sec` reflect raw b-tree walking cost rather
+            // than ArrayList churn.
+            const Counter = struct {
+                total: *u64,
+                sink: *i64,
+                fn tick(ctx: *const @This(), rid: i64, values: []const sqlnano.sqlite.record_mod.Value) anyerror!void {
+                    ctx.total.* += 1;
+                    // Sum rowid + every integer column into a sink so the
+                    // optimizer can't elide value decoding. Matches what
+                    // SQLite's bench harness does (sqlite3_column_int64
+                    // on every column).
+                    ctx.sink.* +%= rid;
+                    for (values) |v| switch (v) {
+                        .integer => |x| ctx.sink.* +%= x,
+                        else => {},
+                    };
+                }
+            };
+            var rows_this_iter: u64 = 0;
+            var sink: i64 = 0;
+            const ctx: Counter = .{ .total = &rows_this_iter, .sink = &sink };
+            try sqlnano.sqlite.table_mod.scanTableForEach(reader, info.root_page, &ctx, Counter.tick);
+            total_rows += rows_this_iter;
+            std.mem.doNotOptimizeAway(sink);
         }
     }
     const end = std.Io.Clock.awake.now(init.io).toNanoseconds();

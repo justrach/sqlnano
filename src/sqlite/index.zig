@@ -23,6 +23,7 @@ pub const IndexError = error{
     ValueOutOfBounds,
     VarintTooSmall,
     VarintOverflow,
+    TooManyColumns,
 };
 
 pub const IndexEntry = struct {

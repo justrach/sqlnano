@@ -23,6 +23,7 @@ pub const SchemaError = error{
     InvalidSerialType,
     ValueOutOfBounds,
     VarintTooSmall,
+    TooManyColumns,
     VarintOverflow,
 };
 

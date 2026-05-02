@@ -25,6 +25,7 @@ pub const TableError = error{
     ValueOutOfBounds,
     VarintTooSmall,
     VarintOverflow,
+    TooManyColumns,
 };
 
 pub const Row = struct {
@@ -56,6 +57,95 @@ pub fn scanTable(reader: page.PageReader, root_page: u32, allocator: std.mem.All
 
     try scanTablePage(reader, root_page, allocator, &rows);
     return .{ .rows = try rows.toOwnedSlice(allocator) };
+}
+
+/// Zero-allocation row-at-a-time table scan. For each row on each
+/// leaf, calls `onRow(ctx, rowid, values)` with a stack-allocated
+/// view. Text/blob slices inside `values` point directly into the
+/// backing page buffer, so they're valid until the next callback
+/// invocation AT MOST — callers that need to retain values must
+/// copy them out.
+///
+/// Bails out with `error.TooManyColumns` on rows wider than
+/// `record.MAX_INLINE_VALUES` (default 64) without falling back; for
+/// the query executor we still use the allocating `scanTable`. This
+/// path is built for hot aggregation / bench loops.
+///
+/// Overflow payloads aren't supported here either — rows that spill
+/// past the leaf page return `error.PayloadOverflowUnsupported`.
+pub fn scanTableForEach(
+    reader: page.PageReader,
+    root_page: u32,
+    ctx: anytype,
+    comptime onRow: fn (ctx: @TypeOf(ctx), rowid: i64, values: []const record.Value) anyerror!void,
+) anyerror!void {
+    try scanTableForEachPage(reader, root_page, ctx, onRow);
+}
+
+fn scanTableForEachPage(
+    reader: page.PageReader,
+    page_number: u32,
+    ctx: anytype,
+    comptime onRow: fn (ctx: @TypeOf(ctx), rowid: i64, values: []const record.Value) anyerror!void,
+) anyerror!void {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    switch (header.page_type) {
+        .table_leaf => {
+            var inline_rec: record.InlineRecord = undefined;
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                const prefix = try parseTableLeafCellPrefix(cell);
+                if (prefix.payload_start + prefix.payload_size > cell.len) return error.PayloadOverflowUnsupported;
+                try record.parseInline(cell[prefix.payload_start .. prefix.payload_start + prefix.payload_size], &inline_rec);
+                try onRow(ctx, prefix.rowid, inline_rec.slice());
+            }
+        },
+        .table_interior => {
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                if (cell.len < 5) return error.InvalidTableCell;
+                const left_child = readU32(cell[0..4]);
+                _ = try parseVarint(cell[4..]);
+                try scanTableForEachPage(reader, left_child, ctx, onRow);
+            }
+            const right = header.right_most_pointer orelse return error.InvalidTableCell;
+            try scanTableForEachPage(reader, right, ctx, onRow);
+        },
+        else => return error.UnsupportedTableBTree,
+    }
+}
+
+/// Count the number of rows in `root_page`'s table by summing leaf
+/// cell counts from the b-tree header — no per-row parse, no
+/// allocation. Matches what SQLite's `SELECT COUNT(*)` compiles down
+/// to when there's no WHERE clause.
+pub fn countRows(reader: page.PageReader, root_page: u32) TableError!u64 {
+    var total: u64 = 0;
+    try countRowsPage(reader, root_page, &total);
+    return total;
+}
+
+fn countRowsPage(reader: page.PageReader, page_number: u32, total: *u64) TableError!void {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    switch (header.page_type) {
+        .table_leaf => total.* += header.cell_count,
+        .table_interior => {
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                if (cell.len < 5) return error.InvalidTableCell;
+                const left_child = readU32(cell[0..4]);
+                try countRowsPage(reader, left_child, total);
+            }
+            const right = header.right_most_pointer orelse return error.InvalidTableCell;
+            try countRowsPage(reader, right, total);
+        },
+        else => return error.UnsupportedTableBTree,
+    }
 }
 
 pub fn findRowByRowid(reader: page.PageReader, root_page: u32, wanted_rowid: i64, allocator: std.mem.Allocator) TableError!?Row {
