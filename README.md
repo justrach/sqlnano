@@ -1,0 +1,91 @@
+# sqlnano
+
+A small embeddable SQL engine in Zig 0.16 with a SQLite `.db` compatibility track.
+
+The first public story:
+
+> sqlnano is a small embeddable Zig SQL engine with a lightweight core, a
+> SQLite `.db` compatibility track, an incremental prepared-statement API, and
+> honest benchmarks against SQLite and Turso. The first compatibility milestone
+> is safe SQLite database identification and read-only header parsing, followed
+> by read-only table scanning before any SQLite-compatible writes.
+
+## Status
+
+See [`src/sqlite/parity.zig`](src/sqlite/parity.zig) for the live tracker. Run
+
+```sh
+zig build run -- parity
+```
+
+to print the current matrix.
+
+Highlights:
+
+- Reads SQLite `.db` files: header validation, `sqlite_schema`, table b-tree
+  scans (rowid + interior), simple non-unique single-column indexes, payload
+  overflow.
+- Writes via a native WAL (`*-snwal` beside the data file): group commit, one
+  fsync per op in steady state, deferred checkpoint + compact, crash recovery
+  on reopen, and torn-WAL truncation. Verified by a fuzz test that walks every
+  byte offset.
+- Tables grow past one page via interior-root + multi-leaf splits, validated
+  by `PRAGMA integrity_check`. Indexes still single-leaf for now.
+
+## Build & test
+
+```sh
+zig build              # builds the static library and the `sqlnano` CLI
+zig build test         # runs the test suite (Debug)
+zig build test -Doptimize=ReleaseFast  # runs the heavier split tests
+```
+
+`sqlite3` on PATH is required for the integration tests; they `SkipZigTest`
+when it is missing.
+
+## CLI
+
+```sh
+sqlnano inspect path.db
+sqlnano select  path.db 'SELECT name FROM users WHERE id = 1'
+sqlnano exec    path.db "INSERT INTO users VALUES (NULL, 'alice', 30)"
+sqlnano wal-checkpoint path.db
+sqlnano bench-write    path.db users 1000
+sqlnano parity
+```
+
+## License
+
+[Server Side Public License v1, with an author exception for justrach](LICENSE).
+The exception lets justrach (and software/services owned by justrach) offer
+sqlnano as a service without the SSPL §13 obligations; everyone else is bound
+by full unmodified SSPL.
+
+## Layout
+
+```
+src/sqlnano.zig          public API surface
+src/main.zig             CLI
+src/sqlite/header.zig    SQLite database header parser
+src/sqlite/page.zig      Page reader
+src/sqlite/btree.zig     B-tree page header
+src/sqlite/record.zig    Record decoder
+src/sqlite/varint.zig    SQLite varint
+src/sqlite/schema.zig    sqlite_schema reader
+src/sqlite/catalog.zig   CREATE TABLE column resolver
+src/sqlite/table.zig     Table b-tree walker
+src/sqlite/index.zig     Index b-tree walker
+src/sqlite/tokenizer.zig SQL tokenizer
+src/sqlite/parser.zig    SQL parser (SELECT/INSERT/UPDATE/DELETE subset)
+src/sqlite/ast.zig       Tiny AST
+src/sqlite/sql.zig       Query executor
+src/sqlite/wal.zig       Native sqlnano WAL (group commit + crash recovery)
+src/sqlite/wal_codec.zig WAL payload codec
+src/sqlite/write.zig     INSERT/UPDATE/DELETE + b-tree splits
+src/sqlite/parity.zig    Compatibility tracker
+```
+
+## Plan
+
+[`plan.md`](plan.md) is the execution roadmap. [`architecture.md`](architecture.md)
+holds the technical contracts.
