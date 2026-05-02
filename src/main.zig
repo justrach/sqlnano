@@ -359,12 +359,19 @@ fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     defer result.deinit(init.gpa);
 
     try writer.print("table: {s}\n", .{result.table_info.name});
-    try writer.print("columns: ", .{});
-    try printColumns(writer, result.table_info.columns);
-    try writer.print("\n", .{});
+    try writer.print("columns: [", .{});
+    for (result.columns, 0..) |col, i| {
+        if (i > 0) try writer.print(", ", .{});
+        try writer.print("{s}", .{col.name});
+    }
+    try writer.print("]\n", .{});
     try writer.print("rows: {d}\n", .{result.rows.len});
     for (result.rows) |row| {
-        try writer.print("{d}: ", .{row.rowid});
+        if (row.rowid >= 0) {
+            try writer.print("{d}: ", .{row.rowid});
+        } else {
+            try writer.print("-: ", .{});
+        }
         try printNamedValues(writer, row.values);
         try writer.print("\n", .{});
     }
@@ -404,7 +411,8 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
     defer schema.deinit(init.gpa);
 
-    const stmt = try sqlnano.sqlite.parseSelect(query);
+    const stmt = try sqlnano.sqlite.parseSelect(query, init.gpa);
+    defer stmt.deinit(init.gpa);
     const entry = schema.findTable(stmt.table_name) orelse return error.TableNotFound;
     var info = try sqlnano.sqlite.tableInfo(entry, init.gpa);
     defer info.deinit(init.gpa);
@@ -414,11 +422,25 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     var indexed_rowids: ?[]i64 = null;
     defer if (indexed_rowids) |ids| init.gpa.free(ids);
 
-    if (stmt.where_clause) |where| {
-        if (sqlnano.sqlite.sql_mod.whereRowidEquals(where)) |id| {
-            rowid = id;
-            mode = "rowid-direct";
-        } else if (try sqlnano.sqlite.sql_mod.indexedRowids(reader, schema, info, where, init.gpa)) |ids| {
+    // bench-read accepts the same tiny subset as before — a single
+    // `col = lit` equality at the top of the WHERE tree. Anything
+    // richer falls out as `UnsupportedBenchmarkQuery`.
+    if (stmt.where_expr) |w| {
+        const wb = w.*;
+        if (wb != .binary or wb.binary.op != .eq) return error.UnsupportedBenchmarkQuery;
+        const eq = wb.binary;
+        if (eq.lhs.* != .column or eq.rhs.* != .literal) return error.UnsupportedBenchmarkQuery;
+        const cname = eq.lhs.column.name;
+        const lit = eq.rhs.literal;
+        if (sqlnano.sqlite.sql_mod.asciiEqlPub(cname, "rowid")) {
+            switch (lit) {
+                .integer => |v| {
+                    rowid = v;
+                    mode = "rowid-direct";
+                },
+                else => return error.UnsupportedBenchmarkQuery,
+            }
+        } else if (try sqlnano.sqlite.sql_mod.indexedRowidsForColumn(reader, schema, info, cname, lit, init.gpa)) |ids| {
             indexed_rowids = ids;
             mode = "prepared-index-rowids";
         } else {

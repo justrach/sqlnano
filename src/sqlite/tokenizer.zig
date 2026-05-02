@@ -22,6 +22,19 @@ pub const Keyword = enum {
     index,
     on,
     null,
+    and_,
+    or_,
+    limit,
+    order,
+    by,
+    desc,
+    asc,
+    inner,
+    join,
+    as,
+    count,
+    is,
+    not,
 };
 
 pub const Kind = enum {
@@ -37,6 +50,12 @@ pub const Kind = enum {
     left_paren,
     right_paren,
     equals,
+    lt,
+    le,
+    gt,
+    ge,
+    ne,
+    dot,
 };
 
 pub const Token = struct {
@@ -84,6 +103,35 @@ pub const Tokenizer = struct {
             '(' => return self.single(.left_paren, start),
             ')' => return self.single(.right_paren, start),
             '=' => return self.single(.equals, start),
+            '.' => return self.single(.dot, start),
+            '<' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '=') {
+                    self.pos += 1;
+                    return .{ .kind = .le, .lexeme = self.input[start..self.pos], .start = start, .end = self.pos };
+                }
+                if (self.pos < self.input.len and self.input[self.pos] == '>') {
+                    self.pos += 1;
+                    return .{ .kind = .ne, .lexeme = self.input[start..self.pos], .start = start, .end = self.pos };
+                }
+                return .{ .kind = .lt, .lexeme = self.input[start..self.pos], .start = start, .end = self.pos };
+            },
+            '>' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '=') {
+                    self.pos += 1;
+                    return .{ .kind = .ge, .lexeme = self.input[start..self.pos], .start = start, .end = self.pos };
+                }
+                return .{ .kind = .gt, .lexeme = self.input[start..self.pos], .start = start, .end = self.pos };
+            },
+            '!' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '=') {
+                    self.pos += 1;
+                    return .{ .kind = .ne, .lexeme = self.input[start..self.pos], .start = start, .end = self.pos };
+                }
+                return error.InvalidCharacter;
+            },
             '\'' => return self.string(start),
             '"', '`', '[' => return self.quotedIdentifier(start),
             '-', '0'...'9' => return self.integer(start),
@@ -243,6 +291,19 @@ pub fn keywordFor(text: []const u8) ?Keyword {
         .{ "INDEX", Keyword.index },
         .{ "ON", Keyword.on },
         .{ "NULL", Keyword.null },
+        .{ "AND", Keyword.and_ },
+        .{ "OR", Keyword.or_ },
+        .{ "LIMIT", Keyword.limit },
+        .{ "ORDER", Keyword.order },
+        .{ "BY", Keyword.by },
+        .{ "DESC", Keyword.desc },
+        .{ "ASC", Keyword.asc },
+        .{ "INNER", Keyword.inner },
+        .{ "JOIN", Keyword.join },
+        .{ "AS", Keyword.as },
+        .{ "COUNT", Keyword.count },
+        .{ "IS", Keyword.is },
+        .{ "NOT", Keyword.not },
     }) |entry| {
         if (std.ascii.eqlIgnoreCase(text, entry[0])) return entry[1];
     }

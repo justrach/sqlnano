@@ -50,15 +50,15 @@ pub const features = [_]Feature{
     },
     .{
         .area = "Full SQL grammar",
-        .status = .scaffold,
-        .evidence = "Reusable tokenizer and shared AST parser exist for tiny SELECT and INSERT VALUES forms.",
-        .next = "Expand SELECT projections/expressions, UPDATE, DELETE, DDL, joins, ordering, grouping, and functions.",
+        .status = .partial,
+        .evidence = "SELECT supports projections (*, col, t.col, t.*, AS aliases), COUNT(*), WHERE with AND/OR/=/!=/</<=/>/>=/<>/IS NULL/IS NOT NULL, INNER JOIN (with qualified names and table aliases, explicit or implicit via 'JOIN'), ORDER BY col [ASC|DESC], LIMIT N. INSERT/UPDATE/DELETE still only accept the tiny legacy forms. No DDL, no subqueries, no GROUP BY / HAVING, no aggregates beyond COUNT(*), no functions.",
+        .next = "SUM/MIN/MAX/AVG aggregates, GROUP BY, LEFT JOIN, subqueries, CTEs, UPDATE/DELETE with richer WHERE, CREATE TABLE / CREATE INDEX.",
     },
     .{
         .area = "Full query planner",
-        .status = .scaffold,
-        .evidence = "Hard-coded rowid and single-column index fast paths exist.",
-        .next = "Add binder, cost model, scan/index selection, joins, sorting, grouping.",
+        .status = .partial,
+        .evidence = "Single-table WHERE with `rowid = N` or `indexed_col = lit` takes the direct-lookup / index-rowid fast path; everything else falls through to the general nested-loop scan (which handles JOIN + WHERE + ORDER BY + LIMIT + COUNT(*)). Joins are cross-product with incremental ON-predicate filtering; column resolution walks every source and rejects ambiguous unqualified refs.",
+        .next = "Cost-based join ordering (current order is FROM-then-JOINs in source order), hash joins for large cross-products, index-driven sort pushdown for ORDER BY.",
     },
     .{
         .area = "VDBE/execution engine",
