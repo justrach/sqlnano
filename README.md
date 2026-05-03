@@ -130,6 +130,37 @@ sqlnano bench-read /tmp/t.db "SELECT * FROM t WHERE rowid = 5000" 100000
 sqlnano bench-read /tmp/t.db "SELECT * FROM t" 1000
 ```
 
+### FTS5 search
+
+sqlnano can read SQLite FTS5 shadow tables directly for narrow BM25 searches.
+The current parser accepts a single bare token, applies SQLite-style BM25
+scores, supports column weights, and can hydrate ranked rowids from a normal
+content table without going back through SQLite.
+
+```bash
+# Ranked rowids only. Weights are comma-separated bm25(ft, w0, w1, ...)
+sqlnano fts-match data.db judgments_fts contract 10 5,3,1
+
+# Ranked JSON results hydrated from the content table:
+#   <db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]
+sqlnano fts-search data.db judgments_fts judgments contract \
+  10 citation,title,court,year 5,3,1 court=SGHC
+```
+
+`fts-search` filters are schema-agnostic and run before the top-k is selected:
+
+- `col=value` exact match. If `col` has a usable SQLite index, sqlnano intersects
+  indexed rowids before ranking.
+- `col~=text` ASCII case-insensitive substring match.
+- `col>=value` / `col<=value` numeric or lexicographic bounds.
+
+Example against a live sgjudge corpus:
+
+```bash
+sqlnano fts-search data/sgjudge.db hansard_speeches_fts hansard_speeches \
+  housing 10 speech_id,sitting_id,speaker,topic 0,2,3,1 'speaker~=Desmond Lee'
+```
+
 ### WAL maintenance
 
 ```bash
@@ -220,6 +251,7 @@ client for the same ecosystem — not a fork.
 - **Native WAL** — group commit, crash recovery, fuzz-tested torn-WAL handling
 - **Configurable durability** — `synchronous=full/normal/off`
 - **Tiny SQL surface** — `SELECT ... WHERE col = literal`, `INSERT INTO t VALUES (...)`, `UPDATE`/`DELETE` with single-equality `WHERE`
+- **Narrow FTS5 reads** — direct shadow-table BM25 for single-token MATCH queries, optional column weights, JSON hydration by content rowid, and simple pre-ranking filters
 
 ### What doesn't work (yet)
 
@@ -228,6 +260,7 @@ client for the same ecosystem — not a fork.
 - **Triggers, foreign keys, views, virtual tables, CTEs** — none of these
 - **Type affinity coercion** — we implement the common cases, not the full SQLite matrix
 - **Collations** — BINARY only
+- **Full FTS5 query syntax** — phrase, boolean, NEAR, prefix, tokenizer parity, snippets/highlights, and virtual-table callback APIs are not implemented yet
 - **Full SQL grammar** — the parser handles what `exec` / `bench-read` need; everything else errors out
 - **Writes to WAL-mode SQLite files** — sqlnano refuses to write a file whose header has `write_version=WAL` because we don't speak the SQLite WAL frame format
 
@@ -258,6 +291,8 @@ License: [Server Side Public License v1, with an author exception for justrach](
 | `sqlnano inspect <db>`                               | Dump header, schema entries, row counts          |
 | `sqlnano select <db> "<SQL>"`                        | Run a tiny read-only SELECT                       |
 | `sqlnano select <db> <table>`                        | Scan a table by name                              |
+| `sqlnano fts-match <db> <fts5_table> <term> [limit] [weights]` | Run a narrow weighted FTS5 BM25 search      |
+| `sqlnano fts-search <db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]` | Search and hydrate ranked JSON rows |
 | `sqlnano exec <db> "<SQL>"`                          | Run INSERT/UPDATE/DELETE                          |
 | `sqlnano bench-read <db> "<SQL>" <N>`                | Benchmark the hot read path (`N` iterations)     |
 | `sqlnano bench-write <db> <table> <N> [full\|normal\|off]` | Benchmark durable inserts via a long-lived `Connection` |
@@ -280,6 +315,8 @@ src/sqlite/
   catalog.zig            CREATE TABLE column resolver
   table.zig              table b-tree walker
   index.zig              index b-tree walker
+  fts5.zig               FTS5 shadow-table reader + BM25 top-k
+  fts5_bm25.zig          SQLite-style BM25 scoring
   tokenizer.zig          SQL tokenizer
   parser.zig             SQL parser (SELECT / INSERT / UPDATE / DELETE subset)
   ast.zig                tiny AST
