@@ -1,6 +1,8 @@
 const btree = @import("sqlite/btree.zig");
 const ast = @import("sqlite/ast.zig");
 const catalog = @import("sqlite/catalog.zig");
+const fts5 = @import("sqlite/fts5.zig");
+const fts5_bm25 = @import("sqlite/fts5_bm25.zig");
 const header_mod = @import("sqlite/header.zig");
 const index = @import("sqlite/index.zig");
 const mapped_file_mod = @import("sqlite/mapped_file.zig");
@@ -19,6 +21,8 @@ const write = @import("sqlite/write.zig");
 pub const ast_mod = ast;
 pub const btree_mod = btree;
 pub const catalog_mod = catalog;
+pub const fts5_mod = fts5;
+pub const fts5_bm25_mod = fts5_bm25;
 pub const header = header_mod;
 pub const index_mod = index;
 pub const mapped_file = mapped_file_mod;

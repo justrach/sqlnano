@@ -83,8 +83,34 @@ pub fn build(b: *std.Build) void {
     const table_overflow_step = b.step("test-table-overflow", "Run overflow row scanner regression test");
     table_overflow_step.dependOn(&run_table_overflow_tests.step);
 
+    const fts5_bm25_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sqlnano.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"sqlite fts5 bm25"},
+    });
+    const run_fts5_bm25_tests = b.addRunArtifact(fts5_bm25_tests);
+    const fts5_bm25_step = b.step("test-fts5-bm25", "Run SQLite FTS5 BM25 scoring regression tests");
+    fts5_bm25_step.dependOn(&run_fts5_bm25_tests.step);
+
+    const fts5_search_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sqlnano.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"sqlite fts5"},
+    });
+    const run_fts5_search_tests = b.addRunArtifact(fts5_search_tests);
+    const fts5_search_step = b.step("test-fts5-search", "Run SQLite FTS5 search/index regression tests");
+    fts5_search_step.dependOn(&run_fts5_search_tests.step);
+
     const atomic_step = b.step("test-atomic", "Run targeted sgjudge-read regression tests");
     atomic_step.dependOn(&run_catalog_comment_tests.step);
     atomic_step.dependOn(&run_table_stop_tests.step);
     atomic_step.dependOn(&run_table_overflow_tests.step);
+    atomic_step.dependOn(&run_fts5_bm25_tests.step);
+    atomic_step.dependOn(&run_fts5_search_tests.step);
 }

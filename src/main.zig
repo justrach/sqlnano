@@ -136,6 +136,39 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "fts-match")) {
+        const path = args.next() orelse {
+            try stderr.print("error: missing database path\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingDatabasePath;
+        };
+        const table_name = args.next() orelse {
+            try stderr.print("error: missing FTS5 table name\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingTable;
+        };
+        const query = args.next() orelse {
+            try stderr.print("error: missing MATCH query\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingQuery;
+        };
+        const limit_text = args.next();
+        if (args.next() != null) {
+            try stderr.print("error: too many arguments\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.TooManyArguments;
+        }
+
+        const limit = if (limit_text) |text| try std.fmt.parseInt(usize, text, 10) else 10;
+        try ftsMatch(init, stdout, path, table_name, query, limit);
+        try stdout.flush();
+        return;
+    }
+
     if (std.mem.eql(u8, command, "parity")) {
         if (args.next() != null) {
             try stderr.print("error: too many arguments\n\n", .{});
@@ -238,6 +271,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  sqlnano inspect <database.db>                  Inspect SQLite header, schema, and row previews
         \\  sqlnano select <database.db> <table>            Read rows from a basic SQLite table
         \\  sqlnano select <database.db> "SELECT * FROM t"  Run tiny read-only SELECT SQL
+        \\  sqlnano fts-match <database.db> <fts5_table> <term> [limit]  Run a narrow FTS5 MATCH/BM25 search
         \\  sqlnano exec <database.db> "INSERT INTO t VALUES (...)"  Append a simple row
         \\  sqlnano bench-read <database.db> "SELECT * FROM t WHERE rowid = 1" <N>  Benchmark hot read path
         \\  sqlnano bench-write <database.db> <table> <N>  Benchmark durable inserts via a long-lived Connection
@@ -368,6 +402,7 @@ fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     const reader = try sqlnano.sqlite.PageReader.init(bytes);
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
     defer schema.deinit(init.gpa);
+    if (try selectSqlFts5(init, writer, reader, schema, query)) return;
     const result = try sqlnano.sqlite.executeSelect(reader, schema, query, init.gpa);
     defer result.deinit(init.gpa);
 
@@ -386,6 +421,65 @@ fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
             try writer.print("-: ", .{});
         }
         try printNamedValues(writer, row.values);
+        try writer.print("\n", .{});
+    }
+}
+
+fn ftsMatch(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    table_name: []const u8,
+    query: []const u8,
+    limit: usize,
+) !void {
+    var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
+    defer mf.deinit();
+
+    const reader = try sqlnano.sqlite.PageReader.init(mf.items);
+    const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
+    defer schema.deinit(init.gpa);
+
+    const result = try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{ .limit = limit }, init.gpa);
+    defer result.deinit(init.gpa);
+    try printFtsResult(writer, result);
+}
+
+fn selectSqlFts5(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    reader: sqlnano.sqlite.PageReader,
+    schema: sqlnano.sqlite.Schema,
+    query: []const u8,
+) !bool {
+    const match_pos = indexOfKeyword(query, "MATCH") orelse return false;
+    const from_pos = indexOfKeyword(query, "FROM") orelse return false;
+    const where_pos = indexOfKeyword(query, "WHERE") orelse return false;
+    if (from_pos > where_pos or where_pos > match_pos) return false;
+
+    const table_name = firstIdentifier(std.mem.trim(u8, query[from_pos + "FROM".len .. where_pos], " \t\r\n")) orelse return false;
+    const match_query = extractMatchQuery(query[match_pos + "MATCH".len ..]) orelse return false;
+    const limit = parseOptionalLimit(query) orelse 10;
+
+    const result = try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, match_query, .{ .limit = limit }, init.gpa);
+    defer result.deinit(init.gpa);
+    try printFtsResult(writer, result);
+    return true;
+}
+
+fn printFtsResult(writer: *std.Io.Writer, result: sqlnano.sqlite.fts5_mod.SearchResult) !void {
+    try writer.print("table: {s}\n", .{result.table_name});
+    try writer.print("query: {s}\n", .{result.query});
+    try writer.print("total_rows: {d}\n", .{result.total_rows});
+    try writer.print("rows_with_term: {d}\n", .{result.rows_with_term});
+    try writer.print("total_hits: {d}\n", .{result.total_hits});
+    try writer.print("avg_doc_len: {d:.3}\n", .{result.avg_doc_len});
+    try writer.print("rows: {d}\n", .{result.rows.len});
+    for (result.rows) |row| {
+        try writer.print("{d}|{d:.15}|hits={d}|doc_len={d}", .{ row.rowid, row.score, row.hits, row.doc_len });
+        for (row.column_hits[0..result.column_count], 0..) |hits, i| {
+            try writer.print("|c{d}={d}", .{ i, hits });
+        }
         try writer.print("\n", .{});
     }
 }
@@ -745,6 +839,61 @@ fn printValue(writer: *std.Io.Writer, value: sqlnano.sqlite.Value) !void {
         .text => |text| try writer.print("\"{s}\"", .{text}),
         .blob => |blob| try writer.print("<blob {d} bytes>", .{blob.len}),
     }
+}
+
+fn indexOfKeyword(text: []const u8, keyword: []const u8) ?usize {
+    var i: usize = 0;
+    while (i + keyword.len <= text.len) : (i += 1) {
+        if (i > 0 and isIdent(text[i - 1])) continue;
+        if (i + keyword.len < text.len and isIdent(text[i + keyword.len])) continue;
+        var matched = true;
+        for (keyword, 0..) |c, j| {
+            if (std.ascii.toUpper(text[i + j]) != c) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return i;
+    }
+    return null;
+}
+
+fn firstIdentifier(text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) : (i += 1) {}
+    const start = i;
+    while (i < text.len and isIdent(text[i])) : (i += 1) {}
+    if (i == start) return null;
+    return text[start..i];
+}
+
+fn extractMatchQuery(after_match: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < after_match.len and std.ascii.isWhitespace(after_match[i])) : (i += 1) {}
+    if (i >= after_match.len) return null;
+    if (after_match[i] == '\'' or after_match[i] == '"') {
+        const quote = after_match[i];
+        const start = i + 1;
+        i = start;
+        while (i < after_match.len and after_match[i] != quote) : (i += 1) {}
+        if (i >= after_match.len) return null;
+        return after_match[start..i];
+    }
+
+    const start = i;
+    while (i < after_match.len and !std.ascii.isWhitespace(after_match[i]) and after_match[i] != ';') : (i += 1) {}
+    if (i == start) return null;
+    return after_match[start..i];
+}
+
+fn parseOptionalLimit(query: []const u8) ?usize {
+    const limit_pos = indexOfKeyword(query, "LIMIT") orelse return null;
+    var rest = std.mem.trim(u8, query[limit_pos + "LIMIT".len ..], " \t\r\n;");
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
+    if (end == 0) return null;
+    rest = rest[0..end];
+    return std.fmt.parseInt(usize, rest, 10) catch null;
 }
 
 fn looksLikeSql(text: []const u8) bool {
