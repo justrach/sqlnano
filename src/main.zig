@@ -458,6 +458,7 @@ fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
     defer schema.deinit(init.gpa);
     if (try selectSqlFts5(init, writer, path, reader, schema, query)) return;
+    if (try selectSqlCountStar(init, writer, reader, schema, query)) return;
     const result = try sqlnano.sqlite.executeSelect(reader, schema, query, init.gpa);
     defer result.deinit(init.gpa);
 
@@ -478,6 +479,32 @@ fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
         try printNamedValues(writer, row.values);
         try writer.print("\n", .{});
     }
+}
+
+fn selectSqlCountStar(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    reader: sqlnano.sqlite.PageReader,
+    schema: sqlnano.sqlite.Schema,
+    query: []const u8,
+) !bool {
+    const stmt = sqlnano.sqlite.parseSelect(query, init.gpa) catch |err| switch (err) {
+        error.UnsupportedSql => return false,
+        else => return err,
+    };
+    defer stmt.deinit(init.gpa);
+
+    if (stmt.where_expr != null or stmt.joins.len != 0 or stmt.projections.len != 1 or stmt.projections[0] != .count_star) return false;
+
+    const entry = schema.findTable(stmt.table_name) orelse return error.TableNotFound;
+    const n = try sqlnano.sqlite.table_mod.countRows(reader, @intCast(entry.root_page));
+    const label = stmt.projections[0].count_star.alias orelse "COUNT(*)";
+
+    try writer.print("table: {s}\n", .{entry.name});
+    try writer.print("columns: [{s}]\n", .{label});
+    try writer.print("rows: 1\n", .{});
+    try writer.print("-: [{s}={d}]\n", .{ label, n });
+    return true;
 }
 
 fn ftsMatch(

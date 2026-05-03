@@ -192,6 +192,11 @@ const TermPostings = struct {
     rows_with_term: u64,
 };
 
+const PostingStats = struct {
+    rows_with_term: u64,
+    total_hits: u64,
+};
+
 pub fn search(
     reader: page.PageReader,
     schema: schema_mod.Schema,
@@ -277,41 +282,9 @@ pub fn searchFiltered(
         try readSegmentTerm(reader, @intCast(data_entry.root_page), segment, candidate_pages[i], term, averages.column_count, postings, allocator);
     }
 
-    var raw_matches = false;
-    for (postings) |posting| {
-        if (posting.present) {
-            raw_matches = true;
-            break;
-        }
-    }
-
     const avg_doc_len = averages.avgDocLen();
-    if (!raw_matches) {
-        const rows = try allocator.alloc(ResultRow, 0);
-        return .{
-            .table_name = fts_table,
-            .query = query,
-            .total_rows = averages.total_rows,
-            .rows_with_term = 0,
-            .total_hits = 0,
-            .avg_doc_len = avg_doc_len,
-            .column_count = averages.column_count,
-            .rows = rows,
-        };
-    }
-
-    const doc_lengths = try loadDocLengths(reader, @intCast(docsize_entry.root_page), max_rowid, averages.column_count, postings, allocator);
-    defer allocator.free(doc_lengths);
-
-    var rows_with_term: u64 = 0;
-    var total_hits: u64 = 0;
-    for (postings) |posting| {
-        if (!posting.present) continue;
-        rows_with_term += 1;
-        total_hits += posting.hits;
-    }
-
-    if (rows_with_term == 0) {
+    const stats = postingStats(postings);
+    if (stats.rows_with_term == 0) {
         const rows = try allocator.alloc(ResultRow, 0);
         return .{
             .table_name = fts_table,
@@ -328,36 +301,57 @@ pub fn searchFiltered(
     const top = try allocator.alloc(ResultRow, options.limit);
     errdefer allocator.free(top);
     var top_len: usize = 0;
-    const idf = fts5_bm25.inverseDocumentFrequency(averages.total_rows, rows_with_term);
+    const idf = fts5_bm25.inverseDocumentFrequency(averages.total_rows, stats.rows_with_term);
 
-    for (postings, 0..) |posting, rowid| {
-        if (!posting.present) continue;
-        var weighted_hits: f64 = 0;
-        for (posting.column_hits[0..averages.column_count], 0..) |hits, i| {
-            const weight = if (i < options.weights.len) options.weights[i] else 1.0;
-            weighted_hits += @as(f64, @floatFromInt(hits)) * weight;
+    const ScoreCtx = struct {
+        postings: []const Posting,
+        column_count: usize,
+        weights: []const f64,
+        avg_doc_len: f64,
+        idf: f64,
+        top: []ResultRow,
+        top_len: *usize,
+        user_ctx: @TypeOf(ctx),
+
+        fn onRow(score_ctx: *@This(), rowid: i64, values: []const record.Value) !void {
+            if (rowid < 0 or @as(u64, @intCast(rowid)) >= @as(u64, @intCast(score_ctx.postings.len))) return;
+            const posting = score_ctx.postings[@intCast(rowid)];
+            if (!posting.present) return;
+
+            const doc_len = try docLengthFromValues(values, score_ctx.column_count);
+            const weighted_hits = weightedPostingHits(posting, score_ctx.column_count, score_ctx.weights);
+            const score = fts5_bm25.scoreWithIdf(doc_len, score_ctx.avg_doc_len, weighted_hits, score_ctx.idf);
+            const candidate: ResultRow = .{
+                .rowid = @intCast(rowid),
+                .score = score,
+                .hits = posting.hits,
+                .doc_len = doc_len,
+                .column_hits = posting.column_hits,
+            };
+            if (!try acceptCandidate(score_ctx.user_ctx, candidate)) return;
+            topInsert(score_ctx.top, score_ctx.top_len, candidate);
         }
+    };
 
-        const doc_len = if (rowid < doc_lengths.len) doc_lengths[@intCast(rowid)] else 0;
-        const score = fts5_bm25.scoreWithIdf(doc_len, avg_doc_len, weighted_hits, idf);
-        const candidate: ResultRow = .{
-            .rowid = @intCast(rowid),
-            .score = score,
-            .hits = posting.hits,
-            .doc_len = doc_len,
-            .column_hits = posting.column_hits,
-        };
-        if (!try acceptCandidate(ctx, candidate)) continue;
-        topInsert(top, &top_len, candidate);
-    }
+    var score_ctx: ScoreCtx = .{
+        .postings = postings,
+        .column_count = averages.column_count,
+        .weights = options.weights,
+        .avg_doc_len = avg_doc_len,
+        .idf = idf,
+        .top = top,
+        .top_len = &top_len,
+        .user_ctx = ctx,
+    };
+    try table.scanTableForEach(reader, @intCast(docsize_entry.root_page), &score_ctx, ScoreCtx.onRow);
 
     const rows = try allocator.realloc(top, top_len);
     return .{
         .table_name = fts_table,
         .query = query,
         .total_rows = averages.total_rows,
-        .rows_with_term = rows_with_term,
-        .total_hits = total_hits,
+        .rows_with_term = stats.rows_with_term,
+        .total_hits = stats.total_hits,
         .avg_doc_len = avg_doc_len,
         .column_count = averages.column_count,
         .rows = rows,
@@ -418,7 +412,6 @@ fn searchMultiTerms(
     defer allocator.free(matched);
     @memset(matched, .{ .column_hits = [_]u32{0} ** MAX_COLUMNS });
 
-    var raw_matches = false;
     row_loop: for (matched, 0..) |*out, rowid| {
         var hits: u32 = 0;
         var column_hits = [_]u32{0} ** MAX_COLUMNS;
@@ -432,25 +425,10 @@ fn searchMultiTerms(
         }
 
         out.* = .{ .present = true, .hits = hits, .column_hits = column_hits };
-        raw_matches = true;
     }
 
-    if (!raw_matches) {
-        return emptySearchResult(allocator, fts_table, query, averages, avg_doc_len);
-    }
-
-    const doc_lengths = try loadDocLengths(reader, docsize_root, max_rowid, averages.column_count, matched, allocator);
-    defer allocator.free(doc_lengths);
-
-    var rows_with_term: u64 = 0;
-    var total_hits: u64 = 0;
-    for (matched) |posting| {
-        if (!posting.present) continue;
-        rows_with_term += 1;
-        total_hits += posting.hits;
-    }
-
-    if (rows_with_term == 0) {
+    const stats = postingStats(matched);
+    if (stats.rows_with_term == 0) {
         return emptySearchResult(allocator, fts_table, query, averages, avg_doc_len);
     }
 
@@ -464,38 +442,62 @@ fn searchMultiTerms(
     errdefer allocator.free(top);
     var top_len: usize = 0;
 
-    for (matched, 0..) |posting, rowid| {
-        if (!posting.present) continue;
-        const doc_len = if (rowid < doc_lengths.len) doc_lengths[@intCast(rowid)] else 0;
-        var score: f64 = 0;
-        for (term_postings, 0..) |tp, term_i| {
-            const term_posting = tp.postings[rowid];
-            var weighted_hits: f64 = 0;
-            for (term_posting.column_hits[0..averages.column_count], 0..) |hits, col| {
-                const weight = if (col < options.weights.len) options.weights[col] else 1.0;
-                weighted_hits += @as(f64, @floatFromInt(hits)) * weight;
-            }
-            score += fts5_bm25.scoreWithIdf(doc_len, avg_doc_len, weighted_hits, idfs[term_i]);
-        }
+    const ScoreCtx = struct {
+        matched: []const Posting,
+        term_postings: []const TermPostings,
+        idfs: []const f64,
+        column_count: usize,
+        weights: []const f64,
+        avg_doc_len: f64,
+        top: []ResultRow,
+        top_len: *usize,
+        user_ctx: @TypeOf(ctx),
 
-        const candidate: ResultRow = .{
-            .rowid = @intCast(rowid),
-            .score = score,
-            .hits = posting.hits,
-            .doc_len = doc_len,
-            .column_hits = posting.column_hits,
-        };
-        if (!try acceptCandidate(ctx, candidate)) continue;
-        topInsert(top, &top_len, candidate);
-    }
+        fn onRow(score_ctx: *@This(), rowid: i64, values: []const record.Value) !void {
+            if (rowid < 0 or @as(u64, @intCast(rowid)) >= @as(u64, @intCast(score_ctx.matched.len))) return;
+            const posting = score_ctx.matched[@intCast(rowid)];
+            if (!posting.present) return;
+
+            const doc_len = try docLengthFromValues(values, score_ctx.column_count);
+            var score: f64 = 0;
+            for (score_ctx.term_postings, 0..) |tp, term_i| {
+                const term_posting = tp.postings[@intCast(rowid)];
+                const weighted_hits = weightedPostingHits(term_posting, score_ctx.column_count, score_ctx.weights);
+                score += fts5_bm25.scoreWithIdf(doc_len, score_ctx.avg_doc_len, weighted_hits, score_ctx.idfs[term_i]);
+            }
+
+            const candidate: ResultRow = .{
+                .rowid = @intCast(rowid),
+                .score = score,
+                .hits = posting.hits,
+                .doc_len = doc_len,
+                .column_hits = posting.column_hits,
+            };
+            if (!try acceptCandidate(score_ctx.user_ctx, candidate)) return;
+            topInsert(score_ctx.top, score_ctx.top_len, candidate);
+        }
+    };
+
+    var score_ctx: ScoreCtx = .{
+        .matched = matched,
+        .term_postings = term_postings,
+        .idfs = idfs,
+        .column_count = averages.column_count,
+        .weights = options.weights,
+        .avg_doc_len = avg_doc_len,
+        .top = top,
+        .top_len = &top_len,
+        .user_ctx = ctx,
+    };
+    try table.scanTableForEach(reader, docsize_root, &score_ctx, ScoreCtx.onRow);
 
     const rows = try allocator.realloc(top, top_len);
     return .{
         .table_name = fts_table,
         .query = query,
         .total_rows = averages.total_rows,
-        .rows_with_term = rows_with_term,
-        .total_hits = total_hits,
+        .rows_with_term = stats.rows_with_term,
+        .total_hits = stats.total_hits,
         .avg_doc_len = avg_doc_len,
         .column_count = averages.column_count,
         .rows = rows,
@@ -711,40 +713,37 @@ fn loadSegments(reader: page.PageReader, data_root: u32, allocator: std.mem.Allo
     return segments.toOwnedSlice(allocator);
 }
 
-fn loadDocLengths(reader: page.PageReader, docsize_root: u32, max_rowid: u64, column_count: usize, postings: []Posting, allocator: std.mem.Allocator) ![]u32 {
-    if (max_rowid > std.math.maxInt(usize) - 1) return error.Fts5TableTooLarge;
-    const lengths = try allocator.alloc(u32, @as(usize, @intCast(max_rowid)) + 1);
-    errdefer allocator.free(lengths);
-    @memset(lengths, 0);
-
-    const Ctx = struct {
-        lengths: []u32,
-        column_count: usize,
-        postings: []Posting,
-
-        fn onRow(ctx: *@This(), rowid: i64, values: []const record.Value) !void {
-            if (rowid < 0 or @as(u64, @intCast(rowid)) >= @as(u64, @intCast(ctx.lengths.len))) return;
-            if (!ctx.postings[@intCast(rowid)].present) return;
-            if (values.len == 0) return error.InvalidFts5Docsize;
-            const blob = firstBytesValue(values) orelse return error.InvalidFts5Docsize;
-            var pos: usize = 0;
-            var total: u64 = 0;
-            var col: usize = 0;
-            while (col < ctx.column_count and pos < blob.len) : (col += 1) {
-                const v = try parseVarint(blob[pos..]);
-                pos += v.len;
-                total += v.value;
-            }
-            ctx.lengths[@intCast(rowid)] = @intCast(@min(total, std.math.maxInt(u32)));
-        }
-    };
-
-    var ctx: Ctx = .{ .lengths = lengths, .column_count = column_count, .postings = postings };
-    try table.scanTableForEach(reader, docsize_root, &ctx, Ctx.onRow);
-    for (postings, 0..) |*posting, rowid| {
-        if (posting.present and lengths[rowid] == 0) posting.present = false;
+fn postingStats(postings: []const Posting) PostingStats {
+    var stats: PostingStats = .{ .rows_with_term = 0, .total_hits = 0 };
+    for (postings) |posting| {
+        if (!posting.present) continue;
+        stats.rows_with_term += 1;
+        stats.total_hits += posting.hits;
     }
-    return lengths;
+    return stats;
+}
+
+fn docLengthFromValues(values: []const record.Value, column_count: usize) !u32 {
+    if (values.len == 0) return error.InvalidFts5Docsize;
+    const blob = firstBytesValue(values) orelse return error.InvalidFts5Docsize;
+    var pos: usize = 0;
+    var total: u64 = 0;
+    var col: usize = 0;
+    while (col < column_count and pos < blob.len) : (col += 1) {
+        const v = try parseVarint(blob[pos..]);
+        pos += v.len;
+        total += v.value;
+    }
+    return @intCast(@min(total, std.math.maxInt(u32)));
+}
+
+fn weightedPostingHits(posting: Posting, column_count: usize, weights: []const f64) f64 {
+    var weighted_hits: f64 = 0;
+    for (posting.column_hits[0..column_count], 0..) |hits, i| {
+        const weight = if (i < weights.len) weights[i] else 1.0;
+        weighted_hits += @as(f64, @floatFromInt(hits)) * weight;
+    }
+    return weighted_hits;
 }
 
 fn candidatePages(reader: page.PageReader, idx_root: u32, segments: []const Segment, term: []const u8, allocator: std.mem.Allocator) ![]u32 {
