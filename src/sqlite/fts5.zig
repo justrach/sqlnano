@@ -185,6 +185,25 @@ pub fn search(
     options: SearchOptions,
     allocator: std.mem.Allocator,
 ) !SearchResult {
+    const AcceptAll = struct {
+        fn call(_: *@This(), _: ResultRow) anyerror!bool {
+            return true;
+        }
+    };
+    var accept_all: AcceptAll = .{};
+    return searchFiltered(reader, schema, fts_table, query, options, allocator, &accept_all, AcceptAll.call);
+}
+
+pub fn searchFiltered(
+    reader: page.PageReader,
+    schema: schema_mod.Schema,
+    fts_table: []const u8,
+    query: []const u8,
+    options: SearchOptions,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    comptime acceptCandidate: fn (ctx: @TypeOf(ctx), candidate: ResultRow) anyerror!bool,
+) !SearchResult {
     if (options.limit == 0) {
         const rows = try allocator.alloc(ResultRow, 0);
         return .{
@@ -291,13 +310,15 @@ pub fn search(
             .weighted_hits = weighted_hits,
         }};
         const score = fts5_bm25.score(averages.total_rows, doc_len, avg_doc_len, &phrase);
-        topInsert(top, &top_len, .{
+        const candidate: ResultRow = .{
             .rowid = @intCast(rowid),
             .score = score,
             .hits = hit_count,
             .doc_len = doc_len,
             .column_hits = posting.column_hits,
-        });
+        };
+        if (!try acceptCandidate(ctx, candidate)) continue;
+        topInsert(top, &top_len, candidate);
     }
 
     const rows = try allocator.realloc(top, top_len);

@@ -156,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingQuery;
         };
         const limit_text = args.next();
+        const weights_text = args.next();
         if (args.next() != null) {
             try stderr.print("error: too many arguments\n\n", .{});
             try printUsage(stderr);
@@ -164,7 +165,60 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const limit = if (limit_text) |text| try std.fmt.parseInt(usize, text, 10) else 10;
-        try ftsMatch(init, stdout, path, table_name, query, limit);
+        var owned_weights: ?[]f64 = null;
+        defer if (owned_weights) |weights| init.gpa.free(weights);
+        const weights = if (weights_text) |text| blk: {
+            owned_weights = try parseWeights(init.gpa, text);
+            break :blk owned_weights.?;
+        } else &.{};
+
+        try ftsMatch(init, stdout, path, table_name, query, limit, weights);
+        try stdout.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "fts-search")) {
+        const path = args.next() orelse {
+            try stderr.print("error: missing database path\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingDatabasePath;
+        };
+        const table_name = args.next() orelse {
+            try stderr.print("error: missing FTS5 table name\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingTable;
+        };
+        const content_table = args.next() orelse {
+            try stderr.print("error: missing content table name\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingTable;
+        };
+        const query = args.next() orelse {
+            try stderr.print("error: missing MATCH query\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingQuery;
+        };
+        const limit_text = args.next();
+        const columns_text = args.next();
+        const weights_text = args.next();
+        var filter_args: std.ArrayList([]const u8) = .empty;
+        defer filter_args.deinit(init.gpa);
+        while (args.next()) |arg| try filter_args.append(init.gpa, arg);
+
+        const limit = if (limit_text) |text| try std.fmt.parseInt(usize, text, 10) else 10;
+        var owned_weights: ?[]f64 = null;
+        defer if (owned_weights) |weights| init.gpa.free(weights);
+
+        const weights = if (weights_text) |text| blk: {
+            owned_weights = try parseWeights(init.gpa, text);
+            break :blk owned_weights.?;
+        } else &.{};
+
+        try ftsSearch(init, stdout, path, table_name, content_table, query, limit, columns_text, weights, filter_args.items);
         try stdout.flush();
         return;
     }
@@ -271,7 +325,8 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  sqlnano inspect <database.db>                  Inspect SQLite header, schema, and row previews
         \\  sqlnano select <database.db> <table>            Read rows from a basic SQLite table
         \\  sqlnano select <database.db> "SELECT * FROM t"  Run tiny read-only SELECT SQL
-        \\  sqlnano fts-match <database.db> <fts5_table> <term> [limit]  Run a narrow FTS5 MATCH/BM25 search
+        \\  sqlnano fts-match <database.db> <fts5_table> <term> [limit] [weights]  Run a narrow FTS5 MATCH/BM25 search
+        \\  sqlnano fts-search <database.db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]  Search and hydrate rows as JSON
         \\  sqlnano exec <database.db> "INSERT INTO t VALUES (...)"  Append a simple row
         \\  sqlnano bench-read <database.db> "SELECT * FROM t WHERE rowid = 1" <N>  Benchmark hot read path
         \\  sqlnano bench-write <database.db> <table> <N>  Benchmark durable inserts via a long-lived Connection
@@ -432,6 +487,7 @@ fn ftsMatch(
     table_name: []const u8,
     query: []const u8,
     limit: usize,
+    weights: []const f64,
 ) !void {
     var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
     defer mf.deinit();
@@ -440,9 +496,148 @@ fn ftsMatch(
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
     defer schema.deinit(init.gpa);
 
-    const result = try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{ .limit = limit }, init.gpa);
+    const result = try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{
+        .limit = limit,
+        .weights = weights,
+    }, init.gpa);
     defer result.deinit(init.gpa);
     try printFtsResult(writer, result);
+}
+
+const HydrateFilterOp = enum { eq, contains, gte, lte };
+
+const HydrateFilter = struct {
+    column_index: usize,
+    op: HydrateFilterOp,
+    value: []const u8,
+    indexed: bool = false,
+};
+
+const RowidFilterSet = struct {
+    rowids: []i64,
+};
+
+const HydrateFilterContext = struct {
+    reader: sqlnano.sqlite.PageReader,
+    info: sqlnano.sqlite.TableInfo,
+    filters: []const HydrateFilter,
+    rowid_sets: []const RowidFilterSet,
+    residual_filter_count: usize,
+    allocator: std.mem.Allocator,
+
+    fn accept(self: *@This(), candidate: sqlnano.sqlite.fts5_mod.ResultRow) anyerror!bool {
+        if (!rowidMatchesSets(@intCast(candidate.rowid), self.rowid_sets)) return false;
+        if (self.residual_filter_count == 0) return true;
+        const row = (try sqlnano.sqlite.table_mod.findRowByRowid(self.reader, self.info.root_page, @intCast(candidate.rowid), self.allocator)) orelse return false;
+        defer row.deinit(self.allocator);
+        return rowMatchesHydrateFilters(row, self.filters);
+    }
+};
+
+fn ftsSearch(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    table_name: []const u8,
+    content_table_name: []const u8,
+    query: []const u8,
+    limit: usize,
+    columns_text: ?[]const u8,
+    weights: []const f64,
+    filter_args: []const []const u8,
+) !void {
+    var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
+    defer mf.deinit();
+
+    const reader = try sqlnano.sqlite.PageReader.init(mf.items);
+    const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
+    defer schema.deinit(init.gpa);
+
+    const content_entry = schema.findTable(content_table_name) orelse return error.TableNotFound;
+    var info = try sqlnano.sqlite.tableInfo(content_entry, init.gpa);
+    defer info.deinit(init.gpa);
+
+    const selected_columns = try parseColumnSelection(init.gpa, info, columns_text);
+    defer init.gpa.free(selected_columns);
+    const filters = try parseHydrateFilters(init.gpa, info, filter_args);
+    defer init.gpa.free(filters);
+    const rowid_sets = try buildIndexedFilterSets(init.gpa, reader, schema, info, filters);
+    defer freeRowidFilterSets(init.gpa, rowid_sets);
+    const residual_filter_count = countResidualFilters(filters);
+
+    const result = if (filters.len == 0)
+        try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{
+            .limit = limit,
+            .weights = weights,
+        }, init.gpa)
+    else blk: {
+        var ctx: HydrateFilterContext = .{
+            .reader = reader,
+            .info = info,
+            .filters = filters,
+            .rowid_sets = rowid_sets,
+            .residual_filter_count = residual_filter_count,
+            .allocator = init.gpa,
+        };
+        break :blk try sqlnano.sqlite.fts5_mod.searchFiltered(reader, schema, table_name, query, .{
+            .limit = limit,
+            .weights = weights,
+        }, init.gpa, &ctx, HydrateFilterContext.accept);
+    };
+    defer result.deinit(init.gpa);
+
+    try writeHydratedFtsJson(writer, reader, info, selected_columns, result, init.gpa);
+}
+
+fn writeHydratedFtsJson(
+    writer: *std.Io.Writer,
+    reader: sqlnano.sqlite.PageReader,
+    info: sqlnano.sqlite.TableInfo,
+    selected_columns: []const usize,
+    result: sqlnano.sqlite.fts5_mod.SearchResult,
+    allocator: std.mem.Allocator,
+) !void {
+    try writer.writeAll("{\"status\":\"ok\",\"table\":");
+    try writeJsonString(writer, info.name);
+    try writer.writeAll(",\"fts_table\":");
+    try writeJsonString(writer, result.table_name);
+    try writer.writeAll(",\"query\":");
+    try writeJsonString(writer, result.query);
+    try writer.print(",\"total_rows\":{d},\"rows_with_term\":{d},\"total_hits\":{d},\"avg_doc_len\":{d:.3},\"results\":[", .{
+        result.total_rows,
+        result.rows_with_term,
+        result.total_hits,
+        result.avg_doc_len,
+    });
+
+    var emitted: usize = 0;
+    for (result.rows) |hit| {
+        const row = (try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, @intCast(hit.rowid), allocator)) orelse continue;
+        defer row.deinit(allocator);
+
+        if (emitted != 0) try writer.writeAll(",");
+        emitted += 1;
+        try writer.print("{{\"rowid\":{d},\"rank_score\":{d:.15},\"hits\":{d},\"doc_len\":{d},\"column_hits\":[", .{
+            hit.rowid,
+            hit.score,
+            hit.hits,
+            hit.doc_len,
+        });
+        for (hit.column_hits[0..result.column_count], 0..) |hits, i| {
+            if (i != 0) try writer.writeAll(",");
+            try writer.print("{d}", .{hits});
+        }
+        try writer.writeAll("],\"columns\":{");
+        for (selected_columns, 0..) |column_index, i| {
+            if (i != 0) try writer.writeAll(",");
+            try writeJsonString(writer, info.columns[column_index].name);
+            try writer.writeAll(":");
+            try writeJsonValue(writer, rowValue(row, column_index));
+        }
+        try writer.writeAll("}}");
+    }
+
+    try writer.print("],\"count\":{d}}}\n", .{emitted});
 }
 
 fn selectSqlFts5(
@@ -839,6 +1034,292 @@ fn printValue(writer: *std.Io.Writer, value: sqlnano.sqlite.Value) !void {
         .text => |text| try writer.print("\"{s}\"", .{text}),
         .blob => |blob| try writer.print("<blob {d} bytes>", .{blob.len}),
     }
+}
+
+fn parseWeights(allocator: std.mem.Allocator, text: []const u8) ![]f64 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "-")) {
+        return try allocator.alloc(f64, 0);
+    }
+
+    var weights: std.ArrayList(f64) = .empty;
+    errdefer weights.deinit(allocator);
+
+    var rest = trimmed;
+    while (rest.len != 0) {
+        const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+        const part = std.mem.trim(u8, rest[0..comma], " \t\r\n");
+        if (part.len == 0) return error.InvalidWeights;
+        try weights.append(allocator, try std.fmt.parseFloat(f64, part));
+        if (comma == rest.len) break;
+        rest = rest[comma + 1 ..];
+    }
+    return try weights.toOwnedSlice(allocator);
+}
+
+fn parseColumnSelection(allocator: std.mem.Allocator, info: sqlnano.sqlite.TableInfo, text: ?[]const u8) ![]usize {
+    const raw = if (text) |value| std.mem.trim(u8, value, " \t\r\n") else "*";
+    if (raw.len == 0 or std.mem.eql(u8, raw, "*") or std.mem.eql(u8, raw, "-")) {
+        const columns = try allocator.alloc(usize, info.columns.len);
+        for (columns, 0..) |*column, i| column.* = i;
+        return columns;
+    }
+
+    var columns: std.ArrayList(usize) = .empty;
+    errdefer columns.deinit(allocator);
+    var rest = raw;
+    while (rest.len != 0) {
+        const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+        const name = std.mem.trim(u8, rest[0..comma], " \t\r\n");
+        if (name.len == 0) return error.InvalidColumnSelection;
+        try columns.append(allocator, columnIndex(info, name) orelse return error.ColumnNotFound);
+        if (comma == rest.len) break;
+        rest = rest[comma + 1 ..];
+    }
+    return try columns.toOwnedSlice(allocator);
+}
+
+fn parseHydrateFilters(allocator: std.mem.Allocator, info: sqlnano.sqlite.TableInfo, args: []const []const u8) ![]HydrateFilter {
+    var filters: std.ArrayList(HydrateFilter) = .empty;
+    errdefer filters.deinit(allocator);
+
+    for (args) |arg| {
+        const parsed = parseHydrateFilter(info, arg) orelse return error.InvalidFilter;
+        try filters.append(allocator, parsed);
+    }
+    return try filters.toOwnedSlice(allocator);
+}
+
+fn parseHydrateFilter(info: sqlnano.sqlite.TableInfo, arg: []const u8) ?HydrateFilter {
+    inline for (.{
+        .{ "~=", HydrateFilterOp.contains },
+        .{ ">=", HydrateFilterOp.gte },
+        .{ "<=", HydrateFilterOp.lte },
+        .{ "=", HydrateFilterOp.eq },
+    }) |candidate| {
+        if (std.mem.indexOf(u8, arg, candidate[0])) |pos| {
+            const name = std.mem.trim(u8, arg[0..pos], " \t\r\n");
+            const value = trimFilterValue(arg[pos + candidate[0].len ..]);
+            if (name.len == 0) return null;
+            return .{
+                .column_index = columnIndex(info, name) orelse return null,
+                .op = candidate[1],
+                .value = value,
+            };
+        }
+    }
+    return null;
+}
+
+fn trimFilterValue(raw: []const u8) []const u8 {
+    var value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len >= 2 and ((value[0] == '"' and value[value.len - 1] == '"') or (value[0] == '\'' and value[value.len - 1] == '\''))) {
+        value = value[1 .. value.len - 1];
+    }
+    return value;
+}
+
+fn rowMatchesHydrateFilters(row: sqlnano.sqlite.TableRow, filters: []const HydrateFilter) bool {
+    for (filters) |filter| {
+        if (filter.indexed) continue;
+        if (!valueMatchesFilter(rowValue(row, filter.column_index), filter)) return false;
+    }
+    return true;
+}
+
+fn buildIndexedFilterSets(
+    allocator: std.mem.Allocator,
+    reader: sqlnano.sqlite.PageReader,
+    schema: sqlnano.sqlite.Schema,
+    info: sqlnano.sqlite.TableInfo,
+    filters: []HydrateFilter,
+) ![]RowidFilterSet {
+    var sets: std.ArrayList(RowidFilterSet) = .empty;
+    errdefer {
+        for (sets.items) |set| allocator.free(set.rowids);
+        sets.deinit(allocator);
+    }
+
+    for (filters) |*filter| {
+        if (filter.op != .eq) continue;
+        const literal = literalForFilter(info, filter.*) orelse continue;
+        const rowids = try sqlnano.sqlite.sql_mod.indexedRowidsForColumn(
+            reader,
+            schema,
+            info,
+            info.columns[filter.column_index].name,
+            literal,
+            allocator,
+        ) orelse continue;
+        std.mem.sort(i64, rowids, {}, struct {
+            fn lessThan(_: void, a: i64, b: i64) bool {
+                return a < b;
+            }
+        }.lessThan);
+        filter.indexed = true;
+        try sets.append(allocator, .{ .rowids = rowids });
+    }
+    return try sets.toOwnedSlice(allocator);
+}
+
+fn freeRowidFilterSets(allocator: std.mem.Allocator, sets: []RowidFilterSet) void {
+    for (sets) |set| allocator.free(set.rowids);
+    allocator.free(sets);
+}
+
+fn countResidualFilters(filters: []const HydrateFilter) usize {
+    var count: usize = 0;
+    for (filters) |filter| {
+        if (!filter.indexed) count += 1;
+    }
+    return count;
+}
+
+fn rowidMatchesSets(rowid: i64, sets: []const RowidFilterSet) bool {
+    for (sets) |set| {
+        if (!containsRowid(set.rowids, rowid)) return false;
+    }
+    return true;
+}
+
+fn containsRowid(rowids: []const i64, rowid: i64) bool {
+    var lo: usize = 0;
+    var hi: usize = rowids.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (rowids[mid] < rowid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < rowids.len and rowids[lo] == rowid;
+}
+
+fn literalForFilter(info: sqlnano.sqlite.TableInfo, filter: HydrateFilter) ?sqlnano.sqlite.Literal {
+    if (std.ascii.eqlIgnoreCase(filter.value, "null")) return .null;
+    return switch (info.columns[filter.column_index].affinity) {
+        .integer => if (std.fmt.parseInt(i64, filter.value, 10)) |value| .{ .integer = value } else |_| null,
+        else => .{ .text = filter.value },
+    };
+}
+
+fn valueMatchesFilter(value: sqlnano.sqlite.Value, filter: HydrateFilter) bool {
+    return switch (filter.op) {
+        .eq => valueEqualsText(value, filter.value),
+        .contains => switch (value) {
+            .text => |text| containsAsciiFold(text, filter.value),
+            else => false,
+        },
+        .gte => compareValueText(value, filter.value) orelse false,
+        .lte => if (compareValueText(value, filter.value)) |gte| !gte or valueEqualsText(value, filter.value) else false,
+    };
+}
+
+fn valueEqualsText(value: sqlnano.sqlite.Value, text: []const u8) bool {
+    return switch (value) {
+        .null => std.mem.eql(u8, text, "null"),
+        .integer => |int| if (std.fmt.parseInt(i64, text, 10)) |wanted| int == wanted else |_| false,
+        .real => |real| if (std.fmt.parseFloat(f64, text)) |wanted| real == wanted else |_| false,
+        .text => |actual| std.mem.eql(u8, actual, text),
+        .blob => false,
+    };
+}
+
+fn compareValueText(value: sqlnano.sqlite.Value, text: []const u8) ?bool {
+    return switch (value) {
+        .integer => |int| if (std.fmt.parseInt(i64, text, 10)) |wanted| int >= wanted else |_| null,
+        .real => |real| if (std.fmt.parseFloat(f64, text)) |wanted| real >= wanted else |_| null,
+        .text => |actual| std.mem.order(u8, actual, text) != .lt,
+        else => null,
+    };
+}
+
+fn rowValue(row: sqlnano.sqlite.TableRow, column_index: usize) sqlnano.sqlite.Value {
+    if (column_index >= row.values.len) return .null;
+    return row.values[column_index];
+}
+
+fn columnIndex(info: sqlnano.sqlite.TableInfo, name: []const u8) ?usize {
+    for (info.columns, 0..) |column, i| {
+        if (std.ascii.eqlIgnoreCase(column.name, name)) return i;
+    }
+    return null;
+}
+
+fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
+    return indexOfAsciiFold(haystack, needle) != null;
+}
+
+fn indexOfAsciiFold(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+        }
+        if (j == needle.len) return i;
+    }
+    return null;
+}
+
+fn writeJsonValue(writer: *std.Io.Writer, value: sqlnano.sqlite.Value) !void {
+    switch (value) {
+        .null => try writer.writeAll("null"),
+        .integer => |int| try writer.print("{d}", .{int}),
+        .real => |real| try writer.print("{d:.15}", .{real}),
+        .text => |text| try writeJsonString(writer, text),
+        .blob => try writer.writeAll("null"),
+    }
+}
+
+fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeAll("\"");
+    try writeJsonEscaped(writer, text);
+    try writer.writeAll("\"");
+}
+
+fn writeJsonEscaped(writer: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0...7, 11, 12, 14...31 => try writer.writeAll(" "),
+            else => try writer.writeAll(&.{byte}),
+        }
+    }
+}
+
+test "parse fts weight list" {
+    const weights = try parseWeights(std.testing.allocator, "5, 3, 1");
+    defer std.testing.allocator.free(weights);
+    try std.testing.expectEqual(@as(usize, 3), weights.len);
+    try std.testing.expectEqual(@as(f64, 5.0), weights[0]);
+    try std.testing.expectEqual(@as(f64, 3.0), weights[1]);
+    try std.testing.expectEqual(@as(f64, 1.0), weights[2]);
+}
+
+test "hydrate filters compare text and numeric values" {
+    try std.testing.expect(valueMatchesFilter(.{ .text = "Mr Desmond Lee" }, .{
+        .column_index = 0,
+        .op = .contains,
+        .value = "desmond",
+    }));
+    try std.testing.expect(valueMatchesFilter(.{ .integer = 2023 }, .{
+        .column_index = 0,
+        .op = .gte,
+        .value = "2020",
+    }));
+    try std.testing.expect(valueMatchesFilter(.{ .integer = 2023 }, .{
+        .column_index = 0,
+        .op = .lte,
+        .value = "2024",
+    }));
 }
 
 fn indexOfKeyword(text: []const u8, keyword: []const u8) ?usize {
