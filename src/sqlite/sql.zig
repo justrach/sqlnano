@@ -396,19 +396,55 @@ fn streamSingleTable(
         }
     }.call;
 
-    table.scanTableForEach(reader, info.root_page, &ctx, onRow) catch |err| {
+    table.scanTableForEach(reader, info.root_page, &ctx, onRow) catch |err| handle_scan_err: {
+        if (err == error.PayloadOverflowUnsupported) {
+            for (rows.items) |r| r.deinit(allocator);
+            rows.clearRetainingCapacity();
+            ctx.emitted = 0;
+            ctx.stop_after = false;
+            table.scanTableForEachAlloc(reader, info.root_page, allocator, &ctx, onRow) catch |alloc_err| {
+                return switch (alloc_err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.TooManyColumns => error.TooManyColumns,
+                    error.PayloadOverflowUnsupported => error.PayloadOverflowUnsupported,
+                    error.CellOffsetOutOfBounds => error.CellOffsetOutOfBounds,
+                    error.InvalidCellIndex => error.InvalidCellIndex,
+                    error.InvalidHeaderSize => error.InvalidHeaderSize,
+                    error.InvalidOverflowPage => error.InvalidOverflowPage,
+                    error.InvalidPageHeader => error.InvalidPageHeader,
+                    error.InvalidPageNumber => error.InvalidPageNumber,
+                    error.InvalidPageType => error.InvalidPageType,
+                    error.InvalidSerialType => error.InvalidSerialType,
+                    error.InvalidTableCell => error.InvalidTableCell,
+                    error.Overflow => error.Overflow,
+                    error.PageOutOfBounds => error.PageOutOfBounds,
+                    error.PageTooSmall => error.PageTooSmall,
+                    error.RowNotFound => error.RowNotFound,
+                    error.ValueOutOfBounds => error.ValueOutOfBounds,
+                    error.VarintOverflow => error.VarintOverflow,
+                    error.VarintTooSmall => error.VarintTooSmall,
+                    else => error.UnsupportedSql,
+                };
+            };
+            break :handle_scan_err;
+        }
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.TooManyColumns => error.TooManyColumns,
             error.PayloadOverflowUnsupported => error.PayloadOverflowUnsupported,
             error.CellOffsetOutOfBounds => error.CellOffsetOutOfBounds,
+            error.InvalidCellIndex => error.InvalidCellIndex,
+            error.InvalidHeaderSize => error.InvalidHeaderSize,
+            error.InvalidPageHeader => error.InvalidPageHeader,
             error.InvalidPageNumber => error.InvalidPageNumber,
             error.InvalidPageType => error.InvalidPageType,
+            error.InvalidSerialType => error.InvalidSerialType,
             error.InvalidTableCell => error.InvalidTableCell,
             error.Overflow => error.Overflow,
             error.PageOutOfBounds => error.PageOutOfBounds,
             error.PageTooSmall => error.PageTooSmall,
             error.RowNotFound => error.RowNotFound,
+            error.ValueOutOfBounds => error.ValueOutOfBounds,
             error.VarintOverflow => error.VarintOverflow,
             error.VarintTooSmall => error.VarintTooSmall,
             else => error.UnsupportedSql,
@@ -1839,4 +1875,3 @@ test "parse indexed column from create index" {
     try std.testing.expectEqualStrings("name", parseFirstIndexColumn("CREATE INDEX idx_users_name ON users(name)").?);
     try std.testing.expectEqualStrings("user name", parseFirstIndexColumn("CREATE INDEX idx ON users(\"user name\")").?);
 }
-

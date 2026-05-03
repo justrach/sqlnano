@@ -95,7 +95,7 @@ fn parseCreateTableColumns(sql: []const u8, allocator: std.mem.Allocator) Catalo
     while (pos < body.len) {
         const start = pos;
         pos = findNextComma(body, pos);
-        const part = std.mem.trim(u8, body[start..pos], " \t\r\n");
+        const part = trimSqlComments(body[start..pos]);
         if (part.len != 0 and !isTableConstraint(part)) {
             try columns.append(allocator, try parseColumn(part));
         }
@@ -205,6 +205,19 @@ fn findNextComma(bytes: []const u8, start: usize) usize {
             if (c == q) quote = null;
             continue;
         }
+        if (c == '-' and i + 1 < bytes.len and bytes[i + 1] == '-') {
+            i += 2;
+            while (i < bytes.len and bytes[i] != '\n') : (i += 1) {}
+            if (i >= bytes.len) return bytes.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < bytes.len and bytes[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < bytes.len and !(bytes[i] == '*' and bytes[i + 1] == '/')) : (i += 1) {}
+            if (i + 1 >= bytes.len) return bytes.len;
+            i += 1;
+            continue;
+        }
         if (c == '\'' or c == '"' or c == '`') {
             quote = c;
             continue;
@@ -214,6 +227,23 @@ fn findNextComma(bytes: []const u8, start: usize) usize {
         if (c == ',' and depth == 0) return i;
     }
     return bytes.len;
+}
+
+fn trimSqlComments(bytes: []const u8) []const u8 {
+    var rest = std.mem.trim(u8, bytes, " \t\r\n");
+    while (true) {
+        if (std.mem.startsWith(u8, rest, "--")) {
+            const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
+            rest = std.mem.trim(u8, rest[newline + 1 ..], " \t\r\n");
+            continue;
+        }
+        if (std.mem.startsWith(u8, rest, "/*")) {
+            const close = std.mem.indexOf(u8, rest, "*/") orelse return "";
+            rest = std.mem.trim(u8, rest[close + 2 ..], " \t\r\n");
+            continue;
+        }
+        return rest;
+    }
 }
 
 fn containsKeywordPair(bytes: []const u8, first: []const u8, second: []const u8) bool {
@@ -259,6 +289,34 @@ test "parse create table columns and integer primary key" {
     try std.testing.expectEqual(ColumnAffinity.integer, info.columns[0].affinity);
     try std.testing.expect(info.columns[0].is_integer_primary_key);
     try std.testing.expectEqual(@as(?usize, 0), info.integer_primary_key_index);
+}
+
+test "parse create table columns with line comments between definitions" {
+    const entry = schema.SchemaEntry{
+        .rowid = 1,
+        .object_type = "table",
+        .name = "judgments",
+        .table_name = "judgments",
+        .root_page = 2,
+        .sql =
+        \\CREATE TABLE judgments (
+        \\    citation        TEXT PRIMARY KEY,        -- e.g. "2026_SGHC_88"
+        \\    neutral_cite    TEXT,                    -- e.g. "[2026] SGHC 88"
+        \\    court           TEXT,
+        \\    year            INTEGER,
+        \\    case_no         TEXT                     -- no trailing comma
+        \\)
+        ,
+    };
+    const info = try tableInfo(entry, std.testing.allocator);
+    defer info.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), info.columns.len);
+    try std.testing.expectEqualStrings("citation", info.columns[0].name);
+    try std.testing.expectEqualStrings("neutral_cite", info.columns[1].name);
+    try std.testing.expectEqualStrings("court", info.columns[2].name);
+    try std.testing.expectEqualStrings("year", info.columns[3].name);
+    try std.testing.expectEqualStrings("case_no", info.columns[4].name);
 }
 
 test "project integer primary key from rowid" {

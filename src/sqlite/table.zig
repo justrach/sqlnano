@@ -82,6 +82,20 @@ pub fn scanTableForEach(
     try scanTableForEachPage(reader, root_page, ctx, onRow);
 }
 
+/// Row-at-a-time table scan that supports overflow payloads. Unlike
+/// `scanTable`, this does not materialise the whole table; unlike
+/// `scanTableForEach`, it may allocate for each row whose payload
+/// spills to overflow pages.
+pub fn scanTableForEachAlloc(
+    reader: page.PageReader,
+    root_page: u32,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    comptime onRow: fn (ctx: @TypeOf(ctx), rowid: i64, values: []const record.Value) anyerror!void,
+) anyerror!void {
+    try scanTableForEachAllocPage(reader, root_page, allocator, ctx, onRow);
+}
+
 fn scanTableForEachPage(
     reader: page.PageReader,
     page_number: u32,
@@ -100,6 +114,7 @@ fn scanTableForEachPage(
                 if (prefix.payload_start + prefix.payload_size > cell.len) return error.PayloadOverflowUnsupported;
                 try record.parseInline(cell[prefix.payload_start .. prefix.payload_start + prefix.payload_size], &inline_rec);
                 try onRow(ctx, prefix.rowid, inline_rec.slice());
+                if (scanShouldStop(ctx)) return;
             }
         },
         .table_interior => {
@@ -110,12 +125,59 @@ fn scanTableForEachPage(
                 const left_child = readU32(cell[0..4]);
                 _ = try parseVarint(cell[4..]);
                 try scanTableForEachPage(reader, left_child, ctx, onRow);
+                if (scanShouldStop(ctx)) return;
             }
             const right = header.right_most_pointer orelse return error.InvalidTableCell;
             try scanTableForEachPage(reader, right, ctx, onRow);
         },
         else => return error.UnsupportedTableBTree,
     }
+}
+
+fn scanTableForEachAllocPage(
+    reader: page.PageReader,
+    page_number: u32,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    comptime onRow: fn (ctx: @TypeOf(ctx), rowid: i64, values: []const record.Value) anyerror!void,
+) anyerror!void {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    switch (header.page_type) {
+        .table_leaf => {
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                const row = try parseTableLeafCellWithReader(reader, cell, allocator);
+                defer row.deinit(allocator);
+                try onRow(ctx, row.rowid, row.values);
+                if (scanShouldStop(ctx)) return;
+            }
+        },
+        .table_interior => {
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                if (cell.len < 5) return error.InvalidTableCell;
+                const left_child = readU32(cell[0..4]);
+                _ = try parseVarint(cell[4..]);
+                try scanTableForEachAllocPage(reader, left_child, allocator, ctx, onRow);
+                if (scanShouldStop(ctx)) return;
+            }
+            const right = header.right_most_pointer orelse return error.InvalidTableCell;
+            try scanTableForEachAllocPage(reader, right, allocator, ctx, onRow);
+        },
+        else => return error.UnsupportedTableBTree,
+    }
+}
+
+fn scanShouldStop(ctx: anytype) bool {
+    const info = @typeInfo(@TypeOf(ctx));
+    if (info != .pointer) return false;
+    const child = info.pointer.child;
+    if (@typeInfo(child) != .@"struct") return false;
+    if (@hasField(child, "stop_after")) return ctx.stop_after;
+    return false;
 }
 
 /// Count the number of rows in `root_page`'s table by summing leaf
@@ -321,7 +383,11 @@ test "parse table leaf cell" {
         1, // int8
         23, // 5-byte text
         42,
-        'a', 'l', 'i', 'c', 'e',
+        'a',
+        'l',
+        'i',
+        'c',
+        'e',
     };
 
     const row = try parseTableLeafCell(&cell, std.testing.allocator);
@@ -365,4 +431,145 @@ test "scan table root leaf page" {
     try std.testing.expectEqual(@as(usize, 1), table.rows.len);
     try std.testing.expectEqual(@as(i64, 7), table.rows[0].rowid);
     try std.testing.expectEqualStrings("alice", table.rows[0].values[1].text);
+}
+
+test "scan table foreach stops after caller sets stop_after" {
+    var bytes = [_]u8{0} ** 4096;
+    initTestHeader(bytes[0..], 4096, 1);
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.table_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 2;
+
+    const cell_1 = [_]u8{ 5, 1, 3, 1, 1, 10, 20 };
+    const cell_2 = [_]u8{ 5, 2, 3, 1, 1, 30, 40 };
+    const cell_2_off = 4096 - cell_2.len;
+    const cell_1_off = cell_2_off - cell_1.len;
+    writeU16Test(bytes[page_base + 5 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 8 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 10 ..][0..2], @intCast(cell_2_off));
+    @memcpy(bytes[cell_1_off..][0..cell_1.len], &cell_1);
+    @memcpy(bytes[cell_2_off..][0..cell_2.len], &cell_2);
+
+    const reader = try page.PageReader.init(&bytes);
+    const Ctx = struct {
+        count: usize = 0,
+        last_rowid: i64 = 0,
+        stop_after: bool = false,
+
+        fn onRow(ctx: *@This(), rowid: i64, values: []const record.Value) !void {
+            try std.testing.expectEqual(@as(usize, 2), values.len);
+            ctx.count += 1;
+            ctx.last_rowid = rowid;
+            ctx.stop_after = true;
+        }
+    };
+    var ctx: Ctx = .{};
+    try scanTableForEach(reader, 1, &ctx, Ctx.onRow);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.count);
+    try std.testing.expectEqual(@as(i64, 1), ctx.last_rowid);
+}
+
+test "scan table foreach alloc reads overflow payload" {
+    const page_size = 512;
+    var bytes = [_]u8{0} ** (page_size * 2);
+    initTestHeader(bytes[0..], page_size, 2);
+
+    var payload = [_]u8{0} ** 600;
+    payload[0] = 3; // header size: one byte for size + two-byte serial type
+    _ = encodeVarintTest(payload[1..], 1206); // blob length: (1206 - 12) / 2 = 597
+    @memset(payload[3..], 0xab);
+
+    const payload_info = btree.tableLeafPayloadInfo(payload.len, page_size);
+    try std.testing.expect(payload_info.overflow_page != null);
+
+    var cell_1: [128]u8 = undefined;
+    var cpos: usize = 0;
+    cpos += encodeVarintTest(cell_1[cpos..], payload.len);
+    cpos += encodeVarintTest(cell_1[cpos..], 1);
+    @memcpy(cell_1[cpos..][0..payload_info.local_len], payload[0..payload_info.local_len]);
+    cpos += payload_info.local_len;
+    writeU32Test(cell_1[cpos..][0..4], 2);
+    cpos += 4;
+
+    const cell_2 = [_]u8{ 3, 2, 2, 1, 7 };
+    const cell_1_off = page_size - cpos;
+    const cell_2_off = cell_1_off - cell_2.len;
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.table_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 2;
+    writeU16Test(bytes[page_base + 5 ..][0..2], @intCast(cell_2_off));
+    writeU16Test(bytes[page_base + 8 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 10 ..][0..2], @intCast(cell_2_off));
+    @memcpy(bytes[cell_1_off..][0..cpos], cell_1[0..cpos]);
+    @memcpy(bytes[cell_2_off..][0..cell_2.len], &cell_2);
+
+    const overflow_base = page_size;
+    writeU32Test(bytes[overflow_base..][0..4], 0);
+    @memcpy(bytes[overflow_base + 4 ..][0 .. payload.len - payload_info.local_len], payload[payload_info.local_len..]);
+
+    const reader = try page.PageReader.init(&bytes);
+    const Ctx = struct {
+        count: usize = 0,
+        blob_len: usize = 0,
+        stop_after: bool = false,
+
+        fn onRow(ctx: *@This(), rowid: i64, values: []const record.Value) !void {
+            try std.testing.expectEqual(@as(i64, 1), rowid);
+            try std.testing.expectEqual(@as(usize, 1), values.len);
+            try std.testing.expect(values[0] == .blob);
+            try std.testing.expectEqual(@as(usize, 597), values[0].blob.len);
+            try std.testing.expectEqual(@as(u8, 0xab), values[0].blob[0]);
+            ctx.count += 1;
+            ctx.blob_len = values[0].blob.len;
+            ctx.stop_after = true;
+        }
+    };
+    var ctx: Ctx = .{};
+    try scanTableForEachAlloc(reader, 1, std.testing.allocator, &ctx, Ctx.onRow);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.count);
+    try std.testing.expectEqual(@as(usize, 597), ctx.blob_len);
+}
+
+fn initTestHeader(bytes: []u8, comptime page_size: u16, page_count: u32) void {
+    @memcpy(bytes[0..16], @import("header.zig").MAGIC);
+    writeU16Test(bytes[16..18], page_size);
+    bytes[18] = 1;
+    bytes[19] = 1;
+    bytes[21] = 64;
+    bytes[22] = 32;
+    bytes[23] = 32;
+    writeU32Test(bytes[28..32], page_count);
+}
+
+fn writeU16Test(bytes: []u8, value: u16) void {
+    std.mem.writeInt(u16, bytes[0..2], value, .big);
+}
+
+fn writeU32Test(bytes: []u8, value: u32) void {
+    std.mem.writeInt(u32, bytes[0..4], value, .big);
+}
+
+fn encodeVarintTest(dst: []u8, value: u64) usize {
+    var buf: [9]u8 = undefined;
+    var tmp = value;
+    var len: usize = 1;
+    while (tmp > 0x7f and len < 9) : (len += 1) tmp >>= 7;
+
+    var i = len;
+    tmp = value;
+    while (i > 0) {
+        i -= 1;
+        buf[i] = @intCast(tmp & 0x7f);
+        if (i != len - 1) buf[i] |= 0x80;
+        tmp >>= 7;
+    }
+
+    @memcpy(dst[0..len], buf[0..len]);
+    return len;
 }
