@@ -212,6 +212,16 @@ pub const CreateIndexStatement = struct {
     unique: bool = false,
 };
 
+pub const AlterTableStatement = struct {
+    table_name: []const u8,
+    new_table_name: []const u8,
+};
+
+pub const DropTableStatement = struct {
+    table_name: []const u8,
+    if_exists: bool = false,
+};
+
 pub const Assignment = struct {
     column_name: []const u8,
     value: Literal,

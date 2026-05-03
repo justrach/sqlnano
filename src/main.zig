@@ -329,6 +329,8 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  sqlnano fts-search <database.db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]  Search and hydrate rows as JSON
         \\  sqlnano exec <database.db> "CREATE TABLE t(...)"  Create a simple rowid table
         \\  sqlnano exec <database.db> "CREATE INDEX idx ON t(col)"  Create a simple single-column index
+        \\  sqlnano exec <database.db> "ALTER TABLE t RENAME TO u"  Rename a simple rowid table
+        \\  sqlnano exec <database.db> "DROP TABLE t"  Drop a simple tail-allocated rowid table
         \\  sqlnano exec <database.db> "INSERT INTO t VALUES (...)"  Append a simple row
         \\  sqlnano bench-read <database.db> "SELECT * FROM t WHERE rowid = 1" <N>  Benchmark hot read path
         \\  sqlnano bench-write <database.db> <table> <N>  Benchmark durable inserts via a long-lived Connection
@@ -919,6 +921,18 @@ fn execSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, sql
                 try writer.print("created index: {s}\n", .{create.index_name});
             } else {
                 try writer.print("index already exists: {s}\n", .{create.index_name});
+            }
+        },
+        .alter_table => |alter| {
+            try sqlnano.sqlite.write_mod.alterTableRenameSimple(init.gpa, init.io, path, alter);
+            try writer.print("renamed table: {s} -> {s}\n", .{ alter.table_name, alter.new_table_name });
+        },
+        .drop_table => |drop| {
+            const dropped = try sqlnano.sqlite.write_mod.dropTableSimple(init.gpa, init.io, path, drop);
+            if (dropped) {
+                try writer.print("dropped table: {s}\n", .{drop.table_name});
+            } else {
+                try writer.print("table did not exist: {s}\n", .{drop.table_name});
             }
         },
         .update => |upd| {

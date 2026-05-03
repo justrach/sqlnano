@@ -1113,6 +1113,137 @@ pub const Connection = struct {
         return true;
     }
 
+    pub fn alterTableRename(self: *Connection, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
+        if (self.in_batch) return error.DdlInBatchUnsupported;
+        if (isReservedSchemaName(stmt.new_table_name)) return error.ReservedSchemaName;
+
+        _ = self.scratch_arena.reset(.retain_capacity);
+        const scratch = self.scratch_arena.allocator();
+        try self.alterTableRenameInExistingDatabase(scratch, stmt);
+
+        self.image_dirty = true;
+        self.full_rewrite = true;
+        self.invalidateSchemaCache();
+        self.invalidateRowidCache(stmt.table_name);
+        self.invalidateRowidCache(stmt.new_table_name);
+        try self.flush();
+    }
+
+    fn alterTableRenameInExistingDatabase(self: *Connection, scratch: Allocator, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
+        if (self.image.items.len == 0) return error.TableNotFound;
+
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return error.WalModeUnsupported;
+
+        const db_schema = try schema.readSchema(reader, self.gpa);
+        defer db_schema.deinit(self.gpa);
+        const table_entry = findTableIgnoreCase(db_schema, stmt.table_name) orelse return error.TableNotFound;
+        if (schemaObjectNameExists(db_schema, stmt.new_table_name)) return error.SchemaObjectAlreadyExists;
+
+        const schema_ref = try reader.page(1);
+        const schema_header = try btree.PageHeader.parse(schema_ref);
+        if (schema_header.page_type != .table_leaf) return error.UnsupportedSchemaBTree;
+
+        const renamed_table_sql = try renameCreateTableSql(scratch, table_entry.sql, stmt.new_table_name);
+        const entries = try scratch.alloc(schema.SchemaEntry, db_schema.entries.len);
+        for (db_schema.entries, 0..) |entry, i| {
+            entries[i] = entry;
+            if (entry.rowid == table_entry.rowid) {
+                entries[i].name = stmt.new_table_name;
+                entries[i].table_name = stmt.new_table_name;
+                entries[i].sql = renamed_table_sql;
+            } else if (std.ascii.eqlIgnoreCase(entry.table_name, table_entry.name)) {
+                entries[i].table_name = stmt.new_table_name;
+                if (entry.isIndex() and entry.sql.len != 0) {
+                    entries[i].sql = try renameCreateIndexSql(scratch, entry.sql, entry.name, stmt.new_table_name);
+                }
+            }
+        }
+
+        const file_pages = pageCountForLength(self.image.items.len, reader.db_header.page_size);
+        const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
+        try rewriteSchemaLeafPage(scratch, self.image.items, reader.db_header, entries);
+        bumpHeaderForDdl(self.image.items, reader.db_header, effective_page_count);
+    }
+
+    pub fn dropTable(self: *Connection, stmt: @import("ast.zig").DropTableStatement) WriteError!bool {
+        if (self.in_batch) return error.DdlInBatchUnsupported;
+
+        _ = self.scratch_arena.reset(.retain_capacity);
+        const scratch = self.scratch_arena.allocator();
+        const dropped = try self.dropTableInExistingDatabase(scratch, stmt);
+
+        if (dropped) {
+            self.image_dirty = true;
+            self.full_rewrite = true;
+            self.invalidateSchemaCache();
+            self.invalidateRowidCache(stmt.table_name);
+            try self.flush();
+        }
+        return dropped;
+    }
+
+    fn dropTableInExistingDatabase(self: *Connection, scratch: Allocator, stmt: @import("ast.zig").DropTableStatement) WriteError!bool {
+        if (self.image.items.len == 0) {
+            if (stmt.if_exists) return false;
+            return error.TableNotFound;
+        }
+
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return error.WalModeUnsupported;
+
+        const db_schema = try schema.readSchema(reader, self.gpa);
+        defer db_schema.deinit(self.gpa);
+        const table_entry = findTableIgnoreCase(db_schema, stmt.table_name) orelse {
+            if (stmt.if_exists) return false;
+            return error.TableNotFound;
+        };
+        if (table_entry.root_page <= 1) return error.UnsupportedDropTable;
+
+        const schema_ref = try reader.page(1);
+        const schema_header = try btree.PageHeader.parse(schema_ref);
+        if (schema_header.page_type != .table_leaf) return error.UnsupportedSchemaBTree;
+
+        const page_size: usize = reader.db_header.page_size;
+        const file_pages = pageCountForLength(self.image.items.len, page_size);
+        const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
+
+        var pages_to_drop = std.AutoHashMap(u32, void).init(scratch);
+        try collectTablePages(reader, @intCast(table_entry.root_page), &pages_to_drop);
+        for (db_schema.entries) |entry| {
+            if (!entry.isIndex() or entry.root_page <= 0) continue;
+            if (!std.ascii.eqlIgnoreCase(entry.table_name, table_entry.name)) continue;
+            try collectIndexPages(reader, @intCast(entry.root_page), &pages_to_drop);
+        }
+
+        var final_page_count = effective_page_count;
+        while (final_page_count > 1 and pages_to_drop.contains(final_page_count)) {
+            final_page_count -= 1;
+        }
+        if (final_page_count == effective_page_count) return error.DropTableRequiresFreelist;
+        var dropped_pages_it = pages_to_drop.keyIterator();
+        while (dropped_pages_it.next()) |page_num| {
+            if (page_num.* <= final_page_count) return error.DropTableRequiresFreelist;
+        }
+
+        var kept_entries: std.ArrayList(schema.SchemaEntry) = .empty;
+        errdefer kept_entries.deinit(scratch);
+        for (db_schema.entries) |entry| {
+            const drops_table = entry.rowid == table_entry.rowid;
+            const drops_index = entry.isIndex() and std.ascii.eqlIgnoreCase(entry.table_name, table_entry.name);
+            if (!drops_table and !drops_index) {
+                if (entry.root_page > final_page_count) return error.DropTableRequiresFreelist;
+                try kept_entries.append(scratch, entry);
+            }
+        }
+
+        const new_image_len: usize = @as(usize, final_page_count) * page_size;
+        try self.image.resize(new_image_len);
+        try rewriteSchemaLeafPage(scratch, self.image.items, reader.db_header, kept_entries.items);
+        bumpHeaderForDdl(self.image.items, reader.db_header, final_page_count);
+        return true;
+    }
+
     fn createTableInExistingDatabase(self: *Connection, scratch: Allocator, stmt: @import("ast.zig").CreateTableStatement) WriteError!bool {
         const reader = try page.PageReader.init(self.image.items);
         if (reader.db_header.isWal()) return error.WalModeUnsupported;
@@ -1480,6 +1611,105 @@ fn buildSchemaObjectCell(
     return cell.toOwnedSlice(allocator);
 }
 
+fn rewriteSchemaLeafPage(
+    allocator: Allocator,
+    mutable: []u8,
+    db_header: header.Header,
+    entries: []const schema.SchemaEntry,
+) WriteError!void {
+    var cells: std.ArrayList([]u8) = .empty;
+    defer {
+        for (cells.items) |cell| allocator.free(cell);
+        cells.deinit(allocator);
+    }
+    try cells.ensureTotalCapacity(allocator, entries.len);
+    for (entries) |entry| {
+        if (entry.root_page < 0) return error.UnsupportedSchemaRecord;
+        const cell = try buildSchemaObjectCell(
+            allocator,
+            entry.object_type,
+            entry.name,
+            entry.table_name,
+            @intCast(entry.root_page),
+            entry.sql,
+            entry.rowid,
+        );
+        try cells.append(allocator, cell);
+    }
+    try rewriteLeafPage(mutable, db_header, 1, .table_leaf, cells.items);
+}
+
+fn renameCreateTableSql(allocator: Allocator, sql: []const u8, new_table_name: []const u8) WriteError![]u8 {
+    const open = std.mem.indexOfScalar(u8, sql, '(') orelse return error.InvalidCreateTableSql;
+    const close = findMatchingParen(sql, open) orelse return error.InvalidCreateTableSql;
+    const quoted_name = try quoteIdentifierAlloc(allocator, new_table_name);
+    return std.fmt.allocPrint(allocator, "CREATE TABLE {s}{s}", .{ quoted_name, sql[open .. close + 1] });
+}
+
+fn renameCreateIndexSql(
+    allocator: Allocator,
+    sql: []const u8,
+    index_name: []const u8,
+    new_table_name: []const u8,
+) WriteError![]u8 {
+    const column_name = parseFirstIndexColumn(sql) orelse return error.UnsupportedIndex;
+    const quoted_index = try quoteIdentifierAlloc(allocator, index_name);
+    const quoted_table = try quoteIdentifierAlloc(allocator, new_table_name);
+    const quoted_column = try quoteIdentifierAlloc(allocator, column_name);
+    const unique = if (isUniqueIndex(sql)) "UNIQUE " else "";
+    return std.fmt.allocPrint(allocator, "CREATE {s}INDEX {s} ON {s}({s})", .{ unique, quoted_index, quoted_table, quoted_column });
+}
+
+fn quoteIdentifierAlloc(allocator: Allocator, name: []const u8) WriteError![]u8 {
+    if (isBareIdentifier(name) and !isReservedSqlWord(name)) return allocator.dupe(u8, name);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '"');
+    for (name) |c| {
+        if (c == '"') try out.append(allocator, '"');
+        try out.append(allocator, c);
+    }
+    try out.append(allocator, '"');
+    return out.toOwnedSlice(allocator);
+}
+
+fn isBareIdentifier(name: []const u8) bool {
+    if (name.len == 0 or !@import("tokenizer.zig").isIdentifierStart(name[0])) return false;
+    for (name[1..]) |c| {
+        if (!@import("tokenizer.zig").isIdentifierContinue(c)) return false;
+    }
+    return true;
+}
+
+fn isReservedSqlWord(name: []const u8) bool {
+    return @import("tokenizer.zig").keywordFor(name) != null;
+}
+
+fn findMatchingParen(sql: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var quote: ?u8 = null;
+    var i = open;
+    while (i < sql.len) : (i += 1) {
+        const c = sql[i];
+        if (quote) |q| {
+            if (c == q) quote = null;
+            continue;
+        }
+        if (c == '\'' or c == '"' or c == '`') {
+            quote = c;
+            continue;
+        }
+        if (c == '(') depth += 1;
+        if (c == ')') {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return null;
+}
+
 fn writeMinimalDatabaseHeader(mutable: []u8, page_count: u32) void {
     std.debug.assert(mutable.len >= header.HEADER_SIZE);
     @memset(mutable[0..header.HEADER_SIZE], 0);
@@ -1627,6 +1857,18 @@ pub fn createIndexSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import
     var conn = try Connection.open(gpa, io, path);
     defer conn.close();
     return conn.createIndex(stmt);
+}
+
+pub fn alterTableRenameSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
+    var conn = try Connection.open(gpa, io, path);
+    defer conn.close();
+    return conn.alterTableRename(stmt);
+}
+
+pub fn dropTableSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").DropTableStatement) WriteError!bool {
+    var conn = try Connection.open(gpa, io, path);
+    defer conn.close();
+    return conn.dropTable(stmt);
 }
 
 /// One-shot convenience wrapper: opens a `Connection`, runs a single
@@ -2643,6 +2885,27 @@ fn walkTableLeaves(
     }
 }
 
+fn collectTablePages(reader: page.PageReader, page_num: u32, out: *std.AutoHashMap(u32, void)) WriteError!void {
+    try out.put(page_num, {});
+    const ref = try reader.page(page_num);
+    const hdr = try btree.PageHeader.parse(ref);
+    switch (hdr.page_type) {
+        .table_leaf => {},
+        .table_interior => {
+            var i: usize = 0;
+            while (i < hdr.cell_count) : (i += 1) {
+                const cell = try hdr.cell(ref, i);
+                if (cell.len < 5) return error.InvalidTableCell;
+                const left = std.mem.readInt(u32, cell[0..4], .big);
+                try collectTablePages(reader, left, out);
+            }
+            const right = hdr.right_most_pointer orelse return error.InvalidTableCell;
+            try collectTablePages(reader, right, out);
+        },
+        else => return error.UnsupportedTableBTree,
+    }
+}
+
 /// Rewrite `root_page` as a `table_interior` node with one divider per
 /// non-rightmost leaf. Each divider cell is `[u32 left_child BE][varint
 /// largest_rowid_in_left]`; the rightmost leaf is pointed to by the
@@ -2824,6 +3087,27 @@ fn walkIndexLeaves(
             }
             const right = hdr.right_most_pointer orelse return error.UnsupportedIndex;
             try walkIndexLeaves(reader, right, root_page, out, gpa);
+        },
+        else => return error.UnsupportedIndex,
+    }
+}
+
+fn collectIndexPages(reader: page.PageReader, page_num: u32, out: *std.AutoHashMap(u32, void)) WriteError!void {
+    try out.put(page_num, {});
+    const ref = try reader.page(page_num);
+    const hdr = try btree.PageHeader.parse(ref);
+    switch (hdr.page_type) {
+        .index_leaf => {},
+        .index_interior => {
+            var i: usize = 0;
+            while (i < hdr.cell_count) : (i += 1) {
+                const cell = try hdr.cell(ref, i);
+                if (cell.len < 4) return error.InvalidIndexCell;
+                const left = std.mem.readInt(u32, cell[0..4], .big);
+                try collectIndexPages(reader, left, out);
+            }
+            const right = hdr.right_most_pointer orelse return error.InvalidIndexCell;
+            try collectIndexPages(reader, right, out);
         },
         else => return error.UnsupportedIndex,
     }
@@ -3064,6 +3348,25 @@ test "createTableSimple creates a readable db and accepts inserts" {
     const note_rowid = try insertSimple(testing.allocator, testing.io, db_path, "notes", &note_vals);
     try testing.expectEqual(@as(i64, 1), note_rowid);
 
+    try alterTableRenameSimple(testing.allocator, testing.io, db_path, .{
+        .table_name = "users",
+        .new_table_name = "people",
+    });
+
+    const charlie_vals = [_]InsertValue{ .null, .{ .text = "charlie" }, .{ .integer = 50 } };
+    const charlie_rowid = try insertSimple(testing.allocator, testing.io, db_path, "people", &charlie_vals);
+    try testing.expectEqual(@as(i64, 3), charlie_rowid);
+
+    const scratch_created = try createTableSimple(testing.allocator, testing.io, db_path, .{
+        .table_name = "scratch",
+        .sql = "CREATE TABLE scratch(id INTEGER PRIMARY KEY, body TEXT)",
+    });
+    try testing.expect(scratch_created);
+    const scratch_dropped = try dropTableSimple(testing.allocator, testing.io, db_path, .{
+        .table_name = "scratch",
+    });
+    try testing.expect(scratch_dropped);
+
     const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, db_path, testing.allocator, .limited(1024 * 1024));
     defer testing.allocator.free(bytes);
     const reader = try page.PageReader.init(bytes);
@@ -3072,30 +3375,39 @@ test "createTableSimple creates a readable db and accepts inserts" {
 
     const db_schema = try schema.readSchema(reader, testing.allocator);
     defer db_schema.deinit(testing.allocator);
-    const entry = db_schema.findTable("users") orelse return error.TestUnexpectedResult;
+    try testing.expect(db_schema.findTable("users") == null);
+    try testing.expect(db_schema.findTable("scratch") == null);
+    const entry = db_schema.findTable("people") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 2), entry.root_page);
+    try testing.expectEqualStrings("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", entry.sql);
     const notes_entry = db_schema.findTable("notes") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 3), notes_entry.root_page);
     const index_entry = db_schema.findIndex("idx_users_name") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 4), index_entry.root_page);
+    try testing.expectEqualStrings("people", index_entry.table_name);
+    try testing.expectEqualStrings("CREATE INDEX idx_users_name ON people(name)", index_entry.sql);
 
     var info = try catalog.tableInfo(entry, testing.allocator);
     defer info.deinit(testing.allocator);
     const scanned = try table.scanTable(reader, info.root_page, testing.allocator);
     defer scanned.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 2), scanned.rows.len);
+    try testing.expectEqual(@as(usize, 3), scanned.rows.len);
     try testing.expectEqualStrings("alice", scanned.rows[0].values[1].text);
     try testing.expectEqual(@as(i64, 30), scanned.rows[0].values[2].integer);
     try testing.expectEqualStrings("bob", scanned.rows[1].values[1].text);
     try testing.expectEqual(@as(i64, 40), scanned.rows[1].values[2].integer);
+    try testing.expectEqualStrings("charlie", scanned.rows[2].values[1].text);
+    try testing.expectEqual(@as(i64, 50), scanned.rows[2].values[2].integer);
 
     const idx = try @import("index.zig").scanIndex(reader, @intCast(index_entry.root_page), testing.allocator);
     defer idx.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 2), idx.entries.len);
+    try testing.expectEqual(@as(usize, 3), idx.entries.len);
     try testing.expectEqualStrings("alice", idx.entries[0].values[0].text);
     try testing.expectEqual(@as(?i64, 1), idx.entries[0].rowid());
     try testing.expectEqualStrings("bob", idx.entries[1].values[0].text);
     try testing.expectEqual(@as(?i64, 2), idx.entries[1].rowid());
+    try testing.expectEqualStrings("charlie", idx.entries[2].values[0].text);
+    try testing.expectEqual(@as(?i64, 3), idx.entries[2].rowid());
 
     var notes_info = try catalog.tableInfo(notes_entry, testing.allocator);
     defer notes_info.deinit(testing.allocator);
