@@ -10,6 +10,7 @@ pub const ParseError = error{
     UnsupportedSql,
     UnsupportedSelect,
     UnsupportedInsert,
+    UnsupportedCreate,
     UnsupportedUpdate,
     UnsupportedDelete,
     UnsupportedWhere,
@@ -18,6 +19,8 @@ pub const ParseError = error{
 pub const Statement = union(enum) {
     select: ast.SelectStatement,
     insert: ast.InsertStatement,
+    create_table: ast.CreateTableStatement,
+    create_index: ast.CreateIndexStatement,
     update: ast.UpdateStatement,
     delete: ast.DeleteStatement,
 
@@ -25,6 +28,8 @@ pub const Statement = union(enum) {
         switch (self) {
             .select => |sel| sel.deinit(allocator),
             .insert => |insert| insert.deinit(allocator),
+            .create_table => {},
+            .create_index => {},
             .update => {},
             .delete => {},
         }
@@ -43,6 +48,8 @@ pub const Parser = struct {
             .{ .select = try self.parseSelect(allocator) }
         else if (self.stream.current.isKeyword(.insert))
             .{ .insert = try self.parseInsert(allocator) }
+        else if (self.stream.current.isKeyword(.create))
+            try self.parseCreate()
         else if (self.stream.current.isKeyword(.update))
             .{ .update = try self.parseUpdate() }
         else if (self.stream.current.isKeyword(.delete))
@@ -112,8 +119,7 @@ pub const Parser = struct {
             try self.expectKeyword(.by, error.UnsupportedSql);
             const col = try self.parseColumnRef();
             var descending = false;
-            if (try self.consumeKeyword(.desc)) descending = true
-            else _ = try self.consumeKeyword(.asc);
+            if (try self.consumeKeyword(.desc)) descending = true else _ = try self.consumeKeyword(.asc);
             order_by = .{ .column = col, .descending = descending };
         }
 
@@ -506,6 +512,119 @@ pub const Parser = struct {
         return .{ .table_name = table_name, .values = try values.toOwnedSlice(allocator) };
     }
 
+    pub fn parseCreate(self: *Parser) ParseError!Statement {
+        const saved = self.stream;
+        try self.expectKeyword(.create, error.UnsupportedCreate);
+        if (currentWordEquals(self.stream.current, "UNIQUE")) {
+            self.stream.advance() catch return error.InvalidSql;
+        }
+        const is_index = self.stream.current.isKeyword(.index);
+        self.stream = saved;
+        if (is_index) return .{ .create_index = try self.parseCreateIndex() };
+        return .{ .create_table = try self.parseCreateTable() };
+    }
+
+    pub fn parseCreateTable(self: *Parser) ParseError!ast.CreateTableStatement {
+        const source = self.stream.tokenizer.input;
+        const start = self.stream.current.start;
+
+        try self.expectKeyword(.create, error.UnsupportedCreate);
+        try self.expectKeyword(.table, error.UnsupportedCreate);
+
+        var if_not_exists = false;
+        if (currentWordEquals(self.stream.current, "IF")) {
+            if_not_exists = true;
+            self.stream.advance() catch return error.InvalidSql;
+            try self.expectWord("NOT", error.UnsupportedCreate);
+            try self.expectWord("EXISTS", error.UnsupportedCreate);
+        }
+
+        const table_name = try self.identifier(error.UnsupportedCreate);
+        try self.expect(.left_paren, error.UnsupportedCreate);
+
+        var depth: usize = 1;
+        var close_end: usize = 0;
+        while (true) {
+            const tok = self.stream.current;
+            switch (tok.kind) {
+                .eof => return error.UnsupportedCreate,
+                .left_paren => {
+                    depth += 1;
+                    self.stream.advance() catch return error.InvalidSql;
+                },
+                .right_paren => {
+                    depth -= 1;
+                    close_end = tok.end;
+                    self.stream.advance() catch return error.InvalidSql;
+                    if (depth == 0) break;
+                },
+                else => self.stream.advance() catch return error.InvalidSql,
+            }
+        }
+
+        return .{
+            .table_name = table_name,
+            .sql = std.mem.trim(u8, source[start..close_end], " \t\r\n"),
+            .if_not_exists = if_not_exists,
+        };
+    }
+
+    pub fn parseCreateIndex(self: *Parser) ParseError!ast.CreateIndexStatement {
+        const source = self.stream.tokenizer.input;
+        const start = self.stream.current.start;
+
+        try self.expectKeyword(.create, error.UnsupportedCreate);
+        const unique = if (currentWordEquals(self.stream.current, "UNIQUE")) blk: {
+            self.stream.advance() catch return error.InvalidSql;
+            break :blk true;
+        } else false;
+        try self.expectKeyword(.index, error.UnsupportedCreate);
+
+        var if_not_exists = false;
+        if (currentWordEquals(self.stream.current, "IF")) {
+            if_not_exists = true;
+            self.stream.advance() catch return error.InvalidSql;
+            try self.expectWord("NOT", error.UnsupportedCreate);
+            try self.expectWord("EXISTS", error.UnsupportedCreate);
+        }
+
+        const index_name = try self.identifier(error.UnsupportedCreate);
+        try self.expectKeyword(.on, error.UnsupportedCreate);
+        const table_name = try self.identifier(error.UnsupportedCreate);
+        try self.expect(.left_paren, error.UnsupportedCreate);
+        const column_name = try self.identifier(error.UnsupportedCreate);
+
+        var depth: usize = 1;
+        var close_end: usize = 0;
+        while (true) {
+            const tok = self.stream.current;
+            switch (tok.kind) {
+                .eof => return error.UnsupportedCreate,
+                .comma => if (depth == 1) return error.UnsupportedCreate else self.stream.advance() catch return error.InvalidSql,
+                .left_paren => {
+                    depth += 1;
+                    self.stream.advance() catch return error.InvalidSql;
+                },
+                .right_paren => {
+                    depth -= 1;
+                    close_end = tok.end;
+                    self.stream.advance() catch return error.InvalidSql;
+                    if (depth == 0) break;
+                },
+                else => self.stream.advance() catch return error.InvalidSql,
+            }
+        }
+
+        return .{
+            .index_name = index_name,
+            .table_name = table_name,
+            .column_name = column_name,
+            .sql = std.mem.trim(u8, source[start..close_end], " \t\r\n"),
+            .if_not_exists = if_not_exists,
+            .unique = unique,
+        };
+    }
+
     pub fn parseUpdate(self: *Parser) ParseError!ast.UpdateStatement {
         try self.expectKeyword(.update, error.UnsupportedUpdate);
         const table_name = try self.identifier(error.UnsupportedUpdate);
@@ -542,6 +661,11 @@ pub const Parser = struct {
 
     fn consumeKeyword(self: *Parser, keyword: tokenizer.Keyword) ParseError!bool {
         return self.stream.consumeKeyword(keyword) catch return error.InvalidSql;
+    }
+
+    fn expectWord(self: *Parser, word: []const u8, err: ParseError) ParseError!void {
+        if (!currentWordEquals(self.stream.current, word)) return err;
+        self.stream.advance() catch return error.InvalidSql;
     }
 
     fn expect(self: *Parser, kind: tokenizer.Kind, err: ParseError) ParseError!void {
@@ -583,6 +707,13 @@ pub const Parser = struct {
         return err;
     }
 };
+
+fn currentWordEquals(token: tokenizer.Token, word: []const u8) bool {
+    return switch (token.kind) {
+        .identifier, .keyword => std.ascii.eqlIgnoreCase(token.lexeme, word),
+        else => false,
+    };
+}
 
 fn makeBinary(allocator: std.mem.Allocator, op: ast.BinOp, lhs: *ast.Expr, rhs: *ast.Expr) ParseError!*ast.Expr {
     const node = try allocator.create(ast.Expr);
@@ -712,4 +843,24 @@ test "parse statement dispatch" {
     defer stmt.deinit(std.testing.allocator);
     try std.testing.expect(stmt == .insert);
     try std.testing.expectEqualStrings("users", stmt.insert.table_name);
+}
+
+test "parse create table dispatch" {
+    const stmt = try parseStatement("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT);", std.testing.allocator);
+    defer stmt.deinit(std.testing.allocator);
+    try std.testing.expect(stmt == .create_table);
+    try std.testing.expect(stmt.create_table.if_not_exists);
+    try std.testing.expectEqualStrings("users", stmt.create_table.table_name);
+    try std.testing.expectEqualStrings("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT)", stmt.create_table.sql);
+}
+
+test "parse create index dispatch" {
+    const stmt = try parseStatement("CREATE INDEX IF NOT EXISTS idx_users_name ON users(name);", std.testing.allocator);
+    defer stmt.deinit(std.testing.allocator);
+    try std.testing.expect(stmt == .create_index);
+    try std.testing.expect(stmt.create_index.if_not_exists);
+    try std.testing.expectEqualStrings("idx_users_name", stmt.create_index.index_name);
+    try std.testing.expectEqualStrings("users", stmt.create_index.table_name);
+    try std.testing.expectEqualStrings("name", stmt.create_index.column_name);
+    try std.testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS idx_users_name ON users(name)", stmt.create_index.sql);
 }

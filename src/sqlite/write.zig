@@ -89,7 +89,6 @@ const ApplyMode = enum { fresh, idempotent };
 /// and the WAL is checkpointed+compacted.
 ///
 /// The `db_path` slice is borrowed and must outlive the connection.
-
 /// When the on-disk WAL grows past this many bytes, `maybeCheckpoint`
 /// flushes the image and compacts the WAL. 1 MiB balances batch
 /// amortisation against crash-replay cost.
@@ -996,12 +995,173 @@ pub const Connection = struct {
         if (!self.in_batch) try self.maybeCheckpoint();
         return changed;
     }
+
+    pub fn createTable(self: *Connection, stmt: @import("ast.zig").CreateTableStatement) WriteError!bool {
+        if (self.in_batch) return error.DdlInBatchUnsupported;
+        if (isReservedSchemaName(stmt.table_name)) return error.ReservedSchemaName;
+
+        _ = self.scratch_arena.reset(.retain_capacity);
+        const scratch = self.scratch_arena.allocator();
+        try validateCreateTableStatement(stmt, scratch);
+
+        const created = if (self.image.items.len == 0)
+            try self.createFirstTable(scratch, stmt)
+        else
+            try self.createTableInExistingDatabase(scratch, stmt);
+
+        if (created) {
+            self.image_dirty = true;
+            self.full_rewrite = true;
+            self.invalidateSchemaCache();
+            self.invalidateRowidCache(stmt.table_name);
+            try self.flush();
+        }
+        return created;
+    }
+
+    fn createFirstTable(self: *Connection, scratch: Allocator, stmt: @import("ast.zig").CreateTableStatement) WriteError!bool {
+        const page_size: usize = 4096;
+        const reserved: usize = 0;
+        const root_page: u32 = 2;
+        const page_count: u32 = 2;
+        const image_len: usize = page_size * page_count;
+
+        try self.image.resize(image_len);
+        @memset(self.image.items, 0);
+        self.page_size_cached = page_size;
+
+        const mutable = self.image.items;
+        writeMinimalDatabaseHeader(mutable, page_count);
+        writeEmptyTableLeafPage(mutable, 1, page_size, reserved);
+        writeEmptyTableLeafPage(mutable, root_page, page_size, reserved);
+
+        const db_header = try header.Header.parse(mutable);
+        const schema_cell = try buildSchemaTableCell(scratch, stmt.table_name, root_page, stmt.sql, 1);
+        try insertCellIntoLeaf(mutable, db_header, 1, schema_cell, 0);
+        return true;
+    }
+
+    pub fn createIndex(self: *Connection, stmt: @import("ast.zig").CreateIndexStatement) WriteError!bool {
+        if (self.in_batch) return error.DdlInBatchUnsupported;
+        if (isReservedSchemaName(stmt.index_name)) return error.ReservedSchemaName;
+
+        _ = self.scratch_arena.reset(.retain_capacity);
+        const scratch = self.scratch_arena.allocator();
+        const created = try self.createIndexInExistingDatabase(scratch, stmt);
+
+        if (created) {
+            self.image_dirty = true;
+            self.full_rewrite = true;
+            self.invalidateSchemaCache();
+            self.invalidateRowidCache(stmt.table_name);
+            try self.flush();
+        }
+        return created;
+    }
+
+    fn createIndexInExistingDatabase(self: *Connection, scratch: Allocator, stmt: @import("ast.zig").CreateIndexStatement) WriteError!bool {
+        if (self.image.items.len == 0) return error.TableNotFound;
+
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return error.WalModeUnsupported;
+
+        const db_schema = try schema.readSchema(reader, self.gpa);
+        defer db_schema.deinit(self.gpa);
+        if (schemaObjectNameExists(db_schema, stmt.index_name)) {
+            if (stmt.if_not_exists) return false;
+            return error.SchemaObjectAlreadyExists;
+        }
+        if (stmt.unique) return error.UniqueIndexUnsupported;
+
+        const table_entry = findTableIgnoreCase(db_schema, stmt.table_name) orelse return error.TableNotFound;
+        var info = try catalog.tableInfo(table_entry, scratch);
+        defer info.deinit(scratch);
+        const column_idx = columnIndex(info, stmt.column_name) orelse return error.ColumnNotFound;
+
+        const schema_ref = try reader.page(1);
+        const schema_header = try btree.PageHeader.parse(schema_ref);
+        if (schema_header.page_type != .table_leaf) return error.UnsupportedSchemaBTree;
+
+        var max_schema_rowid: i64 = 0;
+        for (db_schema.entries) |entry| max_schema_rowid = @max(max_schema_rowid, entry.rowid);
+        const schema_rowid = max_schema_rowid + 1;
+
+        const page_size: usize = reader.db_header.page_size;
+        const old_image_len = self.image.items.len;
+        const file_pages = pageCountForLength(old_image_len, page_size);
+        const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
+        const root_page = effective_page_count + 1;
+        const final_page_count = root_page;
+
+        const index_cells = try buildIndexLeafCellsForTable(scratch, reader, info, column_idx);
+        const layout = try packIndexLayout(index_cells, reader.usableSize(), scratch);
+        if (layout.leaves.len != 1) return error.UnsupportedIndex;
+
+        const schema_cell = try buildSchemaIndexCell(scratch, stmt.index_name, table_entry.name, root_page, stmt.sql, schema_rowid);
+        if (!leafHasRoomForCell(self.image.items, reader.db_header, 1, schema_cell.len, schema_header.cell_count)) {
+            return error.SchemaPageFull;
+        }
+
+        const new_image_len: usize = @as(usize, final_page_count) * page_size;
+        try self.image.resize(new_image_len);
+        @memset(self.image.items[old_image_len..], 0);
+        const mutable = self.image.items;
+
+        try rewriteLeafPage(mutable, reader.db_header, root_page, .index_leaf, layout.leaves[0]);
+        try insertCellIntoLeaf(mutable, reader.db_header, 1, schema_cell, schema_header.cell_count);
+        bumpHeaderForDdl(mutable, reader.db_header, final_page_count);
+        return true;
+    }
+
+    fn createTableInExistingDatabase(self: *Connection, scratch: Allocator, stmt: @import("ast.zig").CreateTableStatement) WriteError!bool {
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return error.WalModeUnsupported;
+
+        const db_schema = try schema.readSchema(reader, self.gpa);
+        defer db_schema.deinit(self.gpa);
+        if (schemaObjectNameExists(db_schema, stmt.table_name)) {
+            if (stmt.if_not_exists) return false;
+            return error.SchemaObjectAlreadyExists;
+        }
+
+        const schema_ref = try reader.page(1);
+        const schema_header = try btree.PageHeader.parse(schema_ref);
+        if (schema_header.page_type != .table_leaf) return error.UnsupportedSchemaBTree;
+
+        var max_schema_rowid: i64 = 0;
+        for (db_schema.entries) |entry| max_schema_rowid = @max(max_schema_rowid, entry.rowid);
+        const schema_rowid = max_schema_rowid + 1;
+
+        const page_size: usize = reader.db_header.page_size;
+        const reserved: usize = reader.db_header.reserved_space;
+        const old_image_len = self.image.items.len;
+        const file_pages = pageCountForLength(old_image_len, page_size);
+        const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
+        const root_page = effective_page_count + 1;
+        const final_page_count = root_page;
+
+        const schema_cell = try buildSchemaTableCell(scratch, stmt.table_name, root_page, stmt.sql, schema_rowid);
+        if (!leafHasRoomForCell(self.image.items, reader.db_header, 1, schema_cell.len, schema_header.cell_count)) {
+            return error.SchemaPageFull;
+        }
+
+        const new_image_len: usize = @as(usize, final_page_count) * page_size;
+        try self.image.resize(new_image_len);
+        @memset(self.image.items[old_image_len..], 0);
+        const mutable = self.image.items;
+
+        writeEmptyTableLeafPage(mutable, root_page, page_size, reserved);
+        try insertCellIntoLeaf(mutable, reader.db_header, 1, schema_cell, schema_header.cell_count);
+        bumpHeaderForDdl(mutable, reader.db_header, final_page_count);
+        return true;
+    }
     // ── schema cache helpers ──────────────────────────────────────────────
 
     /// Invalidate the cached schema + all per-table info.
     /// Call after any DDL that changes the schema (CREATE TABLE, DROP TABLE, ALTER TABLE).
     pub fn invalidateSchemaCache(self: *Connection) void {
         self.dupeSchemaDeinit();
+        self.cached_schema = null;
         var it = self.cached_table_infos.iterator();
         while (it.next()) |entry| {
             // Free column names individually (they were duped separately)
@@ -1059,7 +1219,6 @@ pub const Connection = struct {
             .integer_primary_key_index = src.integer_primary_key_index,
         };
     }
-
 };
 
 fn rightmostTableLeaf(reader: page.PageReader, start_page: u32) !u32 {
@@ -1260,6 +1419,170 @@ fn writeInteriorWithSingleDivider(
     writeU16(mutable[start + 12 .. start + 14], cell_rel); // pointer to cell 0
 }
 
+fn validateCreateTableStatement(stmt: @import("ast.zig").CreateTableStatement, allocator: Allocator) WriteError!void {
+    const fake_entry = schema.SchemaEntry{
+        .rowid = 1,
+        .object_type = "table",
+        .name = stmt.table_name,
+        .table_name = stmt.table_name,
+        .root_page = 2,
+        .sql = stmt.sql,
+    };
+    var info = try catalog.tableInfo(fake_entry, allocator);
+    defer info.deinit(allocator);
+    if (info.columns.len == 0) return error.InvalidCreateTableSql;
+}
+
+fn buildSchemaTableCell(
+    allocator: Allocator,
+    table_name: []const u8,
+    root_page: u32,
+    sql: []const u8,
+    rowid: i64,
+) WriteError![]u8 {
+    return buildSchemaObjectCell(allocator, "table", table_name, table_name, root_page, sql, rowid);
+}
+
+fn buildSchemaIndexCell(
+    allocator: Allocator,
+    index_name: []const u8,
+    table_name: []const u8,
+    root_page: u32,
+    sql: []const u8,
+    rowid: i64,
+) WriteError![]u8 {
+    return buildSchemaObjectCell(allocator, "index", index_name, table_name, root_page, sql, rowid);
+}
+
+fn buildSchemaObjectCell(
+    allocator: Allocator,
+    object_type: []const u8,
+    name: []const u8,
+    table_name: []const u8,
+    root_page: u32,
+    sql: []const u8,
+    rowid: i64,
+) WriteError![]u8 {
+    const values = [_]InsertValue{
+        .{ .text = object_type },
+        .{ .text = name },
+        .{ .text = table_name },
+        .{ .integer = root_page },
+        .{ .text = sql },
+    };
+    const payload = try encodeRecordValues(&values, allocator);
+
+    var cell: std.ArrayList(u8) = .empty;
+    errdefer cell.deinit(allocator);
+    try appendVarint(&cell, allocator, @intCast(payload.len));
+    try appendVarint(&cell, allocator, @intCast(rowid));
+    try cell.appendSlice(allocator, payload);
+    return cell.toOwnedSlice(allocator);
+}
+
+fn writeMinimalDatabaseHeader(mutable: []u8, page_count: u32) void {
+    std.debug.assert(mutable.len >= header.HEADER_SIZE);
+    @memset(mutable[0..header.HEADER_SIZE], 0);
+    @memcpy(mutable[0..16], header.MAGIC);
+    mutable[16] = 0x10;
+    mutable[17] = 0x00;
+    mutable[18] = 1; // rollback-journal write version
+    mutable[19] = 1; // rollback-journal read version
+    mutable[20] = 0; // reserved bytes per page
+    mutable[21] = 64;
+    mutable[22] = 32;
+    mutable[23] = 32;
+    writeU32(mutable[24..28], 1); // file change counter
+    writeU32(mutable[28..32], page_count);
+    writeU32(mutable[40..44], 1); // schema cookie
+    writeU32(mutable[44..48], 4); // schema format
+    writeU32(mutable[56..60], 1); // UTF-8
+    writeU32(mutable[92..96], 1); // version-valid-for
+    writeU32(mutable[96..100], 3050000); // SQLite 3.50.0 format writer
+}
+
+fn writeEmptyTableLeafPage(
+    mutable: []u8,
+    page_num: u32,
+    page_size: usize,
+    reserved: usize,
+) void {
+    const page_start: usize = (@as(usize, page_num) - 1) * page_size;
+    const hdr_off: usize = if (page_num == 1) header.HEADER_SIZE else 0;
+    const base = page_start + hdr_off;
+    const usable_end_rel: usize = page_size - reserved;
+    const stored_content_start: u16 = if (usable_end_rel == 65536)
+        0
+    else
+        @intCast(usable_end_rel);
+
+    mutable[base + 0] = @intFromEnum(btree.PageType.table_leaf);
+    writeU16(mutable[base + 1 .. base + 3], 0); // first freeblock
+    writeU16(mutable[base + 3 .. base + 5], 0); // cell_count
+    writeU16(mutable[base + 5 .. base + 7], stored_content_start);
+    mutable[base + 7] = 0; // fragmented free
+}
+
+fn leafHasRoomForCell(
+    bytes: []const u8,
+    db_header: header.Header,
+    root_page: u32,
+    cell_len: usize,
+    pointer_index: usize,
+) bool {
+    const page_size: usize = db_header.page_size;
+    const page_start = (@as(usize, root_page) - 1) * page_size;
+    const hdr_off: usize = if (root_page == 1) header.HEADER_SIZE else 0;
+    const base = page_start + hdr_off;
+    if (base + 8 > bytes.len) return false;
+    const usable_end = page_start + page_size - db_header.reserved_space;
+    if (usable_end > bytes.len or usable_end < base + 8) return false;
+    if (bytes[base] != @intFromEnum(btree.PageType.table_leaf) and bytes[base] != @intFromEnum(btree.PageType.index_leaf)) return false;
+
+    const cell_count = readU16(bytes[base + 3 .. base + 5]);
+    if (pointer_index > cell_count) return false;
+    const ptr_start = base + 8;
+    const ptr_end = ptr_start + (@as(usize, cell_count) + 1) * 2;
+    var content_start: usize = readU16(bytes[base + 5 .. base + 7]);
+    if (content_start == 0) content_start = page_size;
+    if (content_start < cell_len) return false;
+    const new_cell_off: usize = content_start - cell_len;
+    const absolute_cell_off = page_start + new_cell_off;
+    return absolute_cell_off + cell_len <= usable_end and ptr_end <= absolute_cell_off;
+}
+
+fn bumpHeaderForDdl(mutable: []u8, db_header: header.Header, final_page_count: u32) void {
+    const next_change = db_header.file_change_counter +% 1;
+    const next_schema_cookie = db_header.schema_cookie +% 1;
+    writeU32(mutable[24..28], next_change);
+    writeU32(mutable[28..32], final_page_count);
+    writeU32(mutable[40..44], next_schema_cookie);
+    if (mutable.len >= 96) writeU32(mutable[92..96], next_change);
+}
+
+fn pageCountForLength(len: usize, page_size: usize) u32 {
+    if (len == 0) return 0;
+    return @intCast((len + page_size - 1) / page_size);
+}
+
+fn schemaObjectNameExists(db_schema: schema.Schema, name: []const u8) bool {
+    for (db_schema.entries) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
+    }
+    return false;
+}
+
+fn findTableIgnoreCase(db_schema: schema.Schema, name: []const u8) ?schema.SchemaEntry {
+    for (db_schema.entries) |entry| {
+        if (entry.isTable() and std.ascii.eqlIgnoreCase(entry.name, name)) return entry;
+    }
+    return null;
+}
+
+fn isReservedSchemaName(name: []const u8) bool {
+    return name.len >= "sqlite_".len and std.ascii.eqlIgnoreCase(name[0.."sqlite_".len], "sqlite_");
+}
+
 fn readU32(bytes: []const u8) u32 {
     return std.mem.readInt(u32, bytes[0..4], .big);
 }
@@ -1292,6 +1615,18 @@ pub fn recoverAndCompact(gpa: Allocator, io: Io, db_path: []const u8) WriteError
     const before = wal.end_offset;
     wal.compact(io) catch return 0;
     return before;
+}
+
+pub fn createTableSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").CreateTableStatement) WriteError!bool {
+    var conn = try Connection.open(gpa, io, path);
+    defer conn.close();
+    return conn.createTable(stmt);
+}
+
+pub fn createIndexSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").CreateIndexStatement) WriteError!bool {
+    var conn = try Connection.open(gpa, io, path);
+    defer conn.close();
+    return conn.createIndex(stmt);
 }
 
 /// One-shot convenience wrapper: opens a `Connection`, runs a single
@@ -1625,6 +1960,63 @@ fn indexInsertPosition(entries: []const @import("index.zig").IndexEntry, key: In
     return pos;
 }
 
+fn buildIndexLeafCellsForTable(
+    allocator: Allocator,
+    reader: page.PageReader,
+    info: catalog.TableInfo,
+    column_idx: usize,
+) WriteError![][]u8 {
+    const scanned = try table.scanTable(reader, info.root_page, allocator);
+    defer scanned.deinit(allocator);
+
+    var pairs = try allocator.alloc(IndexPair, scanned.rows.len);
+    defer allocator.free(pairs);
+    for (scanned.rows, 0..) |row, i| {
+        pairs[i] = .{
+            .key = try indexValueFromTableRow(info, row, column_idx),
+            .rowid = row.rowid,
+        };
+    }
+    std.mem.sort(IndexPair, pairs, {}, IndexPair.lessThan);
+
+    var cells: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (cells.items) |cell| allocator.free(cell);
+        cells.deinit(allocator);
+    }
+    try cells.ensureTotalCapacity(allocator, pairs.len);
+
+    const usable = reader.usableSize();
+    for (pairs) |pair| {
+        const values = [_]InsertValue{ pair.key, .{ .integer = pair.rowid } };
+        const payload = try encodeRecordValues(&values, allocator);
+        defer allocator.free(payload);
+        const info_pl = btree.indexPayloadInfo(payload.len, usable);
+        if (info_pl.overflow_page != null) return error.PayloadOverflowUnsupported;
+
+        var cell: std.ArrayList(u8) = .empty;
+        errdefer cell.deinit(allocator);
+        try appendVarint(&cell, allocator, @intCast(payload.len));
+        try cell.appendSlice(allocator, payload);
+        try cells.append(allocator, try cell.toOwnedSlice(allocator));
+    }
+
+    return cells.toOwnedSlice(allocator);
+}
+
+fn indexValueFromTableRow(info: catalog.TableInfo, row: table.Row, column_idx: usize) WriteError!InsertValue {
+    if (info.integer_primary_key_index) |ipk| {
+        if (column_idx == ipk) return .{ .integer = row.rowid };
+    }
+    const src: record.Value = if (column_idx < row.values.len) row.values[column_idx] else .null;
+    return switch (src) {
+        .null => .null,
+        .integer => |v| .{ .integer = v },
+        .text => |text| .{ .text = text },
+        .real, .blob => return error.UnsupportedColumnValue,
+    };
+}
+
 fn compareIndexKey(key: InsertValue, rowid: i64, entry: @import("index.zig").IndexEntry) i8 {
     const entry_key: record.Value = if (entry.values.len > 0) entry.values[0] else .null;
     const c = compareInsertValueToRecord(key, entry_key);
@@ -1728,17 +2120,19 @@ fn insertCellIntoLeaf(bytes: []u8, db_header: header.Header, root_page: u32, cel
     if (pointer_index > cell_count) return error.InvalidCellIndex;
     const ptr_start = base + 8;
     const ptr_end = ptr_start + (@as(usize, cell_count) + 1) * 2;
-    var content_start = readU16(bytes[base + 5 .. base + 7]);
-    if (content_start == 0) content_start = @intCast(page_size);
+    var content_start: usize = readU16(bytes[base + 5 .. base + 7]);
+    if (content_start == 0) content_start = page_size;
     if (content_start < cell.len) return error.PageFull;
-    const new_cell_off: u16 = @intCast(content_start - cell.len);
-    const absolute_cell_off = page_start + new_cell_off;
+    const new_cell_off_usize = content_start - cell.len;
+    const new_cell_off: u16 = if (new_cell_off_usize == 65536) 0 else @intCast(new_cell_off_usize);
+    const absolute_cell_off = page_start + new_cell_off_usize;
     if (absolute_cell_off + cell.len > usable_end) return error.PageOutOfBounds;
-    if (ptr_end > page_start + new_cell_off) return error.PageFull;
+    if (ptr_end > page_start + new_cell_off_usize) return error.PageFull;
 
     @memcpy(bytes[absolute_cell_off..][0..cell.len], cell);
     if (pointer_index < cell_count) {
-        std.mem.copyBackwards(u8,
+        std.mem.copyBackwards(
+            u8,
             bytes[ptr_start + (pointer_index + 1) * 2 .. ptr_start + (@as(usize, cell_count) + 1) * 2],
             bytes[ptr_start + pointer_index * 2 .. ptr_start + @as(usize, cell_count) * 2],
         );
@@ -2622,6 +3016,93 @@ fn buildSqliteFixture(db_path: []const u8, schema_sql: []const u8) !void {
 
 fn tmpDbPath(allocator: Allocator, tmp: testing.TmpDir, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "createTableSimple creates a readable db and accepts inserts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmpDbPath(testing.allocator, tmp, "created.db");
+    defer testing.allocator.free(db_path);
+
+    const created = try createTableSimple(testing.allocator, testing.io, db_path, .{
+        .table_name = "users",
+        .sql = "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    });
+    try testing.expect(created);
+
+    const duplicate_ok = try createTableSimple(testing.allocator, testing.io, db_path, .{
+        .table_name = "users",
+        .sql = "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+        .if_not_exists = true,
+    });
+    try testing.expect(!duplicate_ok);
+
+    const created_notes = try createTableSimple(testing.allocator, testing.io, db_path, .{
+        .table_name = "notes",
+        .sql = "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)",
+    });
+    try testing.expect(created_notes);
+
+    const vals = [_]InsertValue{ .null, .{ .text = "alice" }, .{ .integer = 30 } };
+    const rowid = try insertSimple(testing.allocator, testing.io, db_path, "users", &vals);
+    try testing.expectEqual(@as(i64, 1), rowid);
+
+    const index_created = try createIndexSimple(testing.allocator, testing.io, db_path, .{
+        .index_name = "idx_users_name",
+        .table_name = "users",
+        .column_name = "name",
+        .sql = "CREATE INDEX idx_users_name ON users(name)",
+    });
+    try testing.expect(index_created);
+
+    const bob_vals = [_]InsertValue{ .null, .{ .text = "bob" }, .{ .integer = 40 } };
+    const bob_rowid = try insertSimple(testing.allocator, testing.io, db_path, "users", &bob_vals);
+    try testing.expectEqual(@as(i64, 2), bob_rowid);
+
+    const note_vals = [_]InsertValue{ .null, .{ .text = "hello" } };
+    const note_rowid = try insertSimple(testing.allocator, testing.io, db_path, "notes", &note_vals);
+    try testing.expectEqual(@as(i64, 1), note_rowid);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, db_path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    const reader = try page.PageReader.init(bytes);
+    try testing.expectEqual(@as(u32, 4), reader.db_header.database_page_count);
+    try testing.expect(!reader.db_header.isWal());
+
+    const db_schema = try schema.readSchema(reader, testing.allocator);
+    defer db_schema.deinit(testing.allocator);
+    const entry = db_schema.findTable("users") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 2), entry.root_page);
+    const notes_entry = db_schema.findTable("notes") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 3), notes_entry.root_page);
+    const index_entry = db_schema.findIndex("idx_users_name") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 4), index_entry.root_page);
+
+    var info = try catalog.tableInfo(entry, testing.allocator);
+    defer info.deinit(testing.allocator);
+    const scanned = try table.scanTable(reader, info.root_page, testing.allocator);
+    defer scanned.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), scanned.rows.len);
+    try testing.expectEqualStrings("alice", scanned.rows[0].values[1].text);
+    try testing.expectEqual(@as(i64, 30), scanned.rows[0].values[2].integer);
+    try testing.expectEqualStrings("bob", scanned.rows[1].values[1].text);
+    try testing.expectEqual(@as(i64, 40), scanned.rows[1].values[2].integer);
+
+    const idx = try @import("index.zig").scanIndex(reader, @intCast(index_entry.root_page), testing.allocator);
+    defer idx.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), idx.entries.len);
+    try testing.expectEqualStrings("alice", idx.entries[0].values[0].text);
+    try testing.expectEqual(@as(?i64, 1), idx.entries[0].rowid());
+    try testing.expectEqualStrings("bob", idx.entries[1].values[0].text);
+    try testing.expectEqual(@as(?i64, 2), idx.entries[1].rowid());
+
+    var notes_info = try catalog.tableInfo(notes_entry, testing.allocator);
+    defer notes_info.deinit(testing.allocator);
+    const notes_scanned = try table.scanTable(reader, notes_info.root_page, testing.allocator);
+    defer notes_scanned.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), notes_scanned.rows.len);
+    try testing.expectEqualStrings("hello", notes_scanned.rows[0].values[1].text);
 }
 
 test "insertSimple round-trips through WAL into the data file" {

@@ -46,6 +46,8 @@ pub const recoverAndCompact = write.recoverAndCompact;
 
 pub const BTreeError = btree.BTreeError;
 pub const InsertStatement = ast.InsertStatement;
+pub const CreateTableStatement = ast.CreateTableStatement;
+pub const CreateIndexStatement = ast.CreateIndexStatement;
 pub const BTreePageHeader = btree.PageHeader;
 pub const BTreePageType = btree.PageType;
 pub const Column = catalog.Column;
@@ -95,6 +97,8 @@ pub const parseInsert = parser.parseInsert;
 pub const parseStatement = parser.parseStatement;
 pub const executeSelect = sql.executeSelect;
 pub const insertSimple = write.insertSimple;
+pub const createTableSimple = write.createTableSimple;
+pub const createIndexSimple = write.createIndexSimple;
 pub const parityFeatures = parity.features;
 pub const parityStatusLabel = parity.statusLabel;
 pub const parityCompletionScore = parity.completionScore;

@@ -197,6 +197,21 @@ pub const InsertStatement = struct {
     }
 };
 
+pub const CreateTableStatement = struct {
+    table_name: []const u8,
+    sql: []const u8,
+    if_not_exists: bool = false,
+};
+
+pub const CreateIndexStatement = struct {
+    index_name: []const u8,
+    table_name: []const u8,
+    column_name: []const u8,
+    sql: []const u8,
+    if_not_exists: bool = false,
+    unique: bool = false,
+};
+
 pub const Assignment = struct {
     column_name: []const u8,
     value: Literal,

@@ -327,6 +327,8 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  sqlnano select <database.db> "SELECT * FROM t"  Run tiny read-only SELECT SQL
         \\  sqlnano fts-match <database.db> <fts5_table> <term> [limit] [weights]  Run a narrow FTS5 MATCH/BM25 search
         \\  sqlnano fts-search <database.db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]  Search and hydrate rows as JSON
+        \\  sqlnano exec <database.db> "CREATE TABLE t(...)"  Create a simple rowid table
+        \\  sqlnano exec <database.db> "CREATE INDEX idx ON t(col)"  Create a simple single-column index
         \\  sqlnano exec <database.db> "INSERT INTO t VALUES (...)"  Append a simple row
         \\  sqlnano bench-read <database.db> "SELECT * FROM t WHERE rowid = 1" <N>  Benchmark hot read path
         \\  sqlnano bench-write <database.db> <table> <N>  Benchmark durable inserts via a long-lived Connection
@@ -894,14 +896,30 @@ fn printFtsResult(writer: *std.Io.Writer, result: sqlnano.sqlite.fts5_mod.Search
 
 fn execSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, sql: []const u8) !void {
     const stmt = try sqlnano.sqlite.parseStatement(sql, init.gpa);
+    defer stmt.deinit(init.gpa);
     switch (stmt) {
         .insert => |ins| {
-            defer ins.deinit(init.gpa);
             var values = try init.gpa.alloc(sqlnano.sqlite.InsertValue, ins.values.len);
             defer init.gpa.free(values);
             for (ins.values, 0..) |value, i| values[i] = value.toInsertValue();
             const rowid = try sqlnano.sqlite.insertSimple(init.gpa, init.io, path, ins.table_name, values);
             try writer.print("inserted rowid: {d}\n", .{rowid});
+        },
+        .create_table => |create| {
+            const created = try sqlnano.sqlite.write_mod.createTableSimple(init.gpa, init.io, path, create);
+            if (created) {
+                try writer.print("created table: {s}\n", .{create.table_name});
+            } else {
+                try writer.print("table already exists: {s}\n", .{create.table_name});
+            }
+        },
+        .create_index => |create| {
+            const created = try sqlnano.sqlite.write_mod.createIndexSimple(init.gpa, init.io, path, create);
+            if (created) {
+                try writer.print("created index: {s}\n", .{create.index_name});
+            } else {
+                try writer.print("index already exists: {s}\n", .{create.index_name});
+            }
         },
         .update => |upd| {
             const changed = try sqlnano.sqlite.write_mod.updateSimple(init.gpa, init.io, path, upd);
