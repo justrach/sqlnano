@@ -1775,17 +1775,12 @@ pub fn indexedRowidsForColumn(
 ) SqlError!?[]i64 {
     if (asciiEql(column_name, "rowid")) return null;
     const index_entry = findIndexForColumn(db_schema, info.name, column_name) orelse return null;
-    const scanned = try index_mod.scanIndex(reader, @intCast(index_entry.root_page), allocator);
-    defer scanned.deinit(allocator);
-
-    var rowids: std.ArrayList(i64) = .empty;
-    errdefer rowids.deinit(allocator);
-    for (scanned.entries) |entry| {
-        if (entry.values.len < 2) continue;
-        if (!literalMatches(entry.values[0], value)) continue;
-        if (entry.rowid()) |rowid| try rowids.append(allocator, rowid);
-    }
-    return try rowids.toOwnedSlice(allocator);
+    const lookup: index_mod.LookupValue = switch (value) {
+        .null => .null,
+        .integer => |v| .{ .integer = v },
+        .text => |v| .{ .text = v },
+    };
+    return try index_mod.rowidsForFirstColumnEquals(reader, @intCast(index_entry.root_page), lookup, allocator);
 }
 
 fn findIndexForColumn(db_schema: schema.Schema, table_name: []const u8, column_name: []const u8) ?schema.SchemaEntry {

@@ -256,7 +256,7 @@ zig build test
 zig build test -Doptimize=ReleaseFast
 ```
 
-76 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
+77 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
 table/index creation, table rename/add-column/drop, table multi-leaf split verified by
 `PRAGMA integrity_check`, end-to-end INSERT/UPDATE/DELETE through `Connection`.
 
@@ -270,7 +270,7 @@ client for the same ecosystem — not a fork.
 
 ### What works
 
-- **Read SQLite `.db` files** — header/page validation, `sqlite_schema`, table b-tree scans (rowid + interior), single-column non-unique indexes, payload overflow
+- **Read SQLite `.db` files** — header/page validation, `sqlite_schema`, table b-tree scans (rowid + interior), b-tree-pruned equality lookup on single-column non-unique indexes, payload overflow
 - **Create simple rowid tables** — `CREATE TABLE t(...)` and `CREATE TABLE IF NOT EXISTS t(...)` on empty or small rollback-journal DBs whose `sqlite_schema` root is still a leaf page
 - **Create simple indexes** — non-unique, single-column `CREATE INDEX idx ON t(col)` when the resulting index fits in one leaf page; later INSERT/UPDATE/DELETE rebuilds keep that index in sync
 - **Alter/drop simple tables** — `ALTER TABLE old RENAME TO new` rewrites `sqlite_schema` for the table and its simple indexes; `ALTER TABLE t ADD [COLUMN] c TYPE` adds nullable tail columns by updating `sqlite_schema`; `DROP TABLE t` works when all dropped table/index pages are a tail suffix that can be safely truncated without freelist support

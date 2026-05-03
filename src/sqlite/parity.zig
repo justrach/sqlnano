@@ -39,8 +39,8 @@ pub const features = [_]Feature{
     .{
         .area = "Index b-tree reads",
         .status = .partial,
-        .evidence = "Scans simple indexes and uses single-column equality indexes for SELECT.",
-        .next = "Implement binary seek/range traversal instead of scan-then-filter.",
+        .evidence = "Scans simple indexes and uses b-tree-pruned single-column equality indexes for SELECT and FTS pre-filters.",
+        .next = "Implement range traversal, ORDER BY pushdown, and broader composite-index planning.",
     },
     .{
         .area = "SQLite-compatible writes",
@@ -57,7 +57,7 @@ pub const features = [_]Feature{
     .{
         .area = "Full query planner",
         .status = .partial,
-        .evidence = "Single-table WHERE with `rowid = N` or `indexed_col = lit` takes the direct-lookup / index-rowid fast path; everything else falls through to the general nested-loop scan (which handles JOIN + WHERE + ORDER BY + LIMIT + COUNT(*)). Joins are cross-product with incremental ON-predicate filtering; column resolution walks every source and rejects ambiguous unqualified refs.",
+        .evidence = "Single-table WHERE with `rowid = N` or `indexed_col = lit` takes the direct-lookup / b-tree-pruned index-rowid fast path; everything else falls through to the general nested-loop scan (which handles JOIN + WHERE + ORDER BY + LIMIT + COUNT(*)). Joins are cross-product with incremental ON-predicate filtering; column resolution walks every source and rejects ambiguous unqualified refs.",
         .next = "Cost-based join ordering (current order is FROM-then-JOINs in source order), hash joins for large cross-products, index-driven sort pushdown for ORDER BY.",
     },
     .{
