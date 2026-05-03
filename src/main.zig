@@ -457,7 +457,7 @@ fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     const reader = try sqlnano.sqlite.PageReader.init(bytes);
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
     defer schema.deinit(init.gpa);
-    if (try selectSqlFts5(init, writer, reader, schema, query)) return;
+    if (try selectSqlFts5(init, writer, path, reader, schema, query)) return;
     const result = try sqlnano.sqlite.executeSelect(reader, schema, query, init.gpa);
     defer result.deinit(init.gpa);
 
@@ -496,10 +496,16 @@ fn ftsMatch(
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
     defer schema.deinit(init.gpa);
 
-    const result = try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{
+    const result = sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{
         .limit = limit,
         .weights = weights,
-    }, init.gpa);
+    }, init.gpa) catch |err| switch (err) {
+        error.UnsupportedFts5Query => {
+            try ftsMatchSqliteFallback(init, writer, path, table_name, query, limit, weights);
+            return;
+        },
+        else => return err,
+    };
     defer result.deinit(init.gpa);
     try printFtsResult(writer, result);
 }
@@ -565,8 +571,8 @@ fn ftsSearch(
     defer freeRowidFilterSets(init.gpa, rowid_sets);
     const residual_filter_count = countResidualFilters(filters);
 
-    const result = if (filters.len == 0)
-        try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{
+    const result = (if (filters.len == 0)
+        sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{
             .limit = limit,
             .weights = weights,
         }, init.gpa)
@@ -579,10 +585,16 @@ fn ftsSearch(
             .residual_filter_count = residual_filter_count,
             .allocator = init.gpa,
         };
-        break :blk try sqlnano.sqlite.fts5_mod.searchFiltered(reader, schema, table_name, query, .{
+        break :blk sqlnano.sqlite.fts5_mod.searchFiltered(reader, schema, table_name, query, .{
             .limit = limit,
             .weights = weights,
         }, init.gpa, &ctx, HydrateFilterContext.accept);
+    }) catch |err| switch (err) {
+        error.UnsupportedFts5Query => {
+            try ftsSearchSqliteFallback(init, writer, path, table_name, content_table_name, query, limit, info, selected_columns, weights, filters);
+            return;
+        },
+        else => return err,
     };
     defer result.deinit(init.gpa);
 
@@ -640,9 +652,168 @@ fn writeHydratedFtsJson(
     try writer.print("],\"count\":{d}}}\n", .{emitted});
 }
 
+fn ftsSearchSqliteFallback(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    table_name: []const u8,
+    content_table_name: []const u8,
+    query: []const u8,
+    limit: usize,
+    info: sqlnano.sqlite.TableInfo,
+    selected_columns: []const usize,
+    weights: []const f64,
+    filters: []const HydrateFilter,
+) !void {
+    const sql = try buildSqliteFtsSearchSql(init.gpa, table_name, content_table_name, query, limit, info, selected_columns, weights, filters);
+    defer init.gpa.free(sql);
+
+    const result = std.process.run(init.gpa, init.io, .{
+        .argv = &.{ "sqlite3", "-noheader", path, sql },
+    }) catch |err| {
+        try writeJsonError(writer, "sqlite3_fallback_unavailable", @errorName(err));
+        return;
+    };
+    defer init.gpa.free(result.stdout);
+    defer init.gpa.free(result.stderr);
+
+    if (result.term != .exited or result.term.exited != 0) {
+        try writeJsonError(writer, "sqlite3_fallback_failed", result.stderr);
+        return;
+    }
+    try writer.writeAll(result.stdout);
+    if (result.stdout.len == 0 or result.stdout[result.stdout.len - 1] != '\n') try writer.writeAll("\n");
+}
+
+fn ftsMatchSqliteFallback(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    table_name: []const u8,
+    query: []const u8,
+    limit: usize,
+    weights: []const f64,
+) !void {
+    const sql = try buildSqliteFtsMatchSql(init.gpa, table_name, query, limit, weights);
+    defer init.gpa.free(sql);
+
+    const result = std.process.run(init.gpa, init.io, .{
+        .argv = &.{ "sqlite3", "-noheader", "-separator", "|", path, sql },
+    }) catch |err| {
+        try writer.print("error: sqlite3 fallback unavailable ({s})\n", .{@errorName(err)});
+        return;
+    };
+    defer init.gpa.free(result.stdout);
+    defer init.gpa.free(result.stderr);
+
+    if (result.term != .exited or result.term.exited != 0) {
+        try writer.print("error: sqlite3 fallback failed: {s}\n", .{result.stderr});
+        return;
+    }
+
+    try writer.print("table: {s}\n", .{table_name});
+    try writer.print("query: {s}\n", .{query});
+    try writer.print("engine: sqlite3\n", .{});
+    try writer.print("rows: {d}\n", .{countNonEmptyLines(result.stdout)});
+    try writer.writeAll(result.stdout);
+    if (result.stdout.len != 0 and result.stdout[result.stdout.len - 1] != '\n') try writer.writeAll("\n");
+}
+
+fn buildSqliteFtsSearchSql(
+    allocator: std.mem.Allocator,
+    fts_table: []const u8,
+    content_table: []const u8,
+    query: []const u8,
+    limit: usize,
+    info: sqlnano.sqlite.TableInfo,
+    selected_columns: []const usize,
+    weights: []const f64,
+    filters: []const HydrateFilter,
+) ![]u8 {
+    var sql: std.ArrayList(u8) = .empty;
+    errdefer sql.deinit(allocator);
+
+    try sql.appendSlice(allocator, "WITH ranked AS (SELECT ");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, ".rowid AS rowid, ");
+    try appendBm25Expr(allocator, &sql, fts_table, weights);
+    try sql.appendSlice(allocator, " AS rank_score, snippet(");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, ", -1, '[', ']', '...', 32) AS snippet");
+    for (selected_columns) |column_index| {
+        try sql.appendSlice(allocator, ", c.");
+        try appendQuotedIdent(allocator, &sql, info.columns[column_index].name);
+        try sql.appendSlice(allocator, " AS ");
+        try appendQuotedIdent(allocator, &sql, info.columns[column_index].name);
+    }
+    try sql.appendSlice(allocator, " FROM ");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, " JOIN ");
+    try appendQuotedIdent(allocator, &sql, content_table);
+    try sql.appendSlice(allocator, " AS c ON c.rowid = ");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, ".rowid WHERE ");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, " MATCH ");
+    try appendSqlString(allocator, &sql, query);
+    for (filters) |filter| {
+        try sql.appendSlice(allocator, " AND c.");
+        try appendQuotedIdent(allocator, &sql, info.columns[filter.column_index].name);
+        try appendSqlFilterOp(allocator, &sql, info, filter);
+    }
+    try sql.appendSlice(allocator, " ORDER BY rank_score LIMIT ");
+    const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+    defer allocator.free(limit_text);
+    try sql.appendSlice(allocator, limit_text);
+
+    try sql.appendSlice(allocator, ") SELECT json_object('status','ok','engine','sqlite3','table',");
+    try appendSqlString(allocator, &sql, content_table);
+    try sql.appendSlice(allocator, ",'fts_table',");
+    try appendSqlString(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, ",'query',");
+    try appendSqlString(allocator, &sql, query);
+    try sql.appendSlice(allocator, ",'results',coalesce(json_group_array(json_object('rowid',rowid,'rank_score',rank_score,'snippet',snippet,'columns',json_object(");
+    for (selected_columns, 0..) |column_index, i| {
+        if (i != 0) try sql.appendSlice(allocator, ",");
+        try appendSqlString(allocator, &sql, info.columns[column_index].name);
+        try sql.appendSlice(allocator, ",");
+        try appendQuotedIdent(allocator, &sql, info.columns[column_index].name);
+    }
+    try sql.appendSlice(allocator, "))),json('[]')),'count',count(*)) FROM ranked;");
+    return try sql.toOwnedSlice(allocator);
+}
+
+fn buildSqliteFtsMatchSql(
+    allocator: std.mem.Allocator,
+    fts_table: []const u8,
+    query: []const u8,
+    limit: usize,
+    weights: []const f64,
+) ![]u8 {
+    var sql: std.ArrayList(u8) = .empty;
+    errdefer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "SELECT rowid || '|' || printf('%.15f', rank_score) || '|hits=0|doc_len=0' FROM (SELECT ");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, ".rowid AS rowid, ");
+    try appendBm25Expr(allocator, &sql, fts_table, weights);
+    try sql.appendSlice(allocator, " AS rank_score FROM ");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, " WHERE ");
+    try appendQuotedIdent(allocator, &sql, fts_table);
+    try sql.appendSlice(allocator, " MATCH ");
+    try appendSqlString(allocator, &sql, query);
+    try sql.appendSlice(allocator, " ORDER BY rank_score LIMIT ");
+    const limit_text = try std.fmt.allocPrint(allocator, "{d}", .{limit});
+    defer allocator.free(limit_text);
+    try sql.appendSlice(allocator, limit_text);
+    try sql.appendSlice(allocator, ");");
+    return try sql.toOwnedSlice(allocator);
+}
+
 fn selectSqlFts5(
     init: std.process.Init,
     writer: *std.Io.Writer,
+    path: []const u8,
     reader: sqlnano.sqlite.PageReader,
     schema: sqlnano.sqlite.Schema,
     query: []const u8,
@@ -656,7 +827,13 @@ fn selectSqlFts5(
     const match_query = extractMatchQuery(query[match_pos + "MATCH".len ..]) orelse return false;
     const limit = parseOptionalLimit(query) orelse 10;
 
-    const result = try sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, match_query, .{ .limit = limit }, init.gpa);
+    const result = sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, match_query, .{ .limit = limit }, init.gpa) catch |err| switch (err) {
+        error.UnsupportedFts5Query => {
+            try ftsMatchSqliteFallback(init, writer, path, table_name, match_query, limit, &.{});
+            return true;
+        },
+        else => return err,
+    };
     defer result.deinit(init.gpa);
     try printFtsResult(writer, result);
     return true;
@@ -1295,6 +1472,117 @@ fn writeJsonEscaped(writer: *std.Io.Writer, text: []const u8) !void {
     }
 }
 
+fn writeJsonError(writer: *std.Io.Writer, code: []const u8, message: []const u8) !void {
+    try writer.writeAll("{\"status\":\"error\",\"error\":");
+    try writeJsonString(writer, code);
+    try writer.writeAll(",\"message\":");
+    try writeJsonString(writer, std.mem.trim(u8, message, " \t\r\n"));
+    try writer.writeAll(",\"results\":[],\"count\":0}\n");
+}
+
+fn appendBm25Expr(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), fts_table: []const u8, weights: []const f64) !void {
+    try sql.appendSlice(allocator, "bm25(");
+    try appendQuotedIdent(allocator, sql, fts_table);
+    for (weights) |weight| {
+        const text = try std.fmt.allocPrint(allocator, ",{d}", .{weight});
+        defer allocator.free(text);
+        try sql.appendSlice(allocator, text);
+    }
+    try sql.appendSlice(allocator, ")");
+}
+
+fn appendSqlFilterOp(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), info: sqlnano.sqlite.TableInfo, filter: HydrateFilter) !void {
+    switch (filter.op) {
+        .eq => {
+            try sql.appendSlice(allocator, " = ");
+            try appendSqlTypedLiteral(allocator, sql, info, filter);
+        },
+        .gte => {
+            try sql.appendSlice(allocator, " >= ");
+            try appendSqlTypedLiteral(allocator, sql, info, filter);
+        },
+        .lte => {
+            try sql.appendSlice(allocator, " <= ");
+            try appendSqlTypedLiteral(allocator, sql, info, filter);
+        },
+        .contains => {
+            try sql.appendSlice(allocator, " LIKE ");
+            try appendSqlLikeContains(allocator, sql, filter.value);
+            try sql.appendSlice(allocator, " ESCAPE '\\'");
+        },
+    }
+}
+
+fn appendSqlTypedLiteral(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), info: sqlnano.sqlite.TableInfo, filter: HydrateFilter) !void {
+    if (std.ascii.eqlIgnoreCase(filter.value, "null")) {
+        try sql.appendSlice(allocator, "NULL");
+        return;
+    }
+    switch (info.columns[filter.column_index].affinity) {
+        .integer => {
+            _ = std.fmt.parseInt(i64, filter.value, 10) catch {
+                try appendSqlString(allocator, sql, filter.value);
+                return;
+            };
+            try sql.appendSlice(allocator, filter.value);
+        },
+        .real, .numeric => {
+            _ = std.fmt.parseFloat(f64, filter.value) catch {
+                try appendSqlString(allocator, sql, filter.value);
+                return;
+            };
+            try sql.appendSlice(allocator, filter.value);
+        },
+        else => try appendSqlString(allocator, sql, filter.value),
+    }
+}
+
+fn appendQuotedIdent(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), ident: []const u8) !void {
+    try sql.append(allocator, '"');
+    for (ident) |byte| {
+        if (byte == '"') try sql.append(allocator, '"');
+        try sql.append(allocator, byte);
+    }
+    try sql.append(allocator, '"');
+}
+
+fn appendSqlString(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), text: []const u8) !void {
+    try sql.append(allocator, '\'');
+    for (text) |byte| {
+        if (byte == '\'') try sql.append(allocator, '\'');
+        try sql.append(allocator, byte);
+    }
+    try sql.append(allocator, '\'');
+}
+
+fn appendSqlLikeContains(allocator: std.mem.Allocator, sql: *std.ArrayList(u8), text: []const u8) !void {
+    try sql.append(allocator, '\'');
+    try sql.append(allocator, '%');
+    for (text) |byte| {
+        switch (byte) {
+            '\'', '%', '_', '\\' => {
+                if (byte != '\'') try sql.append(allocator, '\\');
+                if (byte == '\'') try sql.append(allocator, '\'');
+                try sql.append(allocator, byte);
+            },
+            else => try sql.append(allocator, byte),
+        }
+    }
+    try sql.append(allocator, '%');
+    try sql.append(allocator, '\'');
+}
+
+fn countNonEmptyLines(text: []const u8) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < text.len) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        if (std.mem.trim(u8, text[start..end], " \t\r\n").len != 0) count += 1;
+        start = end + 1;
+    }
+    return count;
+}
+
 test "parse fts weight list" {
     const weights = try parseWeights(std.testing.allocator, "5, 3, 1");
     defer std.testing.allocator.free(weights);
@@ -1320,6 +1608,22 @@ test "hydrate filters compare text and numeric values" {
         .op = .lte,
         .value = "2024",
     }));
+}
+
+test "SQL fallback helpers escape identifiers and strings" {
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(std.testing.allocator);
+
+    try appendQuotedIdent(std.testing.allocator, &sql, "weird\"name");
+    try std.testing.expectEqualStrings("\"weird\"\"name\"", sql.items);
+    sql.clearRetainingCapacity();
+
+    try appendSqlString(std.testing.allocator, &sql, "can't");
+    try std.testing.expectEqualStrings("'can''t'", sql.items);
+    sql.clearRetainingCapacity();
+
+    try appendSqlLikeContains(std.testing.allocator, &sql, "50%_\\");
+    try std.testing.expectEqualStrings("'%50\\%\\_\\\\%'", sql.items);
 }
 
 fn indexOfKeyword(text: []const u8, keyword: []const u8) ?usize {

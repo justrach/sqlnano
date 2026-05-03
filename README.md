@@ -28,7 +28,7 @@ SQLite is legendary and powers an enormous amount of software. sqlnano makes dif
 | **Durability knob**      | `PRAGMA synchronous=FULL/NORMAL/OFF`      | Same three modes, same semantics, per-`Connection` |
 | **File format**          | Native SQLite `.db`                       | Native SQLite `.db` (writes a compatible image)   |
 | **Binary size**          | 1.5 MB shared library                     | ~900 KB static Zig binary                         |
-| **Runtime deps**         | libc, optional ICU/readline               | libc only                                         |
+| **Runtime deps**         | libc, optional ICU/readline               | libc only; rich FTS CLI fallback optionally uses `sqlite3` |
 | **SQL surface**          | Full SQL with extensions                  | Tiny subset (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) |
 | **Multi-leaf indexes**   | ✅                                         | ❌ (helpers exist; dispatch is broken, see parity) |
 | **Transactions**         | ✅ `BEGIN`/`COMMIT`/`ROLLBACK`              | ❌ autocommit only                                 |
@@ -132,10 +132,11 @@ sqlnano bench-read /tmp/t.db "SELECT * FROM t" 1000
 
 ### FTS5 search
 
-sqlnano can read SQLite FTS5 shadow tables directly for narrow BM25 searches.
-The current parser accepts a single bare token, applies SQLite-style BM25
-scores, supports column weights, and can hydrate ranked rowids from a normal
-content table without going back through SQLite.
+sqlnano can read SQLite FTS5 shadow tables directly for fast single-token BM25
+searches. For richer MATCH syntax, the CLI automatically falls back to SQLite's
+own FTS5 implementation when `sqlite3` is on `PATH`, so phrase, boolean, prefix,
+NEAR, column-scoped queries, and snippets work out of the box while the native
+engine keeps the fast path.
 
 ```bash
 # Ranked rowids only. Weights are comma-separated bm25(ft, w0, w1, ...)
@@ -145,6 +146,12 @@ sqlnano fts-match data.db judgments_fts contract 10 5,3,1
 #   <db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]
 sqlnano fts-search data.db judgments_fts judgments contract \
   10 citation,title,court,year 5,3,1 court=SGHC
+
+# Rich MATCH syntax falls back to SQLite FTS5 and includes snippets.
+sqlnano fts-search data.db judgments_fts judgments '"contract law"' \
+  10 citation,title,court,year 5,3,1
+sqlnano fts-search data.db judgments_fts judgments 'NEAR(contract damages, 10)' \
+  10 citation,title,court,year 5,3,1
 ```
 
 `fts-search` filters are schema-agnostic and run before the top-k is selected:
@@ -251,7 +258,7 @@ client for the same ecosystem — not a fork.
 - **Native WAL** — group commit, crash recovery, fuzz-tested torn-WAL handling
 - **Configurable durability** — `synchronous=full/normal/off`
 - **Tiny SQL surface** — `SELECT ... WHERE col = literal`, `INSERT INTO t VALUES (...)`, `UPDATE`/`DELETE` with single-equality `WHERE`
-- **Narrow FTS5 reads** — direct shadow-table BM25 for single-token MATCH queries, optional column weights, JSON hydration by content rowid, and simple pre-ranking filters
+- **FTS5 reads** — native shadow-table BM25 for single-token MATCH queries, optional column weights, JSON hydration by content rowid, simple pre-ranking filters, and a SQLite-backed compatibility fallback for rich MATCH syntax/snippets
 
 ### What doesn't work (yet)
 
@@ -260,7 +267,7 @@ client for the same ecosystem — not a fork.
 - **Triggers, foreign keys, views, virtual tables, CTEs** — none of these
 - **Type affinity coercion** — we implement the common cases, not the full SQLite matrix
 - **Collations** — BINARY only
-- **Full FTS5 query syntax** — phrase, boolean, NEAR, prefix, tokenizer parity, snippets/highlights, and virtual-table callback APIs are not implemented yet
+- **Native full FTS5 query syntax** — phrase, boolean, NEAR, prefix, tokenizer parity, snippets/highlights, and virtual-table callback APIs use the SQLite CLI compatibility path for now
 - **Full SQL grammar** — the parser handles what `exec` / `bench-read` need; everything else errors out
 - **Writes to WAL-mode SQLite files** — sqlnano refuses to write a file whose header has `write_version=WAL` because we don't speak the SQLite WAL frame format
 
