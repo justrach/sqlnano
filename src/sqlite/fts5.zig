@@ -209,12 +209,13 @@ pub fn search(
     const averages = try loadAverages(reader, @intCast(data_entry.root_page), allocator);
     const segments = try loadSegments(reader, @intCast(data_entry.root_page), allocator);
     defer allocator.free(segments);
+    const max_rowid = try maxTableRowid(reader, @intCast(docsize_entry.root_page));
 
     const candidate_pages = try candidatePages(reader, @intCast(idx_entry.root_page), segments, term, allocator);
     defer allocator.free(candidate_pages);
 
-    if (averages.total_rows > std.math.maxInt(usize) - 1) return error.Fts5TableTooLarge;
-    const postings = try allocator.alloc(Posting, @as(usize, @intCast(averages.total_rows)) + 1);
+    if (max_rowid > std.math.maxInt(usize) - 1) return error.Fts5TableTooLarge;
+    const postings = try allocator.alloc(Posting, @as(usize, @intCast(max_rowid)) + 1);
     defer allocator.free(postings);
     @memset(postings, .{ .present = false, .column_hits = [_]u32{0} ** MAX_COLUMNS });
 
@@ -222,7 +223,36 @@ pub fn search(
         try readSegmentTerm(reader, @intCast(data_entry.root_page), segment, candidate_pages[i], term, averages.column_count, postings, allocator);
     }
 
+    var raw_matches = false;
+    for (postings) |posting| {
+        if (posting.present) {
+            raw_matches = true;
+            break;
+        }
+    }
+
     const avg_doc_len = averages.avgDocLen();
+    const top = try allocator.alloc(ResultRow, options.limit);
+    errdefer allocator.free(top);
+    var top_len: usize = 0;
+
+    if (!raw_matches) {
+        const rows = try allocator.realloc(top, 0);
+        return .{
+            .table_name = fts_table,
+            .query = query,
+            .total_rows = averages.total_rows,
+            .rows_with_term = 0,
+            .total_hits = 0,
+            .avg_doc_len = avg_doc_len,
+            .column_count = averages.column_count,
+            .rows = rows,
+        };
+    }
+
+    const doc_lengths = try loadDocLengths(reader, @intCast(docsize_entry.root_page), max_rowid, averages.column_count, postings, allocator);
+    defer allocator.free(doc_lengths);
+
     var rows_with_term: u64 = 0;
     var total_hits: u64 = 0;
     for (postings) |posting| {
@@ -230,11 +260,6 @@ pub fn search(
         rows_with_term += 1;
         for (posting.column_hits[0..averages.column_count]) |hits| total_hits += hits;
     }
-
-    const top_limit = @min(options.limit, @as(usize, @intCast(rows_with_term)));
-    const top = try allocator.alloc(ResultRow, top_limit);
-    errdefer allocator.free(top);
-    var top_len: usize = 0;
 
     if (rows_with_term == 0) {
         const rows = try allocator.realloc(top, 0);
@@ -249,9 +274,6 @@ pub fn search(
             .rows = rows,
         };
     }
-
-    const doc_lengths = try loadDocLengths(reader, @intCast(docsize_entry.root_page), averages.total_rows, averages.column_count, postings, allocator);
-    defer allocator.free(doc_lengths);
 
     for (postings, 0..) |posting, rowid| {
         if (!posting.present) continue;
@@ -440,16 +462,16 @@ fn loadSegments(reader: page.PageReader, data_root: u32, allocator: std.mem.Allo
     return segments.toOwnedSlice(allocator);
 }
 
-fn loadDocLengths(reader: page.PageReader, docsize_root: u32, total_rows: u64, column_count: usize, postings: []const Posting, allocator: std.mem.Allocator) ![]u32 {
-    if (total_rows > std.math.maxInt(usize) - 1) return error.Fts5TableTooLarge;
-    const lengths = try allocator.alloc(u32, @as(usize, @intCast(total_rows)) + 1);
+fn loadDocLengths(reader: page.PageReader, docsize_root: u32, max_rowid: u64, column_count: usize, postings: []Posting, allocator: std.mem.Allocator) ![]u32 {
+    if (max_rowid > std.math.maxInt(usize) - 1) return error.Fts5TableTooLarge;
+    const lengths = try allocator.alloc(u32, @as(usize, @intCast(max_rowid)) + 1);
     errdefer allocator.free(lengths);
     @memset(lengths, 0);
 
     const Ctx = struct {
         lengths: []u32,
         column_count: usize,
-        postings: []const Posting,
+        postings: []Posting,
 
         fn onRow(ctx: *@This(), rowid: i64, values: []const record.Value) !void {
             if (rowid < 0 or @as(u64, @intCast(rowid)) >= @as(u64, @intCast(ctx.lengths.len))) return;
@@ -470,6 +492,9 @@ fn loadDocLengths(reader: page.PageReader, docsize_root: u32, total_rows: u64, c
 
     var ctx: Ctx = .{ .lengths = lengths, .column_count = column_count, .postings = postings };
     try table.scanTableForEach(reader, docsize_root, &ctx, Ctx.onRow);
+    for (postings, 0..) |*posting, rowid| {
+        if (posting.present and lengths[rowid] == 0) posting.present = false;
+    }
     return lengths;
 }
 
@@ -662,6 +687,27 @@ fn segmentPage(reader: page.PageReader, data_root: u32, segid: u64, pg: u32, all
 
 fn findTableBlobByRowid(reader: page.PageReader, root_page: u32, wanted_rowid: i64, allocator: std.mem.Allocator) !?BlobBlock {
     return findTableBlobInPage(reader, root_page, wanted_rowid, allocator);
+}
+
+fn maxTableRowid(reader: page.PageReader, root_page: u32) !u64 {
+    const ref = try reader.page(root_page);
+    const header = try btree.PageHeader.parse(ref);
+    if (!header.page_type.isTable()) return error.UnsupportedTableBTree;
+
+    switch (header.page_type) {
+        .table_leaf => {
+            if (header.cell_count == 0) return 0;
+            const cell = try header.cell(ref, header.cell_count - 1);
+            const prefix = try parseTableLeafCellPrefix(cell);
+            if (prefix.rowid < 0) return error.InvalidTableCell;
+            return @intCast(prefix.rowid);
+        },
+        .table_interior => {
+            const right = header.right_most_pointer orelse return error.InvalidTableCell;
+            return try maxTableRowid(reader, right);
+        },
+        else => return error.UnsupportedTableBTree,
+    }
 }
 
 fn findTableBlobInPage(reader: page.PageReader, page_number: u32, wanted_rowid: i64, allocator: std.mem.Allocator) !?BlobBlock {
