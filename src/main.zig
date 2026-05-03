@@ -591,6 +591,9 @@ fn ftsSearch(
         }, init.gpa, &ctx, HydrateFilterContext.accept);
     }) catch |err| switch (err) {
         error.UnsupportedFts5Query => {
+            // Compatibility escape hatch only. The prioritized sqlnano FTS path
+            // is the native compact-shape reader: bare token -> rowids/ranks,
+            // optional weights, hydration, and simple filters.
             try ftsSearchSqliteFallback(init, writer, path, table_name, content_table_name, query, limit, info, selected_columns, weights, filters);
             return;
         },
@@ -665,6 +668,9 @@ fn ftsSearchSqliteFallback(
     weights: []const f64,
     filters: []const HydrateFilter,
 ) !void {
+    // Keep this as a correctness fallback for rich SQLite FTS5 MATCH syntax.
+    // Do not optimize the product around spawning sqlite3; native compact
+    // shapes are where sqlnano should win and where new work is prioritized.
     const sql = try buildSqliteFtsSearchSql(init.gpa, table_name, content_table_name, query, limit, info, selected_columns, weights, filters);
     defer init.gpa.free(sql);
 
@@ -694,6 +700,8 @@ fn ftsMatchSqliteFallback(
     limit: usize,
     weights: []const f64,
 ) !void {
+    // Correctness fallback for phrase/boolean/prefix/NEAR MATCH queries.
+    // Native `fts-match` remains intentionally compact and prioritized.
     const sql = try buildSqliteFtsMatchSql(init.gpa, table_name, query, limit, weights);
     defer init.gpa.free(sql);
 

@@ -117,8 +117,8 @@ pub const features = [_]Feature{
     .{
         .area = "Virtual tables",
         .status = .experimental,
-        .evidence = "No general xConnect/xBestIndex/xFilter module system yet, but FTS5 shadow tables can be read directly for bare-token MATCH + BM25 top-k via `fts-match` and a limited SELECT/MATCH shortcut.",
-        .next = "Broaden FTS5 query syntax, tokenizer parity, phrase/AND/OR/NEAR support, column filters, and eventually a real virtual-table ABI.",
+        .evidence = "No general xConnect/xBestIndex/xFilter module system yet, but FTS5 shadow tables can be read directly for prioritized compact shapes: bare-token MATCH, BM25 top-k, weights, hydration, and simple filters.",
+        .next = "Keep compact native FTS shapes fast first; then broaden native query syntax, tokenizer parity, phrase/AND/OR/NEAR support, snippets, and eventually a real virtual-table ABI.",
     },
     .{
         .area = "Broad compatibility behavior",
