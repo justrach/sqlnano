@@ -61,6 +61,7 @@ const Averages = struct {
 
 const Posting = struct {
     present: bool = false,
+    hits: u32 = 0,
     column_hits: [MAX_COLUMNS]u32,
 };
 
@@ -156,11 +157,11 @@ const DoclistParser = struct {
         var total: u32 = 0;
         for (hits[0..self.column_count]) |n| total += n;
         if (total == 0) {
-            self.postings[@intCast(rowid)].present = false;
+            self.postings[@intCast(rowid)] = .{ .column_hits = [_]u32{0} ** MAX_COLUMNS };
             return;
         }
 
-        self.postings[@intCast(rowid)] = .{ .present = true, .column_hits = hits };
+        self.postings[@intCast(rowid)] = .{ .present = true, .hits = total, .column_hits = hits };
     }
 };
 
@@ -236,7 +237,7 @@ pub fn searchFiltered(
     if (max_rowid > std.math.maxInt(usize) - 1) return error.Fts5TableTooLarge;
     const postings = try allocator.alloc(Posting, @as(usize, @intCast(max_rowid)) + 1);
     defer allocator.free(postings);
-    @memset(postings, .{ .present = false, .column_hits = [_]u32{0} ** MAX_COLUMNS });
+    @memset(postings, .{ .column_hits = [_]u32{0} ** MAX_COLUMNS });
 
     for (segments, 0..) |segment, i| {
         try readSegmentTerm(reader, @intCast(data_entry.root_page), segment, candidate_pages[i], term, averages.column_count, postings, allocator);
@@ -251,12 +252,8 @@ pub fn searchFiltered(
     }
 
     const avg_doc_len = averages.avgDocLen();
-    const top = try allocator.alloc(ResultRow, options.limit);
-    errdefer allocator.free(top);
-    var top_len: usize = 0;
-
     if (!raw_matches) {
-        const rows = try allocator.realloc(top, 0);
+        const rows = try allocator.alloc(ResultRow, 0);
         return .{
             .table_name = fts_table,
             .query = query,
@@ -277,11 +274,11 @@ pub fn searchFiltered(
     for (postings) |posting| {
         if (!posting.present) continue;
         rows_with_term += 1;
-        for (posting.column_hits[0..averages.column_count]) |hits| total_hits += hits;
+        total_hits += posting.hits;
     }
 
     if (rows_with_term == 0) {
-        const rows = try allocator.realloc(top, 0);
+        const rows = try allocator.alloc(ResultRow, 0);
         return .{
             .table_name = fts_table,
             .query = query,
@@ -294,26 +291,25 @@ pub fn searchFiltered(
         };
     }
 
+    const top = try allocator.alloc(ResultRow, options.limit);
+    errdefer allocator.free(top);
+    var top_len: usize = 0;
+    const idf = fts5_bm25.inverseDocumentFrequency(averages.total_rows, rows_with_term);
+
     for (postings, 0..) |posting, rowid| {
         if (!posting.present) continue;
-        var hit_count: u32 = 0;
         var weighted_hits: f64 = 0;
         for (posting.column_hits[0..averages.column_count], 0..) |hits, i| {
-            hit_count += hits;
             const weight = if (i < options.weights.len) options.weights[i] else 1.0;
             weighted_hits += @as(f64, @floatFromInt(hits)) * weight;
         }
 
         const doc_len = if (rowid < doc_lengths.len) doc_lengths[@intCast(rowid)] else 0;
-        const phrase = [_]fts5_bm25.PhraseStats{.{
-            .rows_with_phrase = rows_with_term,
-            .weighted_hits = weighted_hits,
-        }};
-        const score = fts5_bm25.score(averages.total_rows, doc_len, avg_doc_len, &phrase);
+        const score = fts5_bm25.scoreWithIdf(doc_len, avg_doc_len, weighted_hits, idf);
         const candidate: ResultRow = .{
             .rowid = @intCast(rowid),
             .score = score,
-            .hits = hit_count,
+            .hits = posting.hits,
             .doc_len = doc_len,
             .column_hits = posting.column_hits,
         };
@@ -623,6 +619,8 @@ fn readSegmentTerm(
 
     var start_page = segment.first;
     if (candidate_page != 0) {
+        // FTS5 encodes the segment leaf page in the high bits of %_idx.pgno.
+        // The low bit is not part of the data leaf number.
         const half = candidate_page >> 1;
         start_page = if (half < segment.first)
             segment.first
@@ -755,15 +753,25 @@ fn findTableBlobInPage(reader: page.PageReader, page_number: u32, wanted_rowid: 
             return null;
         },
         .table_interior => {
-            var i: usize = 0;
-            while (i < header.cell_count) : (i += 1) {
-                const cell = try header.cell(ref, i);
+            var lo: usize = 0;
+            var hi: usize = header.cell_count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const cell = try header.cell(ref, mid);
                 if (cell.len < 5) return error.InvalidTableCell;
-                const left_child = readU32(cell[0..4]);
                 const sep = try parseVarint(cell[4..]);
                 if (wanted_rowid <= @as(i64, @intCast(sep.value))) {
-                    return try findTableBlobInPage(reader, left_child, wanted_rowid, allocator);
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
                 }
+            }
+
+            if (lo < header.cell_count) {
+                const cell = try header.cell(ref, lo);
+                if (cell.len < 5) return error.InvalidTableCell;
+                const left_child = readU32(cell[0..4]);
+                return try findTableBlobInPage(reader, left_child, wanted_rowid, allocator);
             }
 
             const right = header.right_most_pointer orelse return error.InvalidTableCell;
@@ -919,14 +927,14 @@ fn parsePoslist(poslist: []const u8, column_count: usize, hits: *[MAX_COLUMNS]u3
     var pos: usize = 0;
     var column: usize = 0;
     while (pos < poslist.len) {
-        if (poslist[pos] == 1) {
+        const first = poslist[pos];
+        if (first == 1) {
             pos += 1;
             const col_v = try parseVarint(poslist[pos..]);
             pos += col_v.len;
             column = @intCast(col_v.value);
         } else {
-            const p = try parseVarint(poslist[pos..]);
-            pos += p.len;
+            pos += if ((first & 0x80) == 0) 1 else (try parseVarint(poslist[pos..])).len;
             if (column < column_count and column < MAX_COLUMNS) {
                 hits[column] += 1;
             }
@@ -995,6 +1003,8 @@ test "sqlite fts5 doclist parser treats continuation rowids as absolute" {
     try std.testing.expect(postings[10].present);
     try std.testing.expect(postings[7].present);
     try std.testing.expect(!postings[17].present);
+    try std.testing.expectEqual(@as(u32, 2), postings[10].hits);
+    try std.testing.expectEqual(@as(u32, 1), postings[7].hits);
     try std.testing.expectEqual(@as(u32, 2), postings[10].column_hits[0]);
     try std.testing.expectEqual(@as(u32, 1), postings[7].column_hits[0]);
 }

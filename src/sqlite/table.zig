@@ -245,15 +245,25 @@ fn findRowInLeaf(reader: page.PageReader, ref: page.PageRef, header: btree.PageH
 }
 
 fn findRowInInterior(reader: page.PageReader, ref: page.PageRef, header: btree.PageHeader, wanted_rowid: i64, allocator: std.mem.Allocator) TableError!?Row {
-    var i: usize = 0;
-    while (i < header.cell_count) : (i += 1) {
-        const cell = try header.cell(ref, i);
+    var lo: usize = 0;
+    var hi: usize = header.cell_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const cell = try header.cell(ref, mid);
         if (cell.len < 5) return error.InvalidTableCell;
-        const left_child = readU32(cell[0..4]);
         const sep = try parseVarint(cell[4..]);
         if (wanted_rowid <= @as(i64, @intCast(sep.value))) {
-            return try findRowInPage(reader, left_child, wanted_rowid, allocator);
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
+    }
+
+    if (lo < header.cell_count) {
+        const cell = try header.cell(ref, lo);
+        if (cell.len < 5) return error.InvalidTableCell;
+        const left_child = readU32(cell[0..4]);
+        return try findRowInPage(reader, left_child, wanted_rowid, allocator);
     }
 
     const right = header.right_most_pointer orelse return error.InvalidTableCell;

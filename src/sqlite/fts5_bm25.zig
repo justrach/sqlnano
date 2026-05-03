@@ -18,20 +18,36 @@ pub const PhraseStats = struct {
 pub fn score(total_rows: u64, doc_len: u64, avg_doc_len: f64, phrases: []const PhraseStats) f64 {
     if (total_rows == 0 or avg_doc_len <= 0) return 0;
 
-    const d: f64 = @floatFromInt(doc_len);
-    const norm = K1 * (1.0 - B + B * d / avg_doc_len);
+    const norm = lengthNorm(doc_len, avg_doc_len);
     var relevance: f64 = 0;
 
     for (phrases) |phrase| {
         if (phrase.weighted_hits <= 0) continue;
 
         const idf = inverseDocumentFrequency(total_rows, phrase.rows_with_phrase);
-        const numerator = phrase.weighted_hits * (K1 + 1.0);
-        const denominator = phrase.weighted_hits + norm;
-        relevance += idf * numerator / denominator;
+        relevance += relevanceWithNorm(phrase.weighted_hits, idf, norm);
     }
 
     return -relevance;
+}
+
+/// Single-phrase BM25 score when the phrase IDF has already been computed.
+/// Compact FTS5 MATCH queries use this to avoid taking the same log once per
+/// candidate row.
+pub fn scoreWithIdf(doc_len: u64, avg_doc_len: f64, weighted_hits: f64, idf: f64) f64 {
+    if (avg_doc_len <= 0 or weighted_hits <= 0) return 0;
+    return -relevanceWithNorm(weighted_hits, idf, lengthNorm(doc_len, avg_doc_len));
+}
+
+fn lengthNorm(doc_len: u64, avg_doc_len: f64) f64 {
+    const d: f64 = @floatFromInt(doc_len);
+    return K1 * (1.0 - B + B * d / avg_doc_len);
+}
+
+fn relevanceWithNorm(weighted_hits: f64, idf: f64, norm: f64) f64 {
+    const numerator = weighted_hits * (K1 + 1.0);
+    const denominator = weighted_hits + norm;
+    return idf * numerator / denominator;
 }
 
 pub fn inverseDocumentFrequency(total_rows: u64, rows_with_phrase: u64) f64 {
@@ -78,4 +94,14 @@ test "sqlite fts5 bm25 supports column weights" {
 
     try std.testing.expectEqual(@as(f64, 10.0), weightedHits(&title_hit, &weights));
     try std.testing.expectEqual(@as(f64, 1.0), weightedHits(&body_hit, &weights));
+}
+
+test "sqlite fts5 bm25 can reuse a precomputed idf" {
+    const phrase = [_]PhraseStats{.{ .rows_with_phrase = 10, .weighted_hits = 3 }};
+    const idf = inverseDocumentFrequency(1000, 10);
+
+    try std.testing.expectEqual(
+        score(1000, 100, 100, &phrase),
+        scoreWithIdf(100, 100, 3, idf),
+    );
 }
