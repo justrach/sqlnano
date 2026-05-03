@@ -55,7 +55,8 @@ pub fn inverseDocumentFrequency(total_rows: u64, rows_with_phrase: u64) f64 {
     const n: f64 = @floatFromInt(total_rows);
     const hits_int = @min(rows_with_phrase, total_rows);
     const hits: f64 = @floatFromInt(hits_int);
-    return @log((n - hits + 0.5) / (hits + 0.5));
+    const idf = @log((n - hits + 0.5) / (hits + 0.5));
+    return if (idf <= 0) 0.000001 else idf;
 }
 
 pub fn weightedHits(column_hits: []const u32, weights: []const f64) f64 {
@@ -104,4 +105,8 @@ test "sqlite fts5 bm25 can reuse a precomputed idf" {
         score(1000, 100, 100, &phrase),
         scoreWithIdf(100, 100, 3, idf),
     );
+}
+
+test "sqlite fts5 bm25 floors common term idf" {
+    try std.testing.expectEqual(@as(f64, 0.000001), inverseDocumentFrequency(100, 99));
 }

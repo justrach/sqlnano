@@ -592,8 +592,9 @@ fn ftsSearch(
     }) catch |err| switch (err) {
         error.UnsupportedFts5Query => {
             // Compatibility escape hatch only. The prioritized sqlnano FTS path
-            // is the native compact-shape reader: bare token -> rowids/ranks,
-            // optional weights, hydration, and simple filters.
+            // is the native compact-shape reader: bare-token / implicit-AND
+            // bareword query -> rowids/ranks, optional weights, hydration,
+            // and simple filters.
             try ftsSearchSqliteFallback(init, writer, path, table_name, content_table_name, query, limit, info, selected_columns, weights, filters);
             return;
         },

@@ -178,6 +178,20 @@ const TermSpan = struct {
     is_last: bool,
 };
 
+const NormalizedTerms = struct {
+    terms: [][]u8,
+
+    fn deinit(self: NormalizedTerms, allocator: std.mem.Allocator) void {
+        for (self.terms) |term| allocator.free(term);
+        allocator.free(self.terms);
+    }
+};
+
+const TermPostings = struct {
+    postings: []Posting,
+    rows_with_term: u64,
+};
+
 pub fn search(
     reader: page.PageReader,
     schema: schema_mod.Schema,
@@ -223,14 +237,34 @@ pub fn searchFiltered(
     const idx_entry = try shadowTable(schema, fts_table, "idx", allocator);
     const docsize_entry = try shadowTable(schema, fts_table, "docsize", allocator);
 
-    const term = try normalizeBareTerm(query, allocator);
-    defer allocator.free(term);
+    const normalized = try normalizeCompactTerms(query, allocator);
+    defer normalized.deinit(allocator);
 
     const averages = try loadAverages(reader, @intCast(data_entry.root_page), allocator);
     const segments = try loadSegments(reader, @intCast(data_entry.root_page), allocator);
     defer allocator.free(segments);
     const max_rowid = try maxTableRowid(reader, @intCast(docsize_entry.root_page));
 
+    if (normalized.terms.len != 1) {
+        return searchMultiTerms(
+            reader,
+            fts_table,
+            query,
+            options,
+            allocator,
+            @intCast(data_entry.root_page),
+            @intCast(idx_entry.root_page),
+            @intCast(docsize_entry.root_page),
+            normalized.terms,
+            averages,
+            segments,
+            max_rowid,
+            ctx,
+            acceptCandidate,
+        );
+    }
+
+    const term = normalized.terms[0];
     const candidate_pages = try candidatePages(reader, @intCast(idx_entry.root_page), segments, term, allocator);
     defer allocator.free(candidate_pages);
 
@@ -330,10 +364,199 @@ pub fn searchFiltered(
     };
 }
 
+fn searchMultiTerms(
+    reader: page.PageReader,
+    fts_table: []const u8,
+    query: []const u8,
+    options: SearchOptions,
+    allocator: std.mem.Allocator,
+    data_root: u32,
+    idx_root: u32,
+    docsize_root: u32,
+    terms: []const []u8,
+    averages: Averages,
+    segments: []const Segment,
+    max_rowid: u64,
+    ctx: anytype,
+    comptime acceptCandidate: fn (ctx: @TypeOf(ctx), candidate: ResultRow) anyerror!bool,
+) !SearchResult {
+    const avg_doc_len = averages.avgDocLen();
+    if (max_rowid > std.math.maxInt(usize) - 1) return error.Fts5TableTooLarge;
+    const posting_len = @as(usize, @intCast(max_rowid)) + 1;
+
+    const term_postings = try allocator.alloc(TermPostings, terms.len);
+    var filled_terms: usize = 0;
+    defer {
+        for (term_postings[0..filled_terms]) |tp| allocator.free(tp.postings);
+        allocator.free(term_postings);
+    }
+
+    for (terms, 0..) |term, term_i| {
+        const postings = try allocator.alloc(Posting, posting_len);
+        @memset(postings, .{ .column_hits = [_]u32{0} ** MAX_COLUMNS });
+        term_postings[term_i] = .{ .postings = postings, .rows_with_term = 0 };
+        filled_terms += 1;
+
+        const pages = try candidatePages(reader, idx_root, segments, term, allocator);
+        defer allocator.free(pages);
+
+        for (segments, 0..) |segment, i| {
+            try readSegmentTerm(reader, data_root, segment, pages[i], term, averages.column_count, postings, allocator);
+        }
+
+        var rows_with_term: u64 = 0;
+        for (postings) |posting| {
+            if (posting.present) rows_with_term += 1;
+        }
+        term_postings[term_i].rows_with_term = rows_with_term;
+        if (rows_with_term == 0) {
+            return emptySearchResult(allocator, fts_table, query, averages, avg_doc_len);
+        }
+    }
+
+    const matched = try allocator.alloc(Posting, posting_len);
+    defer allocator.free(matched);
+    @memset(matched, .{ .column_hits = [_]u32{0} ** MAX_COLUMNS });
+
+    var raw_matches = false;
+    row_loop: for (matched, 0..) |*out, rowid| {
+        var hits: u32 = 0;
+        var column_hits = [_]u32{0} ** MAX_COLUMNS;
+        for (term_postings) |tp| {
+            const posting = tp.postings[rowid];
+            if (!posting.present) continue :row_loop;
+            hits += posting.hits;
+            for (posting.column_hits[0..averages.column_count], 0..) |n, col| {
+                column_hits[col] += n;
+            }
+        }
+
+        out.* = .{ .present = true, .hits = hits, .column_hits = column_hits };
+        raw_matches = true;
+    }
+
+    if (!raw_matches) {
+        return emptySearchResult(allocator, fts_table, query, averages, avg_doc_len);
+    }
+
+    const doc_lengths = try loadDocLengths(reader, docsize_root, max_rowid, averages.column_count, matched, allocator);
+    defer allocator.free(doc_lengths);
+
+    var rows_with_term: u64 = 0;
+    var total_hits: u64 = 0;
+    for (matched) |posting| {
+        if (!posting.present) continue;
+        rows_with_term += 1;
+        total_hits += posting.hits;
+    }
+
+    if (rows_with_term == 0) {
+        return emptySearchResult(allocator, fts_table, query, averages, avg_doc_len);
+    }
+
+    const idfs = try allocator.alloc(f64, term_postings.len);
+    defer allocator.free(idfs);
+    for (term_postings, 0..) |tp, i| {
+        idfs[i] = fts5_bm25.inverseDocumentFrequency(averages.total_rows, tp.rows_with_term);
+    }
+
+    const top = try allocator.alloc(ResultRow, options.limit);
+    errdefer allocator.free(top);
+    var top_len: usize = 0;
+
+    for (matched, 0..) |posting, rowid| {
+        if (!posting.present) continue;
+        const doc_len = if (rowid < doc_lengths.len) doc_lengths[@intCast(rowid)] else 0;
+        var score: f64 = 0;
+        for (term_postings, 0..) |tp, term_i| {
+            const term_posting = tp.postings[rowid];
+            var weighted_hits: f64 = 0;
+            for (term_posting.column_hits[0..averages.column_count], 0..) |hits, col| {
+                const weight = if (col < options.weights.len) options.weights[col] else 1.0;
+                weighted_hits += @as(f64, @floatFromInt(hits)) * weight;
+            }
+            score += fts5_bm25.scoreWithIdf(doc_len, avg_doc_len, weighted_hits, idfs[term_i]);
+        }
+
+        const candidate: ResultRow = .{
+            .rowid = @intCast(rowid),
+            .score = score,
+            .hits = posting.hits,
+            .doc_len = doc_len,
+            .column_hits = posting.column_hits,
+        };
+        if (!try acceptCandidate(ctx, candidate)) continue;
+        topInsert(top, &top_len, candidate);
+    }
+
+    const rows = try allocator.realloc(top, top_len);
+    return .{
+        .table_name = fts_table,
+        .query = query,
+        .total_rows = averages.total_rows,
+        .rows_with_term = rows_with_term,
+        .total_hits = total_hits,
+        .avg_doc_len = avg_doc_len,
+        .column_count = averages.column_count,
+        .rows = rows,
+    };
+}
+
+fn emptySearchResult(
+    allocator: std.mem.Allocator,
+    fts_table: []const u8,
+    query: []const u8,
+    averages: Averages,
+    avg_doc_len: f64,
+) !SearchResult {
+    const rows = try allocator.alloc(ResultRow, 0);
+    return .{
+        .table_name = fts_table,
+        .query = query,
+        .total_rows = averages.total_rows,
+        .rows_with_term = 0,
+        .total_hits = 0,
+        .avg_doc_len = avg_doc_len,
+        .column_count = averages.column_count,
+        .rows = rows,
+    };
+}
+
 fn shadowTable(schema: schema_mod.Schema, fts_table: []const u8, suffix: []const u8, allocator: std.mem.Allocator) !schema_mod.SchemaEntry {
     const name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ fts_table, suffix });
     defer allocator.free(name);
     return schema.findTable(name) orelse error.MissingFts5ShadowTable;
+}
+
+fn normalizeCompactTerms(query: []const u8, allocator: std.mem.Allocator) !NormalizedTerms {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return error.UnsupportedFts5Query;
+
+    var terms: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (terms.items) |term| allocator.free(term);
+        terms.deinit(allocator);
+    }
+
+    var pos: usize = 0;
+    while (pos < trimmed.len) {
+        while (pos < trimmed.len and std.ascii.isWhitespace(trimmed[pos])) pos += 1;
+        if (pos >= trimmed.len) break;
+
+        const start = pos;
+        while (pos < trimmed.len and !std.ascii.isWhitespace(trimmed[pos])) pos += 1;
+        const raw = trimmed[start..pos];
+        if (isFts5Operator(raw)) return error.UnsupportedFts5Query;
+
+        const term = try normalizeBareToken(raw, allocator);
+        terms.append(allocator, term) catch |err| {
+            allocator.free(term);
+            return err;
+        };
+    }
+
+    if (terms.items.len == 0) return error.UnsupportedFts5Query;
+    return .{ .terms = try terms.toOwnedSlice(allocator) };
 }
 
 fn normalizeBareTerm(query: []const u8, allocator: std.mem.Allocator) ![]u8 {
@@ -342,16 +565,18 @@ fn normalizeBareTerm(query: []const u8, allocator: std.mem.Allocator) ![]u8 {
         trimmed = trimmed[1 .. trimmed.len - 1];
     }
 
+    return normalizeBareToken(trimmed, allocator);
+}
+
+fn normalizeBareToken(raw: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var token: std.ArrayList(u8) = .empty;
     defer token.deinit(allocator);
 
     var saw = false;
-    for (trimmed) |c| {
+    for (raw) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '_') {
             try token.append(allocator, std.ascii.toLower(c));
             saw = true;
-        } else if (std.ascii.isWhitespace(c)) {
-            if (saw) return error.UnsupportedFts5Query;
         } else {
             return error.UnsupportedFts5Query;
         }
@@ -364,6 +589,13 @@ fn normalizeBareTerm(query: []const u8, allocator: std.mem.Allocator) ![]u8 {
     out[0] = '0';
     @memcpy(out[1..], token.items[0..stem_len]);
     return out;
+}
+
+fn isFts5Operator(raw: []const u8) bool {
+    return std.mem.eql(u8, raw, "AND") or
+        std.mem.eql(u8, raw, "OR") or
+        std.mem.eql(u8, raw, "NOT") or
+        std.mem.eql(u8, raw, "NEAR");
 }
 
 fn porterLiteStemLen(token: []const u8) usize {
@@ -1013,6 +1245,19 @@ test "sqlite fts5 query normalizer applies porter-style suffixes" {
     const term = try normalizeBareTerm("negligence", std.testing.allocator);
     defer std.testing.allocator.free(term);
     try std.testing.expectEqualStrings("0neglig", term);
+}
+
+test "sqlite fts5 query normalizer accepts compact multi-term queries" {
+    const normalized = try normalizeCompactTerms("contract law", std.testing.allocator);
+    defer normalized.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), normalized.terms.len);
+    try std.testing.expectEqualStrings("0contract", normalized.terms[0]);
+    try std.testing.expectEqualStrings("0law", normalized.terms[1]);
+}
+
+test "sqlite fts5 query normalizer leaves explicit boolean syntax to fallback" {
+    try std.testing.expectError(error.UnsupportedFts5Query, normalizeCompactTerms("contract AND law", std.testing.allocator));
 }
 
 test "sqlite fts5 top insert keeps lowest bm25 scores first" {

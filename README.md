@@ -132,10 +132,11 @@ sqlnano bench-read /tmp/t.db "SELECT * FROM t" 1000
 
 ### FTS5 search
 
-sqlnano can read SQLite FTS5 shadow tables directly for fast single-token BM25
-searches. This compact native shape is the prioritized path right now: bare
-token MATCH, SQLite-style BM25, optional column weights, JSON hydration by
-content rowid, and simple pre-ranking filters.
+sqlnano can read SQLite FTS5 shadow tables directly for fast compact BM25
+searches. This native shape is the prioritized path right now: bare-token MATCH
+and implicit-AND bareword queries like `contract law`, SQLite-style BM25,
+optional column weights, JSON hydration by content rowid, and simple
+pre-ranking filters.
 
 For richer MATCH syntax, the CLI keeps a correctness fallback that shells out to
 SQLite's own FTS5 implementation when `sqlite3` is on `PATH`. That makes phrase,
@@ -150,6 +151,10 @@ sqlnano fts-match data.db judgments_fts contract 10 5,3,1
 #   <db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]
 sqlnano fts-search data.db judgments_fts judgments contract \
   10 citation,title,court,year 5,3,1 court=SGHC
+
+# Compact implicit-AND bareword queries stay native.
+sqlnano fts-search data.db judgments_fts judgments 'contract law' \
+  10 citation,title,court,year 5,3,1
 
 # Rich MATCH syntax is compatibility-first and falls back to SQLite FTS5.
 sqlnano fts-search data.db judgments_fts judgments '"contract law"' \
@@ -262,7 +267,7 @@ client for the same ecosystem — not a fork.
 - **Native WAL** — group commit, crash recovery, fuzz-tested torn-WAL handling
 - **Configurable durability** — `synchronous=full/normal/off`
 - **Tiny SQL surface** — `SELECT ... WHERE col = literal`, `INSERT INTO t VALUES (...)`, `UPDATE`/`DELETE` with single-equality `WHERE`
-- **Prioritized FTS5 reads** — native shadow-table BM25 for compact single-token MATCH queries, optional column weights, JSON hydration by content rowid, and simple pre-ranking filters. Rich MATCH syntax/snippets are correctness-first through the optional SQLite CLI fallback.
+- **Prioritized FTS5 reads** — native shadow-table BM25 for compact bare-token and implicit-AND bareword MATCH queries, optional column weights, JSON hydration by content rowid, and simple pre-ranking filters. Rich MATCH syntax/snippets are correctness-first through the optional SQLite CLI fallback.
 
 ### What doesn't work (yet)
 
