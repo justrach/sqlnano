@@ -11,6 +11,19 @@ pub const Varint = struct {
 };
 
 pub fn parse(bytes: []const u8) VarintError!Varint {
+    // Fast path: 1-2 bytes cover >99% of SQLite serial types and header sizes.
+    if (bytes.len >= 2) {
+        const b0 = bytes[0];
+        if ((b0 & 0x80) == 0) return .{ .value = b0, .len = 1 };
+        const b1 = bytes[1];
+        const v2: u64 = (@as(u64, b0 & 0x7f) << 7) | @as(u64, b1 & 0x7f);
+        if ((b1 & 0x80) == 0) return .{ .value = v2, .len = 2 };
+        // 3+ bytes — fall through to full loop.
+    } else if (bytes.len >= 1) {
+        const b0 = bytes[0];
+        if ((b0 & 0x80) == 0) return .{ .value = b0, .len = 1 };
+    }
+
     var value: u64 = 0;
     var i: usize = 0;
     while (i < bytes.len and i < 9) : (i += 1) {

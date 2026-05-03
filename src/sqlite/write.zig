@@ -89,6 +89,12 @@ const ApplyMode = enum { fresh, idempotent };
 /// and the WAL is checkpointed+compacted.
 ///
 /// The `db_path` slice is borrowed and must outlive the connection.
+
+/// When the on-disk WAL grows past this many bytes, `maybeCheckpoint`
+/// flushes the image and compacts the WAL. 1 MiB balances batch
+/// amortisation against crash-replay cost.
+pub const checkpoint_threshold_bytes: u64 = 1 * 1024 * 1024;
+
 pub const Connection = struct {
     gpa: Allocator,
     io: Io,
@@ -125,6 +131,13 @@ pub const Connection = struct {
     /// could shift rowids (explicit rowid INSERT, DELETE, ROLLBACK once
     /// that exists) invalidates the matching entry.
     next_rowid_cache: std.StringHashMap(i64),
+    /// Lazily-populated schema cache. Parsed once from the sqlite_schema
+    /// b-tree on first access; all string fields are dupe'd into `gpa` so
+    /// the cache survives mmap resize. Invalidated on DDL (not yet wired).
+    cached_schema: ?schema.Schema = null,
+    /// Per-table cache of parsed `catalog.TableInfo`. Populated on first
+    /// reference to each table; string fields are dupe'd into `gpa`.
+    cached_table_infos: std.StringHashMap(catalog.TableInfo),
     /// Per-op scratch arena. Reset at the top of every mutating op. Used
     /// for everything transient in the hot path — parsed schema view,
     /// table info, WAL payload, cell buffer — so the steady state is
@@ -133,11 +146,18 @@ pub const Connection = struct {
     /// retained by the GPA. Inspired by the same hack in justrach/codedb.
     scratch_arena: std.heap.ArenaAllocator,
 
-    /// When the on-disk WAL grows past this many bytes, `maybeCheckpoint`
-    /// flushes the image and compacts the WAL. Big enough that a batch
-    /// of small ops avoids paying a file rewrite per op; small enough
-    /// that crash replay stays cheap.
-    pub const checkpoint_threshold_bytes: u64 = 64 * 1024;
+    /// When true, `insert`/`update`/`delete` write WAL entries but defer
+    /// `commit` + fsync until `commitBatch()`. Amortises one fsync across
+    /// many ops. Real transaction semantics (undo on rollback) are not
+    /// implemented yet — this is just I/O batching.
+    in_batch: bool = false,
+    /// Transaction id reused for every WAL entry in the current batch.
+    batch_txn_id: u64 = 0,
+
+    /// Set to true after an early `persistImage` (at 50 % of the
+    /// threshold). When `maybeCheckpoint` fires a second time it skips
+    /// `persistImage` unless new pages were dirtied since.
+    checkpoint_early_flushed: bool = false,
 
     pub fn open(gpa: Allocator, io: Io, db_path: []const u8) WriteError!Connection {
         const wal_path = try walPathFor(gpa, db_path);
@@ -174,6 +194,7 @@ pub const Connection = struct {
             .full_rewrite = true,
             .page_size_cached = page_size,
             .next_rowid_cache = std.StringHashMap(i64).init(gpa),
+            .cached_table_infos = std.StringHashMap(catalog.TableInfo).init(gpa),
             .scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         };
         errdefer {
@@ -205,13 +226,60 @@ pub const Connection = struct {
     }
 
     fn deinitCache(self: *Connection) void {
-        var it = self.next_rowid_cache.iterator();
-        while (it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        // Rowid cache keys are dupe'd.
+        var rit = self.next_rowid_cache.iterator();
+        while (rit.next()) |entry| self.gpa.free(entry.key_ptr.*);
         self.next_rowid_cache.deinit();
+
+        // Table info cache: each entry owns a dupe'd key + dupe'd TableInfo.
+        var tit = self.cached_table_infos.iterator();
+        while (tit.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            for (entry.value_ptr.columns) |col| {
+                self.gpa.free(col.name);
+            }
+            self.gpa.free(entry.value_ptr.columns);
+            self.gpa.free(entry.value_ptr.name);
+        }
+        self.cached_table_infos.deinit();
+
+        if (self.cached_schema != null) {
+            self.dupeSchemaDeinit();
+            self.cached_schema = null;
+        }
     }
 
     fn invalidateRowidCache(self: *Connection, table_name: []const u8) void {
         if (self.next_rowid_cache.fetchRemove(table_name)) |kv| self.gpa.free(kv.key);
+    }
+
+    /// Load (or return cached) schema + per-table catalog info. Parsed from
+    /// the sqlite_schema b-tree on first access; all string fields are dupe'd
+    /// into `gpa` so the cache survives mmap resize from fast-path splits.
+    /// Returns borrowed references into `self` — caller must not hold them
+    /// across DDL (not yet supported through Connection).
+    fn getOrLoadTableInfo(self: *Connection, table_name: []const u8) WriteError!struct { schema: *schema.Schema, info: *catalog.TableInfo } {
+        // ── schema: load once ───────────────────────────────────────
+        if (self.cached_schema == null) {
+            const reader = try page.PageReader.init(self.image.items);
+            if (reader.db_header.isWal()) return error.WalModeUnsupported;
+            const raw = try schema.readSchema(reader, self.gpa);
+            try self.dupeSchema(raw);
+            raw.deinit(self.gpa);
+        }
+        const cs = &self.cached_schema.?;
+
+        // ── per-table info: load once per table ─────────────────────
+        const gop = try self.cached_table_infos.getOrPut(table_name);
+        if (!gop.found_existing) {
+            const entry = cs.findTable(table_name) orelse return error.TableNotFound;
+            const raw = try catalog.tableInfo(entry, self.gpa);
+            // Key must outlive the hash map; dup into gpa.
+            gop.key_ptr.* = try self.gpa.dupe(u8, table_name);
+            gop.value_ptr.* = try self.dupeTableInfo(raw);
+            raw.deinit(self.gpa);
+        }
+        return .{ .schema = cs, .info = gop.value_ptr };
     }
 
     /// Set the WAL durability mode. See `wal.SyncMode`. Defaults to `.full`.
@@ -296,8 +364,63 @@ pub const Connection = struct {
     }
 
     fn maybeCheckpoint(self: *Connection) WriteError!void {
+        const half = checkpoint_threshold_bytes / 2;
+        // Early persist at 50 % of the threshold: flush dirty image
+        // pages now so that when we cross the full threshold later,
+        // only the WAL checkpoint + compact remain. The bitmap is
+        // cleared and will repopulate if more writes land before the
+        // threshold.
+        if (self.image_dirty and self.wal.end_offset >= half and !self.checkpoint_early_flushed) {
+            try self.persistImage();
+            self.image_dirty = false;
+            self.dirty_pages.unsetAll();
+            self.checkpoint_early_flushed = true;
+        }
         if (self.wal.end_offset < checkpoint_threshold_bytes) return;
+
+        // At the full threshold: if we early-flushed and no new pages
+        // are dirty, skip persistImage and go straight to checkpoint.
+        if (self.checkpoint_early_flushed and !self.image_dirty) {
+            if (self.wal.synced_lsn > self.wal.checkpoint_lsn) {
+                try self.wal.checkpoint(self.io, wal_mod.DB_TAG_SQLITE);
+            }
+            self.wal.compact(self.io) catch {};
+            self.checkpoint_early_flushed = false;
+            return;
+        }
+        // Fallback: full flush (persist + checkpoint + compact).
         try self.flush();
+        self.checkpoint_early_flushed = false;
+    }
+
+    // ── batch I/O ────────────────────────────────────────────────────
+
+    /// Start a write batch. Every subsequent `insert` / `update` / `delete`
+    /// appends to the WAL buffer but skips `commit` + fsync + checkpoint.
+    /// Call `commitBatch` to finalise, or `rollbackBatch` to discard.
+    pub fn beginBatch(self: *Connection) void {
+        std.debug.assert(!self.in_batch);
+        self.in_batch = true;
+        self.batch_txn_id = nextTxnId();
+    }
+
+    /// Flush the WAL buffer to disk, then checkpoint if the threshold is
+    /// exceeded. After this returns, all batched ops are durable (subject
+    /// to `sync_mode`).
+    pub fn commitBatch(self: *Connection) WriteError!void {
+        std.debug.assert(self.in_batch);
+        self.in_batch = false;
+        try self.wal.commit(self.io, self.batch_txn_id, wal_mod.DB_TAG_SQLITE);
+        try self.maybeCheckpoint();
+    }
+
+    /// Discard an in-progress batch. WAL entries buffered beyond the last
+    /// commit are unreachable by recovery (recovery skips entries without a
+    /// matching `txn_commit` record). Image mutations already applied are
+    /// NOT rolled back — this is I/O batching, not transactional undo.
+    pub fn rollbackBatch(self: *Connection) void {
+        std.debug.assert(self.in_batch);
+        self.in_batch = false;
     }
 
     pub fn insert(self: *Connection, table_name: []const u8, values: []const InsertValue) WriteError!i64 {
@@ -307,24 +430,24 @@ pub const Connection = struct {
         _ = self.scratch_arena.reset(.retain_capacity);
         const scratch = self.scratch_arena.allocator();
 
-        // Parse schema + catalog info ONCE. Both the rowid resolver and
-        // the fast-path apply need them; the previous version parsed
-        // schema twice per insert.
-        const reader = try page.PageReader.init(self.image.items);
-        if (reader.db_header.isWal()) return error.WalModeUnsupported;
-        const db_schema = try schema.readSchema(reader, scratch);
-        const entry = db_schema.findTable(table_name) orelse return error.TableNotFound;
-        const info = try catalog.tableInfo(entry, scratch);
+        // Schema + catalog info are cached after the first access.
+        // `getOrLoadTableInfo` dups string fields into `gpa` so the
+        // cache survives mmap resize from fast-path b-tree splits.
+        const cached = try self.getOrLoadTableInfo(table_name);
+        const db_schema = cached.schema.*;
+        const info = cached.info.*;
         if (values.len != info.columns.len) return error.ColumnCountMismatch;
         if (info.root_page == 1) return error.UnsupportedInsert;
+
+        const reader = try page.PageReader.init(self.image.items);
 
         const resolved = try self.resolveRowidShared(scratch, reader, db_schema, info, table_name, values);
         const rowid = resolved.rowid;
 
         const payload = try wal_codec.encodeInsert(scratch, table_name, rowid, values);
-        const txn_id = nextTxnId();
+        const txn_id = if (self.in_batch) self.batch_txn_id else nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_insert, wal_mod.DB_TAG_SQLITE, 0, payload);
-        try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
+        if (!self.in_batch) try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
 
         // The append-only fast paths (A/B/C) assume the new rowid is
         // strictly greater than every existing rowid in the rightmost
@@ -369,7 +492,7 @@ pub const Connection = struct {
         }
         try self.bumpRowidCache(table_name, rowid);
         self.image_dirty = true;
-        try self.maybeCheckpoint();
+        if (!self.in_batch) try self.maybeCheckpoint();
         return rowid;
     }
 
@@ -840,9 +963,9 @@ pub const Connection = struct {
     pub fn update(self: *Connection, stmt: @import("ast.zig").UpdateStatement) WriteError!usize {
         const payload = try wal_codec.encodeUpdate(self.gpa, stmt);
         defer self.gpa.free(payload);
-        const txn_id = nextTxnId();
+        const txn_id = if (self.in_batch) self.batch_txn_id else nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_update, wal_mod.DB_TAG_SQLITE, 0, payload);
-        try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
+        if (!self.in_batch) try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
         const changed = try applyUpdateCore(self.gpa, &self.image, stmt);
         if (changed > 0) {
             self.image_dirty = true;
@@ -850,16 +973,16 @@ pub const Connection = struct {
             // UPDATE currently can't touch rowid, but be defensive.
             self.invalidateRowidCache(stmt.table_name);
         }
-        try self.maybeCheckpoint();
+        if (!self.in_batch) try self.maybeCheckpoint();
         return changed;
     }
 
     pub fn delete(self: *Connection, stmt: @import("ast.zig").DeleteStatement) WriteError!usize {
         const payload = try wal_codec.encodeDelete(self.gpa, stmt);
         defer self.gpa.free(payload);
-        const txn_id = nextTxnId();
+        const txn_id = if (self.in_batch) self.batch_txn_id else nextTxnId();
         _ = try self.wal.write(self.io, txn_id, .row_delete, wal_mod.DB_TAG_SQLITE, 0, payload);
-        try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
+        if (!self.in_batch) try self.wal.commit(self.io, txn_id, wal_mod.DB_TAG_SQLITE);
         const changed = try applyDeleteCore(self.gpa, &self.image, stmt);
         if (changed > 0) {
             self.image_dirty = true;
@@ -870,9 +993,73 @@ pub const Connection = struct {
             // than a stale count.
             self.invalidateRowidCache(stmt.table_name);
         }
-        try self.maybeCheckpoint();
+        if (!self.in_batch) try self.maybeCheckpoint();
         return changed;
     }
+    // ── schema cache helpers ──────────────────────────────────────────────
+
+    /// Invalidate the cached schema + all per-table info.
+    /// Call after any DDL that changes the schema (CREATE TABLE, DROP TABLE, ALTER TABLE).
+    pub fn invalidateSchemaCache(self: *Connection) void {
+        self.dupeSchemaDeinit();
+        var it = self.cached_table_infos.iterator();
+        while (it.next()) |entry| {
+            // Free column names individually (they were duped separately)
+            for (entry.value_ptr.columns) |col| {
+                self.gpa.free(col.name);
+            }
+            self.gpa.free(entry.value_ptr.columns);
+            self.gpa.free(entry.value_ptr.name);
+            self.gpa.free(entry.key_ptr.*);
+        }
+        self.cached_table_infos.clearAndFree();
+    }
+
+    fn dupeSchema(self: *Connection, src: schema.Schema) !void {
+        // Deep-copy the entries slice and all string fields within each entry.
+        const entries = try self.gpa.alloc(schema.SchemaEntry, src.entries.len);
+        for (entries, src.entries) |*dst, src_entry| {
+            dst.* = schema.SchemaEntry{
+                .rowid = src_entry.rowid,
+                .object_type = try self.gpa.dupe(u8, src_entry.object_type),
+                .name = try self.gpa.dupe(u8, src_entry.name),
+                .table_name = try self.gpa.dupe(u8, src_entry.table_name),
+                .root_page = src_entry.root_page,
+                .sql = try self.gpa.dupe(u8, src_entry.sql),
+            };
+        }
+        self.cached_schema = schema.Schema{ .entries = entries };
+    }
+
+    fn dupeSchemaDeinit(self: *Connection) void {
+        const cs = self.cached_schema orelse return;
+        for (cs.entries) |entry| {
+            self.gpa.free(entry.object_type);
+            self.gpa.free(entry.name);
+            self.gpa.free(entry.table_name);
+            self.gpa.free(entry.sql);
+        }
+        self.gpa.free(cs.entries);
+    }
+
+    fn dupeTableInfo(self: *Connection, src: catalog.TableInfo) !catalog.TableInfo {
+        // Deep-copy the columns slice and all column names.
+        const columns = try self.gpa.alloc(catalog.Column, src.columns.len);
+        for (columns, src.columns) |*dst, src_col| {
+            dst.* = .{
+                .name = try self.gpa.dupe(u8, src_col.name),
+                .affinity = src_col.affinity,
+                .is_integer_primary_key = src_col.is_integer_primary_key,
+            };
+        }
+        return catalog.TableInfo{
+            .name = try self.gpa.dupe(u8, src.name),
+            .root_page = src.root_page,
+            .columns = columns,
+            .integer_primary_key_index = src.integer_primary_key_index,
+        };
+    }
+
 };
 
 fn rightmostTableLeaf(reader: page.PageReader, start_page: u32) !u32 {

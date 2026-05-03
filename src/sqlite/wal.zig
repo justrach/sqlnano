@@ -124,11 +124,20 @@ fn entryChecksum(header_bytes: []const u8, payload: []const u8) u32 {
 ///   * `.off`    — never fsync. Data may be lost on any crash.
 pub const SyncMode = enum { full, normal, off };
 
+/// Default pre-allocated write buffer size (256 KB). The buffer is
+/// re-allocated at 2x whenever it fills up, so it grows toward the
+/// steady-state write rate.
+pub const DEFAULT_BUF_SIZE: usize = 256 * 1024;
+
 pub const Wal = struct {
     file: std.Io.File,
-    write_buf: std.ArrayList(u8),
+    /// Pre-allocated write buffer. Writes bump `buf_pos`; when the
+    /// buffer is full we flush first and retry. The buffer grows
+    /// geometrically (2x) on overflow.
+    buf: []u8,
+    buf_pos: usize,
     /// Number of bytes already on disk. Advanced under `mu` whenever a
-    /// flusher claims a chunk of `write_buf`.
+    /// flusher claims the current segment.
     end_offset: u64,
     next_lsn: std.atomic.Value(u64),
     /// LSN of the last `checkpoint` record successfully written; bytes up
@@ -158,9 +167,11 @@ pub const Wal = struct {
             else => return err,
         };
         const stat = try file.stat(io);
+        const buf = try allocator.alloc(u8, DEFAULT_BUF_SIZE);
         return .{
             .file = file,
-            .write_buf = .empty,
+            .buf = buf,
+            .buf_pos = 0,
             .end_offset = stat.size,
             .next_lsn = std.atomic.Value(u64).init(1),
             .checkpoint_lsn = 0,
@@ -175,7 +186,7 @@ pub const Wal = struct {
 
     pub fn close(self: *Wal, io: std.Io) void {
         self.flushPending(io) catch {};
-        self.write_buf.deinit(self.allocator);
+        self.allocator.free(self.buf);
         self.file.close(io);
     }
 
@@ -200,7 +211,7 @@ pub const Wal = struct {
         defer self.mu.unlock(io);
         while (self.flushing) self.cond.waitUncancelable(io, &self.mu);
 
-        if (self.write_buf.items.len > 0) return error.WalHasPendingWrites;
+        if (self.buf_pos > 0) return error.WalHasPendingWrites;
         if (self.synced_lsn > self.checkpoint_lsn) return error.WalHasUncheckpointedCommits;
         if (self.end_offset == 0) return; // already empty
 
@@ -246,10 +257,28 @@ pub const Wal = struct {
         hdr.crc32 = entryChecksum(hdr_bytes, payload);
 
         self.mu.lockUncancelable(io);
-        defer self.mu.unlock(io);
-        try self.write_buf.appendSlice(self.allocator, std.mem.asBytes(&hdr));
-        try self.write_buf.appendSlice(self.allocator, payload);
-        if (pad != 0) try self.write_buf.appendNTimes(self.allocator, 0, pad);
+        const total = HEADER_SIZE + payload.len + pad;
+        // If the entry doesn't fit, flush the current buffer first.
+        if (self.buf_pos + total > self.buf.len) {
+            // flushAndUnlock releases mu during I/O and leaves it released on return.
+            try self.flushAndUnlock(io, false);
+            // Grow if the entry alone exceeds the buffer.
+            if (total > self.buf.len) {
+                const new_len = @max(self.buf.len * 2, total + 1024);
+                self.buf = try self.allocator.realloc(self.buf, new_len);
+            }
+            // Re-acquire: we need mu held for the bump write below.
+            self.mu.lockUncancelable(io);
+        }
+        @memcpy(self.buf[self.buf_pos..][0..HEADER_SIZE], std.mem.asBytes(&hdr));
+        self.buf_pos += HEADER_SIZE;
+        @memcpy(self.buf[self.buf_pos..][0..payload.len], payload);
+        self.buf_pos += payload.len;
+        if (pad != 0) {
+            @memset(self.buf[self.buf_pos..][0..pad], 0);
+            self.buf_pos += pad;
+        }
+        self.mu.unlock(io);
         return lsn;
     }
 
@@ -258,7 +287,7 @@ pub const Wal = struct {
     /// thread; transactional callers should use `commit` instead.
     pub fn flushPending(self: *Wal, io: std.Io) !void {
         self.mu.lockUncancelable(io);
-        if (self.write_buf.items.len == 0 or self.flushing) {
+        if (self.buf_pos == 0 or self.flushing) {
             self.mu.unlock(io);
             return;
         }
@@ -302,7 +331,7 @@ pub const Wal = struct {
 
         self.mu.lockUncancelable(io);
         while (self.flushing) self.cond.waitUncancelable(io, &self.mu);
-        if (self.write_buf.items.len == 0) {
+        if (self.buf_pos == 0) {
             self.mu.unlock(io);
             self.checkpoint_lsn = lsn;
             return;
@@ -320,19 +349,22 @@ pub const Wal = struct {
     /// `.full` syncs, `.normal`/`.off` skip the fsync.
     fn flushAndUnlock(self: *Wal, io: std.Io, must_sync: bool) !void {
         self.flushing = true;
-        var to_write = self.write_buf;
-        self.write_buf = .empty;
+        const len = self.buf_pos;
+        // Clone the buffer segment for the I/O (outside the lock).
+        const clone = try self.allocator.alloc(u8, len);
+        @memcpy(clone, self.buf[0..len]);
+        self.buf_pos = 0;
         const target = self.next_lsn.load(.monotonic) -| 1;
         const off = self.end_offset;
-        self.end_offset += to_write.items.len;
+        self.end_offset += len;
         const should_sync = must_sync or (self.sync_mode == .full);
         self.mu.unlock(io);
 
         var io_err: ?anyerror = null;
-        self.file.writePositionalAll(io, to_write.items, off) catch |e| {
+        self.file.writePositionalAll(io, clone, off) catch |e| {
             io_err = e;
         };
-        to_write.deinit(self.allocator);
+        self.allocator.free(clone);
         if (io_err == null and should_sync) {
             self.file.sync(io) catch |e| {
                 io_err = e;

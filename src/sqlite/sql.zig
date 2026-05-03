@@ -185,22 +185,23 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         }
     }
 
-    // --- Streaming fast path: single source, no aggregates, no
-    // ORDER BY. We can walk the table via `scanTableForEach` and
-    // apply WHERE / projection per row, skipping the full scan
-    // materialisation entirely. Only matching rows ever escape the
-    // callback and pay the dupe-into-allocator cost. ---
+    // --- Streaming fast path: single source, no ORDER BY.
+    // We can walk the table via `scanTableForEach` and apply
+    // WHERE / projection per row, skipping full scan materialisation.
     if (sources.items.len == 1 and stmt.order_by == null) {
-        var has_agg2 = false;
+        var has_agg = false;
         for (stmt.projections) |p| {
             if (p == .count_star or p == .aggregate) {
-                has_agg2 = true;
+                has_agg = true;
                 break;
             }
         }
-        if (!has_agg2) {
-            return try streamSingleTable(reader, stmt, sources.items, primary_info, allocator, ascratch);
+        if (has_agg) {
+            // Streaming aggregates: accumulate SUM/COUNT/MIN/MAX/AVG
+            // inline per row without ever materialising the full scan.
+            return try streamSingleTableAgg(reader, stmt, sources.items, primary_info, allocator, ascratch);
         }
+        return try streamSingleTable(reader, stmt, sources.items, primary_info, allocator, ascratch);
     }
 
     // --- General path: scan every source into the arena, build
@@ -216,11 +217,16 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
     var tuples: std.ArrayList([]SourcedRow) = .empty;
     try buildTuples(ascratch, sources.items, source_scans.items, stmt.joins, &tuples, ascratch);
 
-    // Apply WHERE.
+    // Apply WHERE. Compile the expression once, evaluate the flat
+    // instruction list per row — skips the recursive AST walk and
+    // two O(n) lookups (resolveColumnSource + columnIndex) per column
+    // reference per row.
     var filtered: std.ArrayList([]SourcedRow) = .empty;
     if (stmt.where_expr) |w| {
+        const compiled = try compileExpr(w, sources.items, ascratch);
         for (tuples.items) |t| {
-            if (try evalPredicate(w, sources.items, t, ascratch)) try filtered.append(ascratch, t);
+            const v = try evalCompiled(&compiled, t, ascratch);
+            if (isTruthy(v)) try filtered.append(ascratch, t);
         }
     } else {
         for (tuples.items) |t| try filtered.append(ascratch, t);
@@ -345,6 +351,7 @@ fn streamSingleTable(
     const Ctx = struct {
         sources: []const Source,
         stmt: SelectStatement,
+        compiled_where: ?CompiledExpr,
         rows_out: *std.ArrayList(ResultRow),
         allocator: std.mem.Allocator,
         ascratch: std.mem.Allocator,
@@ -352,9 +359,14 @@ fn streamSingleTable(
         limit: i64,
         stop_after: bool, // set to true once limit hit
     };
+    // Compile WHERE once so the per-row callback is a flat instruction
+    // dispatch instead of a recursive AST walk.
+    var compiled_where: ?CompiledExpr = null;
+    if (stmt.where_expr) |w| compiled_where = try compileExpr(w, sources, ascratch);
     var ctx: Ctx = .{
         .sources = sources,
         .stmt = stmt,
+        .compiled_where = compiled_where,
         .rows_out = &rows,
         .allocator = allocator,
         .ascratch = ascratch,
@@ -374,8 +386,8 @@ fn streamSingleTable(
             @memcpy(arena_values, values);
             const row_in_arena = table.Row{ .rowid = rowid, .values = arena_values };
             var tuple_buf: [1]SourcedRow = .{.{ .source_index = 0, .row = row_in_arena }};
-            if (c.stmt.where_expr) |w| {
-                if (!try evalPredicate(w, c.sources, &tuple_buf, c.ascratch)) return;
+            if (c.compiled_where) |*cw| {
+                if (!isTruthy(try evalCompiled(cw, &tuple_buf, c.ascratch))) return;
             }
             const out_values = try projectTuple(c.allocator, c.stmt.projections, c.sources, &tuple_buf, &.{}, c.ascratch);
             try c.rows_out.append(c.allocator, .{ .rowid = rowid, .values = out_values });
@@ -402,6 +414,180 @@ fn streamSingleTable(
             else => error.UnsupportedSql,
         };
     };
+
+    return .{
+        .columns = columns,
+        .table_info = try cloneTableInfo(allocator, info),
+        .rows = try rows.toOwnedSlice(allocator),
+    };
+}
+
+/// Streaming path for single-table aggregate queries (SUM, COUNT,
+/// MIN, MAX, AVG without GROUP BY). Walks the table via
+/// `scanTableForEach`, updates in-line accumulators per matching row,
+/// and produces a single result row — zero scan materialisation.
+fn streamSingleTableAgg(
+    reader: page.PageReader,
+    stmt: SelectStatement,
+    sources: []const Source,
+    info: catalog.TableInfo,
+    allocator: std.mem.Allocator,
+    ascratch: std.mem.Allocator,
+) SqlError!QueryResult {
+    const columns = try buildResultColumns(allocator, stmt.projections, sources);
+    errdefer allocator.free(columns);
+
+    // Validate: every projection must be a pure aggregate; no GROUP BY.
+    for (stmt.projections) |p| switch (p) {
+        .count_star, .aggregate => {},
+        else => return error.UnsupportedSql,
+    };
+
+    // Compile WHERE once (if present).
+    var compiled_where: ?CompiledExpr = null;
+    if (stmt.where_expr) |w| compiled_where = try compileExpr(w, sources, ascratch);
+
+    // ── accumulator state ──────────────────────────────────────────
+    const Acc = struct {
+        count: i64 = 0,
+        sum: f64 = 0,
+        sum_int: i64 = 0,
+        any_real: bool = false,
+        min_v: ?record.Value = null,
+        max_v: ?record.Value = null,
+    };
+    var accs: std.ArrayList(Acc) = .empty;
+    defer accs.deinit(ascratch);
+    {
+        var n_aggs: usize = 0;
+        for (stmt.projections) |p| {
+            if (p == .aggregate) n_aggs += 1;
+        }
+        try accs.ensureTotalCapacity(ascratch, n_aggs);
+        for (stmt.projections) |p| {
+            if (p == .aggregate) accs.appendAssumeCapacity(.{});
+        }
+    }
+
+    var total_count: i64 = 0;
+
+    // ── Pre-resolve column indices for each aggregate ───────────────
+    const ResolvedAgg = struct { col_idx: usize, ipk: bool, func: ast.AggregateFunc };
+    var resolved: std.ArrayList(ResolvedAgg) = .empty;
+    defer resolved.deinit(ascratch);
+    for (stmt.projections) |p| {
+        if (p == .aggregate) {
+            const ag = p.aggregate;
+            const ci = columnIndex(info, ag.column.name) orelse return error.ColumnNotFound;
+            const ipk = if (info.integer_primary_key_index) |ipk_idx| ci == ipk_idx else false;
+            try resolved.append(ascratch, .{ .col_idx = ci, .ipk = ipk, .func = ag.func });
+        }
+    }
+
+    // ── Per-row callback (rewritten to use pre-resolved columns) ────
+    const Ctx2 = struct {
+        accs: []Acc,
+        total_count: *i64,
+        compiled_where: ?*CompiledExpr,
+        resolved: []ResolvedAgg,
+        info: *const catalog.TableInfo,
+        ascratch: std.mem.Allocator,
+    };
+    var ctx2: Ctx2 = .{
+        .accs = accs.items,
+        .total_count = &total_count,
+        .compiled_where = if (compiled_where) |*cw| cw else null,
+        .resolved = resolved.items,
+        .info = &info,
+        .ascratch = ascratch,
+    };
+
+    const onRow2 = struct {
+        fn call(c: *Ctx2, rowid: i64, values: []const record.Value) SqlError!void {
+            // WHERE filter.
+            if (c.compiled_where) |cw| {
+                const arena_values = try c.ascratch.alloc(record.Value, values.len);
+                @memcpy(arena_values, values);
+                const row = table.Row{ .rowid = rowid, .values = arena_values };
+                var tuple_buf: [1]SourcedRow = .{.{ .source_index = 0, .row = row }};
+                if (!isTruthy(try evalCompiled(cw, &tuple_buf, c.ascratch))) return;
+            }
+            c.total_count.* += 1;
+
+            for (c.accs, 0..) |*acc, pi| {
+                const ra = c.resolved[pi];
+                var v: record.Value = if (ra.col_idx < values.len) values[ra.col_idx] else .null;
+                if (ra.ipk and v == .null) v = .{ .integer = rowid };
+                if (v == .null) continue;
+                acc.count += 1;
+                switch (ra.func) {
+                    .sum, .avg => switch (v) {
+                        .integer => |x| {
+                            if (!acc.any_real) acc.sum_int +%= x;
+                            acc.sum += @floatFromInt(x);
+                        },
+                        .real => |x| {
+                            acc.any_real = true;
+                            acc.sum += x;
+                        },
+                        else => {},
+                    },
+                    .min => {
+                        if (acc.min_v == null or compareValues(v, acc.min_v.?, .lt)) acc.min_v = v;
+                    },
+                    .max => {
+                        if (acc.max_v == null or compareValues(v, acc.max_v.?, .gt)) acc.max_v = v;
+                    },
+                    .count => {},
+                }
+            }
+        }
+    }.call;
+
+    table.scanTableForEach(reader, info.root_page, &ctx2, onRow2) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.TooManyColumns => error.TooManyColumns,
+            error.PayloadOverflowUnsupported => error.PayloadOverflowUnsupported,
+            error.CellOffsetOutOfBounds => error.CellOffsetOutOfBounds,
+            error.InvalidPageNumber => error.InvalidPageNumber,
+            error.InvalidPageType => error.InvalidPageType,
+            error.InvalidTableCell => error.InvalidTableCell,
+            error.Overflow => error.Overflow,
+            error.PageOutOfBounds => error.PageOutOfBounds,
+            error.PageTooSmall => error.PageTooSmall,
+            error.RowNotFound => error.RowNotFound,
+            error.VarintOverflow => error.VarintOverflow,
+            error.VarintTooSmall => error.VarintTooSmall,
+            else => error.UnsupportedSql,
+        };
+    };
+
+    // ── Build the single result row ────────────────────────────────
+    const values = try allocator.alloc(ResultCell, columns.len);
+    errdefer allocator.free(values);
+    var ai: usize = 0;
+    for (stmt.projections, 0..) |p, i| {
+        switch (p) {
+            .count_star => values[i] = .{ .name = columns[i].name, .value = .{ .integer = total_count } },
+            .aggregate => |ag| {
+                const acc = accs.items[ai];
+                ai += 1;
+                const out_value: record.Value = switch (ag.func) {
+                    .count => .{ .integer = acc.count },
+                    .sum => if (acc.count == 0) .null else if (acc.any_real) .{ .real = acc.sum } else .{ .integer = acc.sum_int },
+                    .avg => if (acc.count == 0) .null else .{ .real = acc.sum / @as(f64, @floatFromInt(acc.count)) },
+                    .min => acc.min_v orelse .null,
+                    .max => acc.max_v orelse .null,
+                };
+                values[i] = .{ .name = columns[i].name, .value = try dupValue(allocator, out_value) };
+            },
+            else => unreachable,
+        }
+    }
+
+    var rows: std.ArrayList(ResultRow) = .empty;
+    try rows.append(allocator, .{ .rowid = -1, .values = values });
 
     return .{
         .columns = columns,
@@ -450,6 +636,9 @@ fn buildTuples(
     while (join_i < joins.len) : (join_i += 1) {
         const src_idx = join_i + 1;
         const on_expr = joins[join_i].on;
+        // Compile ON clause once per join — each combined row then
+        // executes a flat instruction list instead of recursing the AST.
+        const compiled_on = try compileExpr(on_expr, sources, scratch);
         var next: std.ArrayList([]SourcedRow) = .empty;
         errdefer {
             for (next.items) |t| allocator.free(t);
@@ -462,8 +651,8 @@ fn buildTuples(
                 combined[partial.len] = .{ .source_index = src_idx, .row = row };
                 // Evaluate ON eagerly so non-matching pairs don't
                 // participate in downstream joins.
-                const ok = try evalPredicate(on_expr, sources, combined, scratch);
-                if (!ok) {
+                const v = try evalCompiled(&compiled_on, combined, scratch);
+                if (!isTruthy(v)) {
                     allocator.free(combined);
                     continue;
                 }
@@ -593,14 +782,14 @@ fn evalUnary(op: ast.BinOp, operand: *ast.Expr, sources: []const Source, tuple: 
         .is_null => .{ .integer = if (v == .null) 1 else 0 },
         .is_not_null => .{ .integer = if (v != .null) 1 else 0 },
         .not_ => blk: {
-            const truthy = switch (v) {
+            const tv = switch (v) {
                 .null => false,
                 .integer => |x| x != 0,
                 .real => |x| x != 0.0,
                 .text => |x| x.len != 0,
                 .blob => |x| x.len != 0,
             };
-            break :blk .{ .integer = if (!truthy) 1 else 0 };
+            break :blk .{ .integer = if (!tv) 1 else 0 };
         },
         .neg => switch (v) {
             .integer => |x| .{ .integer = -x },
@@ -728,7 +917,7 @@ fn likeMatch(text: []const u8, pat: []const u8) bool {
 }
 
 /// Evaluate an expression tree as a boolean predicate. Everything
-/// funnels through `evalExpr` and is coerced to a truthy/falsy value
+/// funnels through `evalExpr` and is coerced to a isTruthy/falsy value
 /// using SQLite-ish rules (NULL is false, 0 is false, empty string is
 /// false, anything else is true).
 fn evalPredicate(expr: *ast.Expr, sources: []const Source, tuple: []const SourcedRow, scratch: std.mem.Allocator) SqlError!bool {
@@ -795,6 +984,323 @@ fn compareValues(a: record.Value, b: record.Value, op: ast.BinOp) bool {
         };
     };
     return false;
+}
+
+// ── compiled expression VM ─────────────────────────────────────────────
+
+/// A pre-resolved column reference. `source_index` and `column_index`
+/// are pre-computed during compilation so expression evaluation is O(1)
+/// instead of scanning `sources` and `columns` per reference per row.
+const ResolvedColumn = struct {
+    source_index: u8,
+    column_index: u8,
+    /// When true, a NULL at this column returns the rowid instead
+    /// (SQLite INTEGER PRIMARY KEY behaviour).
+    ipk: bool = false,
+};
+
+const InstrOp = enum(u8) {
+    push_col,   // a = index into cols[], b = unused
+    push_null,  // stack[sp++] = .null
+    push_int,   // a = index into ints[]
+    push_text,  // a = index into texts[]
+    eq, ne, lt, le, gt, ge, // binary compare — pops 2, pushes int(0/1)
+    add, sub, mul, div, mod, // binary arith
+    concat,     // string concat
+    like, not_like,
+    and_, or_,  // logical — short-circuit NOT applied (pre-evaluated both sides)
+    not_,       // unary logical not
+    is_null, is_not_null,
+    neg,        // unary arithmetic negation
+};
+
+const Instr = struct {
+    op: InstrOp,
+    a: u16, // meaning depends on op
+    b: u16, // meaning depends on op
+};
+
+/// A "compiled" expression: a flat instruction list + literal storage,
+/// produced once per query and evaluated per row with zero tree-walking.
+pub const CompiledExpr = struct {
+    instrs: []Instr,
+    ints: []i64,
+    texts: [][]const u8,   // borrowed from arena
+    cols: []ResolvedColumn,
+
+    pub fn deinit(self: *CompiledExpr, alloc: std.mem.Allocator) void {
+        alloc.free(self.instrs);
+        alloc.free(self.ints);
+        alloc.free(self.texts);
+        alloc.free(self.cols);
+    }
+};
+
+/// Walk an AST expression and produce a flat instruction list.
+/// `sources` must stay alive for the lifetime of the returned `CompiledExpr`
+/// — text literals point into the arena, column refs are pre-resolved.
+pub fn compileExpr(expr: *ast.Expr, sources: []const Source, arena: std.mem.Allocator) SqlError!CompiledExpr {
+    var c = CompileCtx{ .arena = arena, .sources = sources };
+    _ = try c.compileNode(expr);
+    return CompiledExpr{
+        .instrs = try c.instrs.toOwnedSlice(arena),
+        .ints = try c.ints.toOwnedSlice(arena),
+        .texts = try c.texts.toOwnedSlice(arena),
+        .cols = try c.cols.toOwnedSlice(arena),
+    };
+}
+
+const CompileCtx = struct {
+    arena: std.mem.Allocator,
+    sources: []const Source,
+    instrs: std.ArrayList(Instr) = .empty,
+    ints: std.ArrayList(i64) = .empty,
+    texts: std.ArrayList([]const u8) = .empty,
+    cols: std.ArrayList(ResolvedColumn) = .empty,
+
+    fn addInstr(c: *CompileCtx, op: InstrOp, a: u16, b: u16) !void {
+        try c.instrs.append(c.arena, .{ .op = op, .a = a, .b = b });
+    }
+
+    fn pushInt(c: *CompileCtx, v: i64) !void {
+        const idx: u16 = @intCast(c.ints.items.len);
+        try c.ints.append(c.arena, v);
+        try c.addInstr(.push_int, idx, 0);
+    }
+
+    fn pushText(c: *CompileCtx, v: []const u8) !void {
+        const idx: u16 = @intCast(c.texts.items.len);
+        try c.texts.append(c.arena, v);
+        try c.addInstr(.push_text, idx, 0);
+    }
+
+    fn pushCol(c: *CompileCtx, col: ResolvedColumn) !void {
+        const idx: u16 = @intCast(c.cols.items.len);
+        try c.cols.append(c.arena, col);
+        try c.addInstr(.push_col, idx, 0);
+    }
+
+    fn compileNode(c: *CompileCtx, expr: *ast.Expr) SqlError!void {
+        switch (expr.*) {
+            .literal => |lit| switch (lit) {
+                .null => try c.addInstr(.push_null, 0, 0),
+                .integer => |v| try c.pushInt(v),
+                .text => |v| try c.pushText(v),
+            },
+            .column => |col| {
+                const src = try resolveColumnSource(c.sources, col);
+                const info = c.sources[src].info;
+                const ci = columnIndex(info, col.name) orelse return error.ColumnNotFound;
+                const ipk = if (info.integer_primary_key_index) |ipk_idx| ci == ipk_idx else false;
+                try c.pushCol(.{ .source_index = @intCast(src), .column_index = @intCast(ci), .ipk = ipk });
+            },
+            .binary => |bin| {
+                // Short-circuit AND/OR: compile both sides, emit logical op.
+                // (At eval time, AND/OR assume both operands are already
+                // isTruthy ints on the stack.)
+                if (bin.op == .and_ or bin.op == .or_) {
+                    try c.compileNode(bin.lhs);
+                    try c.compileNode(bin.rhs);
+                    try c.addInstr(if (bin.op == .and_) .and_ else .or_, 0, 0);
+                    return;
+                }
+                // IS NULL / IS NOT NULL
+                if (bin.op == .is_null) {
+                    try c.compileNode(bin.lhs);
+                    try c.addInstr(.is_null, 0, 0);
+                    return;
+                }
+                if (bin.op == .is_not_null) {
+                    try c.compileNode(bin.lhs);
+                    try c.addInstr(.is_not_null, 0, 0);
+                    return;
+                }
+                try c.compileNode(bin.lhs);
+                try c.compileNode(bin.rhs);
+                try c.addInstr(binOpToInstr(bin.op), 0, 0);
+            },
+            .unary => |u| {
+                try c.compileNode(u.operand);
+                try c.addInstr(switch (u.op) {
+                    .not_ => .not_,
+                    .neg => .neg,
+                    else => return error.UnsupportedSql,
+                }, 0, 0);
+            },
+            .in_list => |il| {
+                // Compile to a sequence: push value, push each item, compare.
+                // The VM evaluates this as a chain of eq checks followed by
+                // logical ORs.
+                try c.compileNode(il.value);
+                for (il.items) |it| {
+                    try c.compileNode(il.value); // re-evaluate anchor
+                    try c.compileNode(it);
+                    try c.addInstr(.eq, 0, 0);
+                    try c.addInstr(.or_, 0, 0);
+                }
+                if (il.negated) try c.addInstr(.not_, 0, 0);
+            },
+            .between => |bt| {
+                // Compile: (value >= low) AND (value <= high)
+                try c.compileNode(bt.value);
+                try c.compileNode(bt.low);
+                try c.addInstr(.ge, 0, 0);
+                try c.compileNode(bt.value);
+                try c.compileNode(bt.high);
+                try c.addInstr(.le, 0, 0);
+                try c.addInstr(.and_, 0, 0);
+                if (bt.negated) try c.addInstr(.not_, 0, 0);
+            },
+        }
+    }
+};
+
+fn binOpToInstr(op: ast.BinOp) InstrOp {
+    return switch (op) {
+        .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
+        .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod,
+        .concat => .concat,
+        .like => .like, .not_like => .not_like,
+        else => unreachable,
+    };
+}
+
+/// Search `tuple` for the row from `source_index`.
+fn getRowForSource(tuple: []const SourcedRow, source_index: u8) ?table.Row {
+    for (tuple) |sr| if (sr.source_index == source_index) return sr.row;
+    return null;
+}
+
+/// Evaluate a pre-compiled expression against one row tuple (one SourcedRow
+/// per source). Returns a `record.Value` — for predicates, callers then
+/// coerce to isTruthy/falsy. Uses a fixed 16-slot stack (covers nearly every
+/// real-world WHERE clause) with arena fallback for pathological cases.
+pub fn evalCompiled(compiled: *const CompiledExpr, tuple: []const SourcedRow, scratch: std.mem.Allocator) SqlError!record.Value {
+    var stack_buf: [16]record.Value = undefined;
+    var sp: usize = 0;
+    // Fallback for expressions that need >16 stack slots.
+    const fallback: []record.Value = if (compiled.instrs.len > 50)
+        try scratch.alloc(record.Value, compiled.instrs.len)
+    else
+        &.{};
+    defer if (fallback.len > 0) scratch.free(fallback);
+
+    const stack: []record.Value = if (fallback.len > 0) fallback else stack_buf[0..];
+
+    for (compiled.instrs) |instr| {
+        switch (instr.op) {
+            .push_null => vmPush(stack, &sp, .null),
+            .push_int => vmPush(stack, &sp, .{ .integer = compiled.ints[instr.a] }),
+            .push_text => vmPush(stack, &sp, .{ .text = compiled.texts[instr.a] }),
+            .push_col => {
+                const rc = compiled.cols[instr.a];
+                const row = getRowForSource(tuple, rc.source_index) orelse {
+                    vmPush(stack, &sp, .null);
+                    continue;
+                };
+                if (rc.ipk) {
+                    vmPush(stack, &sp, .{ .integer = row.rowid });
+                    continue;
+                }
+                const v: record.Value = if (rc.column_index < row.values.len)
+                    row.values[rc.column_index]
+                else
+                    .null;
+                vmPush(stack, &sp, v);
+            },
+            .eq, .ne, .lt, .le, .gt, .ge => {
+                sp -= 2;
+                const a = stack[sp];
+                const b = stack[sp + 1];
+                stack[sp] = switch (instr.op) {
+                    .eq => intVal(compareValues(a, b, .eq)),
+                    .ne => intVal(compareValues(a, b, .ne)),
+                    .lt => intVal(compareValues(a, b, .lt)),
+                    .le => intVal(compareValues(a, b, .le)),
+                    .gt => intVal(compareValues(a, b, .gt)),
+                    .ge => intVal(compareValues(a, b, .ge)),
+                    else => unreachable,
+                };
+                sp += 1;
+            },
+            .add, .sub, .mul, .div, .mod => {
+                sp -= 2;
+                stack[sp] = evalArith(stack[sp], stack[sp + 1], arithInstrToBinOp(instr.op)) catch .null;
+                sp += 1;
+            },
+            .concat => {
+                sp -= 2;
+                stack[sp] = evalConcat(stack[sp], stack[sp + 1], scratch) catch .null;
+                sp += 1;
+            },
+            .like => {
+                sp -= 2;
+                stack[sp] = intVal(evalLike(stack[sp], stack[sp + 1]));
+                sp += 1;
+            },
+            .not_like => {
+                sp -= 2;
+                stack[sp] = intVal(!evalLike(stack[sp], stack[sp + 1]));
+                sp += 1;
+            },
+            .and_ => {
+                sp -= 2;
+                const l = isTruthy(stack[sp]);
+                const r = isTruthy(stack[sp + 1]);
+                stack[sp] = intVal(l and r);
+                sp += 1;
+            },
+            .or_ => {
+                sp -= 2;
+                const l = isTruthy(stack[sp]);
+                const r = isTruthy(stack[sp + 1]);
+                stack[sp] = intVal(l or r);
+                sp += 1;
+            },
+            .not_ => {
+                const t = !isTruthy(stack[sp - 1]);
+                stack[sp - 1] = intVal(t);
+            },
+            .is_null => {
+                stack[sp - 1] = intVal(stack[sp - 1] == .null);
+            },
+            .is_not_null => {
+                stack[sp - 1] = intVal(stack[sp - 1] != .null);
+            },
+            .neg => {
+                switch (stack[sp - 1]) {
+                    .integer => |x| stack[sp - 1] = .{ .integer = -x },
+                    .real => |x| stack[sp - 1] = .{ .real = -x },
+                    else => stack[sp - 1] = .null,
+                }
+            },
+        }
+    }
+    return if (sp > 0) stack[sp - 1] else .null;
+}
+
+fn arithInstrToBinOp(op: InstrOp) ast.BinOp {
+    return switch (op) { .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod, else => unreachable };
+}
+
+inline fn vmPush(buf: []record.Value, sp: *usize, v: record.Value) void {
+    const s = sp.*;
+    if (s < buf.len) buf[s] = v else @panic("stack overflow");
+    sp.* = s + 1;
+}
+
+inline fn intVal(b: bool) record.Value {
+    return .{ .integer = if (b) 1 else 0 };
+}
+
+inline fn isTruthy(v: record.Value) bool {
+    return switch (v) {
+        .null => false,
+        .integer => |x| x != 0,
+        .real => |x| x != 0.0,
+        .text => |x| x.len != 0,
+        .blob => |x| x.len != 0,
+    };
 }
 
 fn sortTuples(tuples: [][]SourcedRow, src_idx: usize, col_idx: usize, descending: bool, sources: []const Source) void {

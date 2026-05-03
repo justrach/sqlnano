@@ -60,9 +60,40 @@ pub fn parseInline(bytes: []const u8, out: *InlineRecord) RecordError!void {
         if (n >= MAX_INLINE_VALUES) return error.TooManyColumns;
         const serial = try parseVarint(bytes[header_pos..header_size]);
         header_pos += serial.len;
-        const decoded = try decodeValue(serial.value, bytes[body_pos..]);
-        out.values[n] = decoded.value;
-        body_pos += decoded.len;
+        // Inline decode — avoid per-column function call + switch dispatch.
+        // Common case (serial 0-9) has no body bytes; text/blob compute
+        // len from serial type formula inline.
+        const v, const advance: usize = switch (serial.value) {
+            0 => .{ Value.null, 0 },
+            1 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 1) }, 1 },
+            2 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 2) }, 2 },
+            3 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 3) }, 3 },
+            4 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 4) }, 4 },
+            5 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 6) }, 6 },
+            6 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 8) }, 8 },
+            7 => blk: {
+                if (bytes.len - body_pos < 8) return error.ValueOutOfBounds;
+                const raw = std.mem.readInt(u64, bytes[body_pos..][0..8], .big);
+                break :blk .{ Value{ .real = @bitCast(raw) }, 8 };
+            },
+            8  => .{ Value{ .integer = 0 }, 0 },
+            9  => .{ Value{ .integer = 1 }, 0 },
+            10, 11 => return error.InvalidSerialType,
+            else => blk: {
+                const len: usize = if (serial.value % 2 == 0)
+                    @intCast((serial.value - 12) / 2)
+                else
+                    @intCast((serial.value - 13) / 2);
+                if (bytes.len - body_pos < len) return error.ValueOutOfBounds;
+                if (serial.value % 2 == 0) {
+                    break :blk .{ Value{ .blob = bytes[body_pos..][0..len] }, len };
+                } else {
+                    break :blk .{ Value{ .text = bytes[body_pos..][0..len] }, len };
+                }
+            },
+        };
+        out.values[n] = v;
+        body_pos += advance;
         n += 1;
     }
     if (header_pos != header_size) return error.InvalidHeaderSize;
