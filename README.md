@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="sqlnano logo" width="600">
+</p>
+
 # sqlnano
 
 A tiny embeddable SQL engine with a SQLite `.db` compatibility track. Written in Zig.
