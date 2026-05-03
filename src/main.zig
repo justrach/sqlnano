@@ -330,6 +330,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  sqlnano exec <database.db> "CREATE TABLE t(...)"  Create a simple rowid table
         \\  sqlnano exec <database.db> "CREATE INDEX idx ON t(col)"  Create a simple single-column index
         \\  sqlnano exec <database.db> "ALTER TABLE t RENAME TO u"  Rename a simple rowid table
+        \\  sqlnano exec <database.db> "ALTER TABLE t ADD COLUMN c TEXT"  Add a nullable column
         \\  sqlnano exec <database.db> "DROP TABLE t"  Drop a simple tail-allocated rowid table
         \\  sqlnano exec <database.db> "INSERT INTO t VALUES (...)"  Append a simple row
         \\  sqlnano bench-read <database.db> "SELECT * FROM t WHERE rowid = 1" <N>  Benchmark hot read path
@@ -924,8 +925,11 @@ fn execSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, sql
             }
         },
         .alter_table => |alter| {
-            try sqlnano.sqlite.write_mod.alterTableRenameSimple(init.gpa, init.io, path, alter);
-            try writer.print("renamed table: {s} -> {s}\n", .{ alter.table_name, alter.new_table_name });
+            try sqlnano.sqlite.write_mod.alterTableSimple(init.gpa, init.io, path, alter);
+            switch (alter.kind) {
+                .rename_table => try writer.print("renamed table: {s} -> {s}\n", .{ alter.table_name, alter.new_table_name.? }),
+                .add_column => try writer.print("added column to table: {s}\n", .{alter.table_name}),
+            }
         },
         .drop_table => |drop| {
             const dropped = try sqlnano.sqlite.write_mod.dropTableSimple(init.gpa, init.io, path, drop);

@@ -634,13 +634,30 @@ pub const Parser = struct {
     }
 
     pub fn parseAlterTable(self: *Parser) ParseError!ast.AlterTableStatement {
+        const source = self.stream.tokenizer.input;
         try self.expectKeyword(.alter, error.UnsupportedCreate);
         try self.expectKeyword(.table, error.UnsupportedCreate);
         const table_name = try self.identifier(error.UnsupportedCreate);
-        try self.expectKeyword(.rename, error.UnsupportedCreate);
-        try self.expectKeyword(.to, error.UnsupportedCreate);
-        const new_table_name = try self.identifier(error.UnsupportedCreate);
-        return .{ .table_name = table_name, .new_table_name = new_table_name };
+        if (try self.consumeKeyword(.rename)) {
+            try self.expectKeyword(.to, error.UnsupportedCreate);
+            const new_table_name = try self.identifier(error.UnsupportedCreate);
+            return .{ .table_name = table_name, .kind = .rename_table, .new_table_name = new_table_name };
+        }
+        if (try self.consumeKeyword(.add)) {
+            _ = try self.consumeKeyword(.column);
+            const column_start = self.stream.current.start;
+            if (self.stream.current.kind == .eof or self.stream.current.kind == .semicolon) return error.UnsupportedCreate;
+            while (self.stream.current.kind != .eof and self.stream.current.kind != .semicolon) {
+                self.stream.advance() catch return error.InvalidSql;
+            }
+            const column_end = self.stream.current.start;
+            return .{
+                .table_name = table_name,
+                .kind = .add_column,
+                .column_sql = std.mem.trim(u8, source[column_start..column_end], " \t\r\n"),
+            };
+        }
+        return error.UnsupportedCreate;
     }
 
     pub fn parseDropTable(self: *Parser) ParseError!ast.DropTableStatement {
@@ -900,12 +917,20 @@ test "parse alter and drop table dispatch" {
     const alter = try parseStatement("ALTER TABLE users RENAME TO people;", std.testing.allocator);
     defer alter.deinit(std.testing.allocator);
     try std.testing.expect(alter == .alter_table);
+    try std.testing.expect(alter.alter_table.kind == .rename_table);
     try std.testing.expectEqualStrings("users", alter.alter_table.table_name);
-    try std.testing.expectEqualStrings("people", alter.alter_table.new_table_name);
+    try std.testing.expectEqualStrings("people", alter.alter_table.new_table_name.?);
 
     const drop = try parseStatement("DROP TABLE IF EXISTS people;", std.testing.allocator);
     defer drop.deinit(std.testing.allocator);
     try std.testing.expect(drop == .drop_table);
     try std.testing.expect(drop.drop_table.if_exists);
     try std.testing.expectEqualStrings("people", drop.drop_table.table_name);
+
+    const add = try parseStatement("ALTER TABLE people ADD COLUMN email TEXT;", std.testing.allocator);
+    defer add.deinit(std.testing.allocator);
+    try std.testing.expect(add == .alter_table);
+    try std.testing.expect(add.alter_table.kind == .add_column);
+    try std.testing.expectEqualStrings("people", add.alter_table.table_name);
+    try std.testing.expectEqualStrings("email TEXT", add.alter_table.column_sql.?);
 }

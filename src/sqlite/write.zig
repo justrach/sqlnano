@@ -1113,19 +1113,25 @@ pub const Connection = struct {
         return true;
     }
 
-    pub fn alterTableRename(self: *Connection, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
+    pub fn alterTable(self: *Connection, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
         if (self.in_batch) return error.DdlInBatchUnsupported;
-        if (isReservedSchemaName(stmt.new_table_name)) return error.ReservedSchemaName;
+        if (stmt.kind == .rename_table) {
+            const new_table_name = stmt.new_table_name orelse return error.UnsupportedAlterTable;
+            if (isReservedSchemaName(new_table_name)) return error.ReservedSchemaName;
+        }
 
         _ = self.scratch_arena.reset(.retain_capacity);
         const scratch = self.scratch_arena.allocator();
-        try self.alterTableRenameInExistingDatabase(scratch, stmt);
+        switch (stmt.kind) {
+            .rename_table => try self.alterTableRenameInExistingDatabase(scratch, stmt),
+            .add_column => try self.alterTableAddColumnInExistingDatabase(scratch, stmt),
+        }
 
         self.image_dirty = true;
         self.full_rewrite = true;
         self.invalidateSchemaCache();
         self.invalidateRowidCache(stmt.table_name);
-        self.invalidateRowidCache(stmt.new_table_name);
+        if (stmt.new_table_name) |name| self.invalidateRowidCache(name);
         try self.flush();
     }
 
@@ -1138,26 +1144,61 @@ pub const Connection = struct {
         const db_schema = try schema.readSchema(reader, self.gpa);
         defer db_schema.deinit(self.gpa);
         const table_entry = findTableIgnoreCase(db_schema, stmt.table_name) orelse return error.TableNotFound;
-        if (schemaObjectNameExists(db_schema, stmt.new_table_name)) return error.SchemaObjectAlreadyExists;
+        const new_table_name = stmt.new_table_name orelse return error.UnsupportedAlterTable;
+        if (schemaObjectNameExists(db_schema, new_table_name)) return error.SchemaObjectAlreadyExists;
 
         const schema_ref = try reader.page(1);
         const schema_header = try btree.PageHeader.parse(schema_ref);
         if (schema_header.page_type != .table_leaf) return error.UnsupportedSchemaBTree;
 
-        const renamed_table_sql = try renameCreateTableSql(scratch, table_entry.sql, stmt.new_table_name);
+        const renamed_table_sql = try renameCreateTableSql(scratch, table_entry.sql, new_table_name);
         const entries = try scratch.alloc(schema.SchemaEntry, db_schema.entries.len);
         for (db_schema.entries, 0..) |entry, i| {
             entries[i] = entry;
             if (entry.rowid == table_entry.rowid) {
-                entries[i].name = stmt.new_table_name;
-                entries[i].table_name = stmt.new_table_name;
+                entries[i].name = new_table_name;
+                entries[i].table_name = new_table_name;
                 entries[i].sql = renamed_table_sql;
             } else if (std.ascii.eqlIgnoreCase(entry.table_name, table_entry.name)) {
-                entries[i].table_name = stmt.new_table_name;
+                entries[i].table_name = new_table_name;
                 if (entry.isIndex() and entry.sql.len != 0) {
-                    entries[i].sql = try renameCreateIndexSql(scratch, entry.sql, entry.name, stmt.new_table_name);
+                    entries[i].sql = try renameCreateIndexSql(scratch, entry.sql, entry.name, new_table_name);
                 }
             }
+        }
+
+        const file_pages = pageCountForLength(self.image.items.len, reader.db_header.page_size);
+        const effective_page_count: u32 = @max(reader.db_header.database_page_count, file_pages);
+        try rewriteSchemaLeafPage(scratch, self.image.items, reader.db_header, entries);
+        bumpHeaderForDdl(self.image.items, reader.db_header, effective_page_count);
+    }
+
+    fn alterTableAddColumnInExistingDatabase(self: *Connection, scratch: Allocator, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
+        if (self.image.items.len == 0) return error.TableNotFound;
+
+        const column_sql = stmt.column_sql orelse return error.UnsupportedAlterTable;
+        const add_info = try validateAddColumnDefinition(scratch, column_sql);
+
+        const reader = try page.PageReader.init(self.image.items);
+        if (reader.db_header.isWal()) return error.WalModeUnsupported;
+
+        const db_schema = try schema.readSchema(reader, self.gpa);
+        defer db_schema.deinit(self.gpa);
+        const table_entry = findTableIgnoreCase(db_schema, stmt.table_name) orelse return error.TableNotFound;
+
+        var info = try catalog.tableInfo(table_entry, scratch);
+        defer info.deinit(scratch);
+        if (columnIndex(info, add_info.name) != null) return error.ColumnAlreadyExists;
+
+        const schema_ref = try reader.page(1);
+        const schema_header = try btree.PageHeader.parse(schema_ref);
+        if (schema_header.page_type != .table_leaf) return error.UnsupportedSchemaBTree;
+
+        const new_table_sql = try appendColumnToCreateTableSql(scratch, table_entry.sql, column_sql);
+        const entries = try scratch.alloc(schema.SchemaEntry, db_schema.entries.len);
+        for (db_schema.entries, 0..) |entry, i| {
+            entries[i] = entry;
+            if (entry.rowid == table_entry.rowid) entries[i].sql = new_table_sql;
         }
 
         const file_pages = pageCountForLength(self.image.items.len, reader.db_header.page_size);
@@ -1639,6 +1680,49 @@ fn rewriteSchemaLeafPage(
     try rewriteLeafPage(mutable, db_header, 1, .table_leaf, cells.items);
 }
 
+fn validateAddColumnDefinition(allocator: Allocator, column_sql: []const u8) WriteError!catalog.Column {
+    if (column_sql.len == 0) return error.InvalidCreateTableSql;
+    if (containsForbiddenAddColumnClause(column_sql)) return error.UnsupportedAlterTable;
+    const fake_sql = try std.fmt.allocPrint(allocator, "CREATE TABLE __sqlnano_add_column({s})", .{column_sql});
+    const fake_entry = schema.SchemaEntry{
+        .rowid = 1,
+        .object_type = "table",
+        .name = "__sqlnano_add_column",
+        .table_name = "__sqlnano_add_column",
+        .root_page = 2,
+        .sql = fake_sql,
+    };
+    var info = try catalog.tableInfo(fake_entry, allocator);
+    defer info.deinit(allocator);
+    if (info.columns.len != 1) return error.InvalidCreateTableSql;
+    if (info.columns[0].is_integer_primary_key) return error.UnsupportedAlterTable;
+    return info.columns[0];
+}
+
+fn containsForbiddenAddColumnClause(column_sql: []const u8) bool {
+    const forbidden = [_][]const u8{ "PRIMARY", "UNIQUE", "DEFAULT", "NOT", "CHECK", "REFERENCES", "GENERATED" };
+    for (forbidden) |keyword| {
+        if (containsSqlKeyword(column_sql, keyword)) return true;
+    }
+    return false;
+}
+
+fn containsSqlKeyword(sql: []const u8, keyword: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < sql.len) : (pos += 1) {
+        const before_ok = pos == 0 or !(std.ascii.isAlphanumeric(sql[pos - 1]) or sql[pos - 1] == '_');
+        if (before_ok and startsWithKeyword(sql[pos..], keyword)) return true;
+    }
+    return false;
+}
+
+fn appendColumnToCreateTableSql(allocator: Allocator, sql: []const u8, column_sql: []const u8) WriteError![]u8 {
+    const open = std.mem.indexOfScalar(u8, sql, '(') orelse return error.InvalidCreateTableSql;
+    const close = findMatchingParen(sql, open) orelse return error.InvalidCreateTableSql;
+    const before = std.mem.trim(u8, sql[0..close], " \t\r\n");
+    return std.fmt.allocPrint(allocator, "{s}, {s}{s}", .{ before, std.mem.trim(u8, column_sql, " \t\r\n"), sql[close..] });
+}
+
 fn renameCreateTableSql(allocator: Allocator, sql: []const u8, new_table_name: []const u8) WriteError![]u8 {
     const open = std.mem.indexOfScalar(u8, sql, '(') orelse return error.InvalidCreateTableSql;
     const close = findMatchingParen(sql, open) orelse return error.InvalidCreateTableSql;
@@ -1859,10 +1943,10 @@ pub fn createIndexSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import
     return conn.createIndex(stmt);
 }
 
-pub fn alterTableRenameSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
+pub fn alterTableSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").AlterTableStatement) WriteError!void {
     var conn = try Connection.open(gpa, io, path);
     defer conn.close();
-    return conn.alterTableRename(stmt);
+    return conn.alterTable(stmt);
 }
 
 pub fn dropTableSimple(gpa: Allocator, io: Io, path: []const u8, stmt: @import("ast.zig").DropTableStatement) WriteError!bool {
@@ -3348,14 +3432,25 @@ test "createTableSimple creates a readable db and accepts inserts" {
     const note_rowid = try insertSimple(testing.allocator, testing.io, db_path, "notes", &note_vals);
     try testing.expectEqual(@as(i64, 1), note_rowid);
 
-    try alterTableRenameSimple(testing.allocator, testing.io, db_path, .{
+    try alterTableSimple(testing.allocator, testing.io, db_path, .{
         .table_name = "users",
+        .kind = .rename_table,
         .new_table_name = "people",
     });
 
     const charlie_vals = [_]InsertValue{ .null, .{ .text = "charlie" }, .{ .integer = 50 } };
     const charlie_rowid = try insertSimple(testing.allocator, testing.io, db_path, "people", &charlie_vals);
     try testing.expectEqual(@as(i64, 3), charlie_rowid);
+
+    try alterTableSimple(testing.allocator, testing.io, db_path, .{
+        .table_name = "people",
+        .kind = .add_column,
+        .column_sql = "email TEXT",
+    });
+
+    const dora_vals = [_]InsertValue{ .null, .{ .text = "dora" }, .{ .integer = 60 }, .{ .text = "dora@example.test" } };
+    const dora_rowid = try insertSimple(testing.allocator, testing.io, db_path, "people", &dora_vals);
+    try testing.expectEqual(@as(i64, 4), dora_rowid);
 
     const scratch_created = try createTableSimple(testing.allocator, testing.io, db_path, .{
         .table_name = "scratch",
@@ -3379,7 +3474,7 @@ test "createTableSimple creates a readable db and accepts inserts" {
     try testing.expect(db_schema.findTable("scratch") == null);
     const entry = db_schema.findTable("people") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 2), entry.root_page);
-    try testing.expectEqualStrings("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", entry.sql);
+    try testing.expectEqualStrings("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, age INTEGER, email TEXT)", entry.sql);
     const notes_entry = db_schema.findTable("notes") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 3), notes_entry.root_page);
     const index_entry = db_schema.findIndex("idx_users_name") orelse return error.TestUnexpectedResult;
@@ -3389,25 +3484,35 @@ test "createTableSimple creates a readable db and accepts inserts" {
 
     var info = try catalog.tableInfo(entry, testing.allocator);
     defer info.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), info.columns.len);
+    try testing.expectEqualStrings("email", info.columns[3].name);
     const scanned = try table.scanTable(reader, info.root_page, testing.allocator);
     defer scanned.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 3), scanned.rows.len);
+    try testing.expectEqual(@as(usize, 4), scanned.rows.len);
     try testing.expectEqualStrings("alice", scanned.rows[0].values[1].text);
     try testing.expectEqual(@as(i64, 30), scanned.rows[0].values[2].integer);
+    const alice_projected = try catalog.projectRow(info, scanned.rows[0], testing.allocator);
+    defer alice_projected.deinit(testing.allocator);
+    try testing.expect(alice_projected.values[3].value == .null);
     try testing.expectEqualStrings("bob", scanned.rows[1].values[1].text);
     try testing.expectEqual(@as(i64, 40), scanned.rows[1].values[2].integer);
     try testing.expectEqualStrings("charlie", scanned.rows[2].values[1].text);
     try testing.expectEqual(@as(i64, 50), scanned.rows[2].values[2].integer);
+    try testing.expectEqualStrings("dora", scanned.rows[3].values[1].text);
+    try testing.expectEqual(@as(i64, 60), scanned.rows[3].values[2].integer);
+    try testing.expectEqualStrings("dora@example.test", scanned.rows[3].values[3].text);
 
     const idx = try @import("index.zig").scanIndex(reader, @intCast(index_entry.root_page), testing.allocator);
     defer idx.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 3), idx.entries.len);
+    try testing.expectEqual(@as(usize, 4), idx.entries.len);
     try testing.expectEqualStrings("alice", idx.entries[0].values[0].text);
     try testing.expectEqual(@as(?i64, 1), idx.entries[0].rowid());
     try testing.expectEqualStrings("bob", idx.entries[1].values[0].text);
     try testing.expectEqual(@as(?i64, 2), idx.entries[1].rowid());
     try testing.expectEqualStrings("charlie", idx.entries[2].values[0].text);
     try testing.expectEqual(@as(?i64, 3), idx.entries[2].rowid());
+    try testing.expectEqualStrings("dora", idx.entries[3].values[0].text);
+    try testing.expectEqual(@as(?i64, 4), idx.entries[3].rowid());
 
     var notes_info = try catalog.tableInfo(notes_entry, testing.allocator);
     defer notes_info.deinit(testing.allocator);

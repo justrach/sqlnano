@@ -33,7 +33,7 @@ SQLite is legendary and powers an enormous amount of software. sqlnano makes dif
 | **File format**          | Native SQLite `.db`                       | Native SQLite `.db` (writes a compatible image)   |
 | **Binary size**          | 1.5 MB shared library                     | ~900 KB static Zig binary                         |
 | **Runtime deps**         | libc, optional ICU/readline               | libc only; optional rich-FTS fallback shells to `sqlite3` |
-| **SQL surface**          | Full SQL with extensions                  | Tiny subset (`CREATE`/`ALTER RENAME`/`DROP`/`SELECT`/`INSERT`/`UPDATE`/`DELETE`) |
+| **SQL surface**          | Full SQL with extensions                  | Tiny subset (`CREATE`/`ALTER RENAME`/`ALTER ADD COLUMN`/`DROP`/`SELECT`/`INSERT`/`UPDATE`/`DELETE`) |
 | **Multi-leaf indexes**   | ✅                                         | ❌ (helpers exist; dispatch is broken, see parity) |
 | **Transactions**         | ✅ `BEGIN`/`COMMIT`/`ROLLBACK`              | ❌ autocommit only                                 |
 | **Triggers, FKs, views** | ✅                                         | ❌                                                 |
@@ -116,6 +116,7 @@ sqlnano exec    path.db "CREATE TABLE u(id INTEGER PRIMARY KEY, name TEXT, age I
 sqlnano exec    path.db "INSERT INTO u VALUES (NULL, 'alice', 30)"
 sqlnano exec    path.db "CREATE INDEX idx_u_name ON u(name)"
 sqlnano exec    path.db "ALTER TABLE u RENAME TO people"
+sqlnano exec    path.db "ALTER TABLE people ADD COLUMN email TEXT"
 sqlnano exec    path.db "DROP TABLE people"
 sqlnano parity                                      # live compatibility matrix
 ```
@@ -256,7 +257,7 @@ zig build test -Doptimize=ReleaseFast
 ```
 
 76 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
-table/index creation, table rename/drop, table multi-leaf split verified by
+table/index creation, table rename/add-column/drop, table multi-leaf split verified by
 `PRAGMA integrity_check`, end-to-end INSERT/UPDATE/DELETE through `Connection`.
 
 `sqlite3` on `PATH` is required for the fixture-building integration tests; they
@@ -272,18 +273,18 @@ client for the same ecosystem — not a fork.
 - **Read SQLite `.db` files** — header/page validation, `sqlite_schema`, table b-tree scans (rowid + interior), single-column non-unique indexes, payload overflow
 - **Create simple rowid tables** — `CREATE TABLE t(...)` and `CREATE TABLE IF NOT EXISTS t(...)` on empty or small rollback-journal DBs whose `sqlite_schema` root is still a leaf page
 - **Create simple indexes** — non-unique, single-column `CREATE INDEX idx ON t(col)` when the resulting index fits in one leaf page; later INSERT/UPDATE/DELETE rebuilds keep that index in sync
-- **Rename/drop simple tables** — `ALTER TABLE old RENAME TO new` rewrites `sqlite_schema` for the table and its simple indexes; `DROP TABLE t` works when all dropped table/index pages are a tail suffix that can be safely truncated without freelist support
+- **Alter/drop simple tables** — `ALTER TABLE old RENAME TO new` rewrites `sqlite_schema` for the table and its simple indexes; `ALTER TABLE t ADD [COLUMN] c TYPE` adds nullable tail columns by updating `sqlite_schema`; `DROP TABLE t` works when all dropped table/index pages are a tail suffix that can be safely truncated without freelist support
 - **Write rowid tables** — INSERT/UPDATE/DELETE on tables with `id INTEGER PRIMARY KEY`
 - **Multi-page tables** — interior root + multi-leaf splits verified by `PRAGMA integrity_check`
 - **Native WAL** — group commit, crash recovery, fuzz-tested torn-WAL handling
 - **Configurable durability** — `synchronous=full/normal/off`
-- **Tiny SQL surface** — `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE ... RENAME TO`, tail-safe `DROP TABLE`, `SELECT ... WHERE col = literal`, `INSERT INTO t VALUES (...)`, `UPDATE`/`DELETE` with single-equality `WHERE`
+- **Tiny SQL surface** — `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE ... RENAME TO`, `ALTER TABLE ... ADD COLUMN`, tail-safe `DROP TABLE`, `SELECT ... WHERE col = literal`, `INSERT INTO t VALUES (...)`, `UPDATE`/`DELETE` with single-equality `WHERE`
 - **Prioritized FTS5 reads** — native shadow-table BM25 for compact bare-token and implicit-AND bareword MATCH queries, optional column weights, JSON hydration by content rowid, and simple pre-ranking filters. Rich MATCH syntax/snippets are correctness-first through the optional SQLite CLI fallback.
 
 ### What doesn't work (yet)
 
 - **Multi-leaf indexes** — the split helpers exist, but the allocator interaction has a bug where `PRAGMA integrity_check` reports aliased leaf pages. Single-leaf indexes work.
-- **Schema DDL beyond simple create/rename/drop shapes** — no column add/drop/rename, complex schema rewrites, views, triggers, or virtual-table creation yet
+- **Schema DDL beyond simple create/rename/add-column/drop shapes** — no constrained/default ADD COLUMN, column drop/rename, complex schema rewrites, views, triggers, or virtual-table creation yet
 - **BEGIN/COMMIT/ROLLBACK** — autocommit only
 - **Triggers, foreign keys, views, virtual tables, CTEs** — none of these
 - **Type affinity coercion** — we implement the common cases, not the full SQLite matrix
