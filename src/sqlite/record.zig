@@ -65,26 +65,48 @@ pub fn parseInline(bytes: []const u8, out: *InlineRecord) RecordError!void {
         // len from serial type formula inline.
         const v, const advance: usize = switch (serial.value) {
             0 => .{ Value.null, 0 },
-            1 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 1) }, 1 },
+            1 => blk: {
+                @branchHint(.likely);
+                break :blk .{ Value{ .integer = try readSigned(bytes[body_pos..], 1) }, 1 };
+            },
             2 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 2) }, 2 },
             3 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 3) }, 3 },
             4 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 4) }, 4 },
             5 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 6) }, 6 },
-            6 => .{ Value{ .integer = try readSigned(bytes[body_pos..], 8) }, 8 },
+            6 => blk: {
+                @branchHint(.likely);
+                break :blk .{ Value{ .integer = try readSigned(bytes[body_pos..], 8) }, 8 };
+            },
             7 => blk: {
-                if (bytes.len - body_pos < 8) return error.ValueOutOfBounds;
+                if (bytes.len - body_pos < 8) {
+                    @branchHint(.cold);
+                    return error.ValueOutOfBounds;
+                }
                 const raw = std.mem.readInt(u64, bytes[body_pos..][0..8], .big);
                 break :blk .{ Value{ .real = @bitCast(raw) }, 8 };
             },
-            8  => .{ Value{ .integer = 0 }, 0 },
-            9  => .{ Value{ .integer = 1 }, 0 },
-            10, 11 => return error.InvalidSerialType,
+            8 => blk: {
+                @branchHint(.likely);
+                break :blk .{ Value{ .integer = 0 }, 0 };
+            },
+            9 => blk: {
+                @branchHint(.likely);
+                break :blk .{ Value{ .integer = 1 }, 0 };
+            },
+            10, 11 => {
+                @branchHint(.cold);
+                return error.InvalidSerialType;
+            },
             else => blk: {
+                @branchHint(.likely);
                 const len: usize = if (serial.value % 2 == 0)
                     @intCast((serial.value - 12) / 2)
                 else
                     @intCast((serial.value - 13) / 2);
-                if (bytes.len - body_pos < len) return error.ValueOutOfBounds;
+                if (bytes.len - body_pos < len) {
+                    @branchHint(.cold);
+                    return error.ValueOutOfBounds;
+                }
                 if (serial.value % 2 == 0) {
                     break :blk .{ Value{ .blob = bytes[body_pos..][0..len] }, len };
                 } else {
@@ -144,23 +166,45 @@ const DecodedValue = struct {
 fn decodeValue(serial: u64, bytes: []const u8) RecordError!DecodedValue {
     return switch (serial) {
         0 => .{ .value = .null, .len = 0 },
-        1 => .{ .value = .{ .integer = try readSigned(bytes, 1) }, .len = 1 },
+        1 => blk: {
+            @branchHint(.likely);
+            break :blk .{ .value = .{ .integer = try readSigned(bytes, 1) }, .len = 1 };
+        },
         2 => .{ .value = .{ .integer = try readSigned(bytes, 2) }, .len = 2 },
         3 => .{ .value = .{ .integer = try readSigned(bytes, 3) }, .len = 3 },
         4 => .{ .value = .{ .integer = try readSigned(bytes, 4) }, .len = 4 },
         5 => .{ .value = .{ .integer = try readSigned(bytes, 6) }, .len = 6 },
-        6 => .{ .value = .{ .integer = try readSigned(bytes, 8) }, .len = 8 },
+        6 => blk: {
+            @branchHint(.likely);
+            break :blk .{ .value = .{ .integer = try readSigned(bytes, 8) }, .len = 8 };
+        },
         7 => blk: {
-            if (bytes.len < 8) return error.ValueOutOfBounds;
+            if (bytes.len < 8) {
+                @branchHint(.cold);
+                return error.ValueOutOfBounds;
+            }
             const raw = std.mem.readInt(u64, bytes[0..8], .big);
             break :blk .{ .value = .{ .real = @bitCast(raw) }, .len = 8 };
         },
-        8 => .{ .value = .{ .integer = 0 }, .len = 0 },
-        9 => .{ .value = .{ .integer = 1 }, .len = 0 },
-        10, 11 => error.InvalidSerialType,
+        8 => blk: {
+            @branchHint(.likely);
+            break :blk .{ .value = .{ .integer = 0 }, .len = 0 };
+        },
+        9 => blk: {
+            @branchHint(.likely);
+            break :blk .{ .value = .{ .integer = 1 }, .len = 0 };
+        },
+        10, 11 => blk: {
+            @branchHint(.cold);
+            break :blk error.InvalidSerialType;
+        },
         else => blk: {
+            @branchHint(.likely);
             const len: usize = if (serial % 2 == 0) @intCast((serial - 12) / 2) else @intCast((serial - 13) / 2);
-            if (bytes.len < len) return error.ValueOutOfBounds;
+            if (bytes.len < len) {
+                @branchHint(.cold);
+                return error.ValueOutOfBounds;
+            }
             if (serial % 2 == 0) {
                 break :blk .{ .value = .{ .blob = bytes[0..len] }, .len = len };
             } else {

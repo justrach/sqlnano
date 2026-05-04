@@ -267,6 +267,37 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "bench-delete")) {
+        const path = args.next() orelse {
+            try stderr.print("error: missing database path\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingDatabasePath;
+        };
+        const table_name = args.next() orelse {
+            try stderr.print("error: missing table name\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingTable;
+        };
+        const iters_text = args.next() orelse {
+            try stderr.print("error: missing iteration count\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.MissingIterations;
+        };
+        const sync_text = args.next();
+        if (args.next() != null) {
+            try stderr.print("error: too many arguments\n\n", .{});
+            try printUsage(stderr);
+            try stderr.flush();
+            return error.TooManyArguments;
+        }
+        try benchDelete(init, stdout, path, table_name, iters_text, sync_text);
+        try stdout.flush();
+        return;
+    }
+
     if (std.mem.eql(u8, command, "wal-checkpoint")) {
         const path = args.next() orelse {
             try stderr.print("error: missing database path\n\n", .{});
@@ -335,6 +366,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  sqlnano exec <database.db> "INSERT INTO t VALUES (...)"  Append a simple row
         \\  sqlnano bench-read <database.db> "SELECT * FROM t WHERE rowid = 1" <N>  Benchmark hot read path
         \\  sqlnano bench-write <database.db> <table> <N>  Benchmark durable inserts via a long-lived Connection
+        \\  sqlnano bench-delete <database.db> <table> <N>  Benchmark durable deletes via a long-lived Connection
         \\  sqlnano wal-status <database.db>               Inspect the sidecar WAL (`<db>-snwal`)
         \\  sqlnano wal-checkpoint <database.db>           Replay any leftover WAL entries and truncate
         \\  sqlnano parity                                 Show SQLite/Turso compatibility parity table
@@ -1060,22 +1092,56 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
                 },
                 else => return error.UnsupportedBenchmarkQuery,
             }
-        } else if (try sqlnano.sqlite.sql_mod.indexedRowidsForColumn(reader, schema, info, cname, lit, init.gpa)) |ids| {
-            indexed_rowids = ids;
-            mode = if (is_count_projection) "prepared-index-count" else "prepared-index-rowids";
         } else {
-            return error.UnsupportedBenchmarkQuery;
+            // LIMIT-aware index lookup: when the user asked for a small
+            // bounded result set, push the cap into the index walker so
+            // we don't materialise every matching rowid in a hot bucket
+            // (e.g. `WHERE court='SGHC' LIMIT 1` over hundreds of
+            // thousands of judgments — the limit-aware variant returns
+            // a single rowid instead of all matches).
+            const small_limit: ?usize = if (stmt.limit) |lim|
+                if (lim > 0 and lim < 100_000) @intCast(lim) else null
+            else
+                null;
+            const found_ids = if (small_limit) |lim|
+                try sqlnano.sqlite.sql_mod.indexedRowidsForColumnWithLimit(reader, schema, info, cname, lit, lim, init.gpa)
+            else
+                try sqlnano.sqlite.sql_mod.indexedRowidsForColumn(reader, schema, info, cname, lit, init.gpa);
+            if (found_ids) |ids| {
+                indexed_rowids = ids;
+                mode = if (is_count_projection) "prepared-index-count" else "prepared-index-rowids";
+            } else {
+                return error.UnsupportedBenchmarkQuery;
+            }
+        }
+    }
+
+    // Detect `LIMIT N` with no ORDER BY — or with ORDER BY rowid ASC
+    // (which is the natural b-tree traversal order, so a non-sorted
+    // bounded scan trivially satisfies it). Also handles `ORDER BY
+    // <integer-primary-key> ASC`, which aliases rowid.
+    var limit_rows: u64 = std.math.maxInt(u64);
+    if (stmt.limit) |lim| {
+        if (lim > 0) {
+            const order_ok = if (stmt.order_by) |ob|
+                isNaturalRowidAscOrderLocal(ob, info, stmt.table_name, stmt.table_alias)
+            else
+                true;
+            if (order_ok) limit_rows = @intCast(lim);
         }
     }
 
     // Hint the kernel: COUNT(*) and full scans walk every leaf page
     // sequentially, so `MADV_WILLNEED` gets us the same eager
-    // readahead SQLite's pager-with-pread enjoys. Point lookups stay
-    // on default — they touch ~3 pages and don't benefit from a
-    // file-wide prefetch.
+    // readahead SQLite's pager-with-pread enjoys. Point lookups
+    // benefit from `MADV_RANDOM` instead — they touch ~3 pages
+    // scattered across the file, and `random` short-circuits the
+    // kernel's default readahead.
     if (rowid == null and indexed_rowids == null) {
         mf.advise(.willneed) catch {};
         mf.advise(.sequential) catch {};
+    } else {
+        mf.advise(.random) catch {};
     }
 
     var total_rows: usize = 0;
@@ -1113,10 +1179,22 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
             // page reads). This is what makes the reported
             // `rows_per_sec` reflect raw b-tree walking cost rather
             // than ArrayList churn.
+            //
+            // When the planner detected a bounded LIMIT, the counter's
+            // `stop_after` field flips to true on the Nth row so the
+            // scanner unwinds without walking the rest of the b-tree
+            // (the scan's `scanShouldStop` helper picks it up).
+            //
+            // Wide rows / overflow payloads aren't supported by the
+            // zero-alloc path; fall back to `scanTableForEachAlloc` on
+            // `error.PayloadOverflowUnsupported`, which handles
+            // overflow at the cost of an alloc per overflowing row.
             const Counter = struct {
                 total: *u64,
                 sink: *i64,
-                fn tick(ctx: *const @This(), rid: i64, values: []const sqlnano.sqlite.record_mod.Value) anyerror!void {
+                limit: u64,
+                stop_after: bool = false,
+                fn tick(ctx: *@This(), rid: i64, values: []const sqlnano.sqlite.record_mod.Value) anyerror!void {
                     ctx.total.* += 1;
                     // Sum rowid + every integer column into a sink so the
                     // optimizer can't elide value decoding. Matches what
@@ -1127,12 +1205,28 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
                         .integer => |x| ctx.sink.* +%= x,
                         else => {},
                     };
+                    if (ctx.total.* >= ctx.limit) ctx.stop_after = true;
                 }
             };
             var rows_this_iter: u64 = 0;
             var sink: i64 = 0;
-            const ctx: Counter = .{ .total = &rows_this_iter, .sink = &sink };
-            try sqlnano.sqlite.table_mod.scanTableForEach(reader, info.root_page, &ctx, Counter.tick);
+            var ctx: Counter = .{ .total = &rows_this_iter, .sink = &sink, .limit = limit_rows };
+            sqlnano.sqlite.table_mod.scanTableForEach(reader, info.root_page, &ctx, Counter.tick) catch |err| switch (err) {
+                error.PayloadOverflowUnsupported => {
+                    // Reset and retry on the alloc path. The first
+                    // attempt may have partially populated `sink` /
+                    // `rows_this_iter` before bailing; reset so we
+                    // don't double-count.
+                    rows_this_iter = 0;
+                    sink = 0;
+                    ctx.stop_after = false;
+                    sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &ctx, Counter.tick) catch |err2| switch (err2) {
+                        error.PayloadOverflowUnsupported => return err2,
+                        else => return err2,
+                    };
+                },
+                else => return err,
+            };
             total_rows += rows_this_iter;
             std.mem.doNotOptimizeAway(sink);
         }
@@ -1150,6 +1244,33 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     try writer.print("ns_per_iter: {d:.1}\n", .{elapsed_ns / iterations_f});
     try writer.print("iters_per_sec: {d:.0}\n", .{iterations_f * std.time.ns_per_s / elapsed_ns});
     try writer.print("rows_per_sec: {d:.0}\n", .{total_rows_f * std.time.ns_per_s / elapsed_ns});
+}
+
+/// Local re-implementation of sql_mod's private isNaturalRowidAscOrder.
+/// Returns true when `ORDER BY` matches the b-tree's natural traversal
+/// (ascending rowid / integer-primary-key). bench-read uses this to
+/// decide whether a `LIMIT N` clause can be satisfied by stopping the
+/// scan after N rows without resorting.
+fn isNaturalRowidAscOrderLocal(
+    order_by: sqlnano.sqlite.ast_mod.OrderBy,
+    info: sqlnano.sqlite.TableInfo,
+    table_name: []const u8,
+    table_alias: ?[]const u8,
+) bool {
+    if (order_by.descending) return false;
+    if (order_by.column.qualifier) |q| {
+        const matches_alias = if (table_alias) |a| std.ascii.eqlIgnoreCase(a, q) else false;
+        const matches_name = std.ascii.eqlIgnoreCase(table_name, q);
+        if (!matches_alias and !matches_name) return false;
+    }
+    if (std.ascii.eqlIgnoreCase(order_by.column.name, "rowid")) return true;
+    const ipk = info.integer_primary_key_index orelse return false;
+    for (info.columns, 0..) |col, idx| {
+        if (std.ascii.eqlIgnoreCase(col.name, order_by.column.name)) {
+            return idx == ipk;
+        }
+    }
+    return false;
 }
 
 fn benchWrite(
@@ -1187,6 +1308,60 @@ fn benchWrite(
             .{ .integer = @intCast(i) },
         };
         _ = try conn.insert(table_name, &values);
+    }
+    const end = std.Io.Clock.awake.now(init.io).toNanoseconds();
+
+    const elapsed_ns: f64 = @floatFromInt(end - start);
+    const iters_f: f64 = @floatFromInt(iterations);
+    try writer.print("mode: connection-batch synchronous={s}\n", .{@tagName(sync_mode)});
+    try writer.print("iterations: {d}\n", .{iterations});
+    try writer.print("elapsed_ms: {d:.3}\n", .{elapsed_ns / std.time.ns_per_ms});
+    try writer.print("us_per_op: {d:.1}\n", .{elapsed_ns / 1000.0 / iters_f});
+    try writer.print("ops_per_sec: {d:.0}\n", .{iters_f * std.time.ns_per_s / elapsed_ns});
+}
+
+fn benchDelete(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    table_name: []const u8,
+    iters_text: []const u8,
+    sync_text: ?[]const u8,
+) !void {
+    const iterations = try std.fmt.parseInt(usize, iters_text, 10);
+    if (iterations == 0) return error.InvalidIterationCount;
+
+    const sync_mode: sqlnano.sqlite.wal_mod.SyncMode = if (sync_text) |s|
+        if (std.ascii.eqlIgnoreCase(s, "full"))
+            .full
+        else if (std.ascii.eqlIgnoreCase(s, "normal"))
+            .normal
+        else if (std.ascii.eqlIgnoreCase(s, "off"))
+            .off
+        else
+            return error.InvalidSyncMode
+    else
+        .full;
+
+    var conn = try sqlnano.sqlite.Connection.open(init.gpa, init.io, path);
+    defer conn.close();
+    conn.setSyncMode(sync_mode);
+
+    const start = std.Io.Clock.awake.now(init.io).toNanoseconds();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        // `DELETE WHERE rowid = ?`. The Connection's delete path
+        // notices the rowid-equality shape and takes the in-place
+        // freeblock fast path when the table has no indexes —
+        // O(log N) per delete instead of an O(N) full-table rebuild.
+        const stmt = sqlnano.sqlite.ast_mod.DeleteStatement{
+            .table_name = table_name,
+            .where_clause = .{
+                .column_name = "rowid",
+                .value = .{ .integer = @intCast(i + 1) },
+            },
+        };
+        _ = try conn.delete(stmt);
     }
     const end = std.Io.Clock.awake.now(init.io).toNanoseconds();
 
