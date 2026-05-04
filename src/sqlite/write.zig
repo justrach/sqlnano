@@ -2120,6 +2120,20 @@ fn applyDeleteCore(gpa: Allocator, image: *MappedFile, stmt: @import("ast.zig").
         else => return error.UnsupportedDelete,
     }
 
+    // Fast path: `DELETE WHERE rowid = N` against an index-free table.
+    // Walks the b-tree to the right leaf and removes the matching cell
+    // in place via the freeblock chain. The slow path (full scan +
+    // rebuild) is O(N) per delete; this is O(log N) and touches a
+    // single page. Falls through to the slow path on any shape we
+    // can't handle.
+    if (whereTargetsRowid(info, stmt.where_clause)) |target_rowid| {
+        if (db_schema.firstIndexForTable(info.name) == null) {
+            if (try tryFastDeleteByRowid(image, reader.db_header, info, target_rowid)) |deleted| {
+                return deleted;
+            }
+        }
+    }
+
     const scanned = try table.scanTable(reader, info.root_page, gpa);
     defer scanned.deinit(gpa);
     var old_rows = try rowsFromScanned(info, scanned, gpa);
@@ -2147,6 +2161,384 @@ fn applyDeleteCore(gpa: Allocator, image: *MappedFile, stmt: @import("ast.zig").
 
     try rebuildTableAndIndexes(gpa, image, reader.db_header, reader, db_schema, info, kept.items);
     return changed;
+}
+
+/// Returns the integer rowid if `where` is the supported fast-delete
+/// shape `WHERE rowid = N` (or `WHERE <ipk_col> = N` against a table
+/// whose integer primary key aliases the rowid). Returns null for any
+/// other shape so the caller falls back to the generic delete path.
+fn whereTargetsRowid(info: catalog.TableInfo, where: @import("ast.zig").WhereClause) ?i64 {
+    const v: i64 = switch (where.value) {
+        .integer => |n| n,
+        else => return null,
+    };
+    if (std.ascii.eqlIgnoreCase(where.column_name, "rowid")) return v;
+    if (info.integer_primary_key_index) |ipk| {
+        if (std.ascii.eqlIgnoreCase(info.columns[ipk].name, where.column_name)) return v;
+    }
+    return null;
+}
+
+/// In-place leaf-cell removal for `DELETE WHERE rowid = N` on an
+/// index-free table. Walks the b-tree from `info.root_page` to the
+/// leaf containing `target_rowid`, drops the matching cell using the
+/// SQLite freeblock convention, and bumps the file_change_counter.
+///
+/// Returns:
+///   * `null`             — anything we can't handle safely (corrupt page,
+///                          payload overflow, freeblock chain too tight,
+///                          interior-walk inconsistency, would empty a
+///                          non-root leaf). Caller falls back to the
+///                          rebuild path.
+///   * `0`                — rowid not present; nothing to do.
+///   * `1`                — cell removed.
+fn tryFastDeleteByRowid(
+    image: *MappedFile,
+    db_header: header.Header,
+    info: catalog.TableInfo,
+    target_rowid: i64,
+) WriteError!?usize {
+    const page_size: usize = db_header.page_size;
+    const reserved: usize = db_header.reserved_space;
+    if (page_size <= reserved + 8) return null;
+    const bytes = image.items;
+    if (bytes.len < page_size) return null;
+
+    const leaf_page = (try findLeafContainingRowid(bytes, page_size, reserved, info.root_page, target_rowid)) orelse return null;
+    if (leaf_page == 0 or leaf_page == 1) return null;
+
+    const page_start: usize = (@as(usize, leaf_page) - 1) * page_size;
+    if (page_start + page_size > bytes.len) return null;
+    const hdr_off: usize = 0; // non-page-1 leaves never sit behind the DB header
+    const base = page_start + hdr_off;
+    if (bytes[base] != 0x0d) return null; // table_leaf
+
+    const cell_idx = (try findLeafCellByRowid(bytes, page_start, page_size, reserved, target_rowid)) orelse return 0;
+
+    // Empty-leaf guard: removing the last cell from a non-root leaf
+    // creates an empty leaf reachable from the parent, which SQLite
+    // cursor traversal treats as corruption (SQLITE_CORRUPT_PAGE).
+    // The clean way to handle this is to also drop the leaf from the
+    // parent and rebalance siblings — far too much work to do inline.
+    // Bail to the slow path, which rebuilds the whole table b-tree
+    // and naturally drops the empty leaf.
+    const cell_count: usize = readU16(bytes[base + 3 ..][0..2]);
+    if (cell_count <= 1 and leaf_page != info.root_page) return null;
+
+    const ok = try dropLeafCell(bytes, page_start, page_size, reserved, cell_idx);
+    if (!ok) return null;
+
+    // Bump the file_change_counter (u32 BE @ offset 24 of page 1) so
+    // SQLite (and our own readers) invalidate any cached page state.
+    // We deliberately do NOT touch the schema_cookie: row-level deletes
+    // don't change the schema, and bumping it would force every future
+    // SQLite connection to re-prepare its statements.
+    if (bytes.len >= 28) {
+        const counter = readU32(bytes[24..28]);
+        writeU32(bytes[24..28], counter +% 1);
+        // The optional version_valid_for field at offset 92 is meant to
+        // match the change counter when SQLite trusts the cached page
+        // count; mirror it so SQLite's "valid for" check passes.
+        if (bytes.len >= 96) writeU32(bytes[92..96], counter +% 1);
+    }
+
+    return 1;
+}
+
+/// Walk the table b-tree from `root_page` and return the leaf page
+/// number that *would* contain `target_rowid`. Returns null for any
+/// structural anomaly (bad header, missing right pointer, page out of
+/// bounds, interior cell too short). Always succeeds for a well-formed
+/// table tree even if the rowid does not actually exist — the caller
+/// then binary-searches the leaf and may legitimately not find it.
+fn findLeafContainingRowid(
+    bytes: []const u8,
+    page_size: usize,
+    reserved: usize,
+    root_page: u32,
+    target_rowid: i64,
+) WriteError!?u32 {
+    var p: u32 = root_page;
+    // Bound the descent — even a 64-bit rowid space tops out long
+    // before this many levels — so a malformed cycle returns null
+    // instead of looping forever.
+    var depth: usize = 0;
+    while (depth < 64) : (depth += 1) {
+        if (p == 0) return null;
+        const page_start: usize = (@as(usize, p) - 1) * page_size;
+        if (page_start + page_size > bytes.len) return null;
+        const hdr_off: usize = if (p == 1) header.HEADER_SIZE else 0;
+        const base = page_start + hdr_off;
+        if (base + 8 > page_start + page_size - reserved) return null;
+        const page_type = bytes[base];
+        const cell_count = readU16(bytes[base + 3 ..][0..2]);
+        if (page_type == 0x0d) return p; // table_leaf
+        if (page_type != 0x05) return null; // not a table_interior, give up
+
+        // Interior page: 12-byte header, right_most_pointer @ base+8.
+        const ptr_array_start = base + 12;
+        const right_most_pointer = readU32(bytes[base + 8 ..][0..4]);
+        var next_page: u32 = right_most_pointer;
+        var i: usize = 0;
+        while (i < cell_count) : (i += 1) {
+            const ptr_off = ptr_array_start + i * 2;
+            if (ptr_off + 2 > page_start + page_size - reserved) return null;
+            const cell_off = readU16(bytes[ptr_off..][0..2]);
+            const abs_off = page_start + cell_off;
+            if (abs_off + 5 > page_start + page_size - reserved) return null;
+            const left_child = std.mem.readInt(u32, bytes[abs_off..][0..4], .big);
+            const rowid_v = @import("varint.zig").parse(bytes[abs_off + 4 .. page_start + page_size - reserved]) catch return null;
+            const cell_rowid: i64 = @intCast(rowid_v.value);
+            // Interior cell rowid is the largest rowid reachable
+            // through left_child, so we descend the moment the
+            // separator key is >= the target.
+            if (cell_rowid >= target_rowid) {
+                next_page = left_child;
+                break;
+            }
+        }
+        p = next_page;
+    }
+    return null;
+}
+
+/// Binary-search a `table_leaf` page for `target_rowid` and return the
+/// cell index if present, null otherwise. Returns an error only on a
+/// genuinely malformed cell (truncated varint, pointer beyond usable
+/// region) — the caller treats those as fall-through.
+fn findLeafCellByRowid(
+    bytes: []const u8,
+    page_start: usize,
+    page_size: usize,
+    reserved: usize,
+    target_rowid: i64,
+) WriteError!?usize {
+    const usable_end = page_start + page_size - reserved;
+    const hdr_off: usize = 0; // caller guarantees non-page-1 leaf
+    const base = page_start + hdr_off;
+    if (base + 8 > usable_end) return null;
+    const cell_count: usize = readU16(bytes[base + 3 ..][0..2]);
+    if (cell_count == 0) return null;
+    const ptr_array_start = base + 8;
+
+    var lo: usize = 0;
+    var hi: usize = cell_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const ptr_off = ptr_array_start + mid * 2;
+        if (ptr_off + 2 > usable_end) return error.CellOffsetOutOfBounds;
+        const cell_off = readU16(bytes[ptr_off..][0..2]);
+        const abs_off = page_start + cell_off;
+        if (abs_off + 2 > usable_end) return error.CellOffsetOutOfBounds;
+        const payload_size_v = @import("varint.zig").parse(bytes[abs_off..usable_end]) catch return error.InvalidTableCell;
+        const rowid_v = @import("varint.zig").parse(bytes[abs_off + payload_size_v.len .. usable_end]) catch return error.InvalidTableCell;
+        const cell_rowid: i64 = @intCast(rowid_v.value);
+        if (cell_rowid == target_rowid) return mid;
+        if (cell_rowid < target_rowid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return null;
+}
+
+/// Compute the byte length of a `table_leaf` cell at `abs_off`. The
+/// cell layout is `[payload_size:varint][rowid:varint][payload]`. We
+/// reject overflow cases (`payload_size` straddling overflow pages)
+/// because the inline freeblock format can't represent them.
+fn tableLeafCellLen(
+    bytes: []const u8,
+    abs_off: usize,
+    usable_end: usize,
+    page_size: usize,
+    reserved: usize,
+) WriteError!?usize {
+    if (abs_off + 2 > usable_end) return null;
+    const payload_size_v = @import("varint.zig").parse(bytes[abs_off..usable_end]) catch return null;
+    const rowid_v = @import("varint.zig").parse(bytes[abs_off + payload_size_v.len .. usable_end]) catch return null;
+    const header_len: usize = @as(usize, payload_size_v.len) + rowid_v.len;
+    const payload_size: usize = @intCast(payload_size_v.value);
+    // Reject overflow: usable space minus 35 is the SQLite-canonical
+    // max-local; anything bigger spills into overflow pages and we
+    // can't safely free the spill chain here.
+    const usable_size = page_size - reserved;
+    const max_local = usable_size - 35;
+    if (payload_size > max_local) return null;
+    if (header_len + payload_size > usable_end - abs_off) return null;
+    // SQLite enforces a 4-byte freeblock minimum; if a degenerate row
+    // is too small we can't safely chain it.
+    if (header_len + payload_size < 4) return null;
+    return header_len + payload_size;
+}
+
+/// Remove cell `cell_idx` from the leaf page beginning at `page_start`.
+/// Implements the same algorithm SQLite's `btree.c::freeSpace` uses:
+///   * Walk the offset-sorted freeblock chain to find the insertion
+///     site; this gives us a `prev_off` (predecessor in chain) and
+///     `next_off` (successor in chain).
+///   * Coalesce with the successor when its head sits within 3 bytes
+///     of the freed range's tail (the 3-byte slack lets SQLite absorb
+///     small fragments back into a freeblock instead of leaving them
+///     as fragmented bytes).
+///   * Coalesce with the predecessor under the same 3-byte rule.
+///   * Adjust the page's `fragmented_free_bytes` counter for any
+///     fragments we absorbed.
+///   * If the merged range starts exactly at `cell_content_start`,
+///     extend `cell_content_start` instead of recording a freeblock.
+///   * Otherwise splice the merged freeblock into the chain.
+/// Returns false on any geometry / corruption check we can't recover
+/// from in place; the caller falls back to the rebuild path.
+fn dropLeafCell(
+    bytes: []u8,
+    page_start: usize,
+    page_size: usize,
+    reserved: usize,
+    cell_idx: usize,
+) WriteError!bool {
+    const usable_end_off = page_size - reserved;
+    const base = page_start;
+    if (base + 8 > page_start + usable_end_off) return false;
+    if (bytes[base] != 0x0d) return false;
+
+    const cell_count: usize = readU16(bytes[base + 3 ..][0..2]);
+    if (cell_idx >= cell_count) return false;
+
+    const ptr_array_start = base + 8;
+    const ptr_off = ptr_array_start + cell_idx * 2;
+    if (ptr_off + 2 > page_start + usable_end_off) return false;
+    const cell_off: usize = readU16(bytes[ptr_off..][0..2]);
+    const abs_off = page_start + cell_off;
+
+    const cell_len = (try tableLeafCellLen(bytes, abs_off, page_start + usable_end_off, page_size, reserved)) orelse return false;
+    if (cell_len > 0xFFFF) return false;
+    if (cell_off + cell_len > usable_end_off) return false;
+
+    var content_start_raw: usize = readU16(bytes[base + 5 ..][0..2]);
+    if (content_start_raw == 0) content_start_raw = page_size;
+
+    // ── 1. Cell pointer array compaction. ────────────────────────────
+    const tail_start = ptr_off + 2;
+    const tail_end = ptr_array_start + cell_count * 2;
+    if (tail_end > page_start + usable_end_off) return false;
+    if (tail_start < tail_end) {
+        std.mem.copyForwards(
+            u8,
+            bytes[ptr_off..tail_end - 2],
+            bytes[tail_start..tail_end],
+        );
+    }
+    @memset(bytes[tail_end - 2 .. tail_end], 0);
+    writeU16(bytes[base + 3 ..][0..2], @intCast(cell_count - 1));
+
+    // ── 2. Freeblock chain insertion. ────────────────────────────────
+    var i_start: usize = cell_off;
+    var i_end: usize = cell_off + cell_len;
+    var i_size: usize = cell_len;
+    if (i_end > usable_end_off) return false;
+
+    // Find predecessor / successor in the chain.
+    var i_ptr: usize = 0;
+    var i_free_blk: usize = readU16(bytes[base + 1 ..][0..2]);
+    while (i_free_blk != 0 and i_free_blk < i_start) {
+        const fb_abs = page_start + i_free_blk;
+        if (fb_abs + 4 > page_start + usable_end_off) return false;
+        const fb_size: usize = readU16(bytes[fb_abs + 2 ..][0..2]);
+        if (fb_size < 4 or i_free_blk + fb_size > usable_end_off) return false;
+        i_ptr = i_free_blk;
+        i_free_blk = readU16(bytes[fb_abs..][0..2]);
+    }
+
+    // Track fragmented-byte adjustments. Every time we absorb a 1- to
+    // 3-byte gap into a freeblock, that many fragmented bytes vanish.
+    var nfrag_delta: i32 = 0;
+
+    // Coalesce with successor if it sits within 3 bytes of i_end.
+    if (i_free_blk != 0) {
+        const fb_abs = page_start + i_free_blk;
+        if (fb_abs + 4 > page_start + usable_end_off) return false;
+        const next_after_blk: usize = readU16(bytes[fb_abs..][0..2]);
+        const next_size: usize = readU16(bytes[fb_abs + 2 ..][0..2]);
+        if (next_size < 4 or i_free_blk + next_size > usable_end_off) return false;
+        if (i_end + 3 >= i_free_blk) {
+            if (i_end > i_free_blk) return false; // genuine overlap → corrupt
+            nfrag_delta += @as(i32, @intCast(i_free_blk - i_end));
+            i_end = i_free_blk + next_size;
+            if (i_end > usable_end_off) return false;
+            i_size = i_end - i_start;
+            i_free_blk = next_after_blk;
+        }
+    }
+
+    // Coalesce with predecessor if it sits within 3 bytes of i_start.
+    if (i_ptr != 0) {
+        const pb_abs = page_start + i_ptr;
+        const prev_size: usize = readU16(bytes[pb_abs + 2 ..][0..2]);
+        if (prev_size < 4) return false;
+        const prev_end = i_ptr + prev_size;
+        if (prev_end + 3 >= i_start) {
+            if (prev_end > i_start) return false; // overlap → corrupt
+            nfrag_delta += @as(i32, @intCast(i_start - prev_end));
+            i_size = i_end - i_ptr;
+            i_start = i_ptr;
+        }
+    }
+
+    // ── 3. Update fragmented_free_bytes (saturating in [0, 60]). ─────
+    if (nfrag_delta != 0) {
+        const cur: i32 = @intCast(bytes[base + 7]);
+        const next = cur - nfrag_delta;
+        if (next < 0) {
+            // Page claimed fewer fragmented bytes than we just absorbed
+            // — definite corruption. Don't try to fix it inline.
+            return false;
+        }
+        if (next > 60) {
+            // SQLite caps fragmented_free_bytes at 60 then defragments.
+            // We can't defragment in place safely, so bail.
+            return false;
+        }
+        bytes[base + 7] = @intCast(next);
+    }
+
+    // ── 4. Place the merged block. ───────────────────────────────────
+    if (i_start <= content_start_raw) {
+        // Freed range begins at (or before) the cell content area, so
+        // extend cell_content_start instead of leaving a freeblock.
+        if (i_start < content_start_raw) return false; // would mean cell pointer < content_start
+        if (i_ptr != 0) return false; // can't have a predecessor in chain when at content boundary
+        // first_freeblock now skips whatever the merged range absorbed.
+        writeU16(bytes[base + 1 ..][0..2], @intCast(i_free_blk));
+        const stored: u16 = if (i_end == 65536) 0 else @intCast(i_end);
+        writeU16(bytes[base + 5 ..][0..2], stored);
+        // Zero the reclaimed region.
+        @memset(bytes[page_start + i_start .. page_start + i_end], 0);
+        return true;
+    }
+
+    if (i_size > 0xFFFF) return false;
+    if (i_size < 4) {
+        // Shouldn't happen for a real table_leaf cell, but guard anyway.
+        // Account as fragmented bytes and skip the chain insert.
+        const frag_cur: u32 = bytes[base + 7];
+        if (frag_cur + i_size > 60) return false;
+        bytes[base + 7] = @intCast(frag_cur + i_size);
+        @memset(bytes[page_start + i_start .. page_start + i_end], 0);
+        return true;
+    }
+
+    // Splice merged block into chain at i_start, linking to i_free_blk.
+    const fb_abs = page_start + i_start;
+    writeU16(bytes[fb_abs..][0..2], @intCast(i_free_blk));
+    writeU16(bytes[fb_abs + 2 ..][0..2], @intCast(i_size));
+    if (i_size > 4) @memset(bytes[fb_abs + 4 .. fb_abs + i_size], 0);
+    if (i_ptr == 0) {
+        writeU16(bytes[base + 1 ..][0..2], @intCast(i_start));
+    } else {
+        writeU16(bytes[page_start + i_ptr ..][0..2], @intCast(i_start));
+    }
+
+    return true;
 }
 
 fn encodeRecord(info: catalog.TableInfo, rowid: i64, values: []const InsertValue, allocator: std.mem.Allocator) WriteError![]u8 {
