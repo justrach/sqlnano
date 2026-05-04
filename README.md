@@ -93,6 +93,17 @@ The hot-cache COUNT(*) numbers are real measurements but reflect L2 cache speed,
 - **Stack buffer for small cells** — a 256-byte stack slice carries the cell envelope for typical rows, so the fast path does zero heap activity
 - **Configurable `synchronous`** — `full` (fsync per commit, default), `normal` (fsync on checkpoint only, matches SQLite WAL+NORMAL), `off` (never fsync)
 
+### Next read-path targets from SQLite/Turso
+
+DeepWiki's SQLite and Turso notes point at the next general speed work. These are not claimed as complete yet; they are the prioritized shapes that fit sqlnano's direct b-tree reader:
+
+- **Covering index reads** — if `SELECT`, `WHERE`, and `ORDER BY` only need columns already stored in an index, read directly from the index and skip table row hydration.
+- **Deferred table hydration** — when an index produces candidate rowids, postpone table b-tree seeks until a projected column actually needs the full row.
+- **Indexed `ORDER BY ... LIMIT`** — scan a matching index in forward or reverse order, stop at `LIMIT`, and only hydrate rows that survive.
+- **`MIN()` / `MAX()` by index edge** — answer `MIN(col)` or `MAX(col)` from the first or last usable index entry instead of scanning all rows.
+- **Range and `IN` index seeks** — extend the current equality-only first-column index seek to `BETWEEN`, `<`, `<=`, `>`, `>=`, and literal `IN (...)` probes.
+- **Column-selective record decode** — parse record headers once and materialize only requested columns, especially to avoid touching large `body_text` payloads during narrow projections.
+
 ## Install
 
 ```bash
