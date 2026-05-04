@@ -1024,6 +1024,9 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     // Detect `SELECT COUNT(*) FROM t` (no WHERE) — SQLite's fast
     // COUNT path also just sums leaf-header cell counts, so we match
     // its apples-to-apples shape by doing the same.
+    const is_count_projection = stmt.joins.len == 0 and
+        stmt.projections.len == 1 and
+        stmt.projections[0] == .count_star;
     const is_count_star = stmt.where_expr == null and
         stmt.joins.len == 0 and
         stmt.projections.len == 1 and
@@ -1053,13 +1056,13 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
             switch (lit) {
                 .integer => |v| {
                     rowid = v;
-                    mode = "rowid-direct";
+                    mode = if (is_count_projection) "rowid-count-direct" else "rowid-direct";
                 },
                 else => return error.UnsupportedBenchmarkQuery,
             }
         } else if (try sqlnano.sqlite.sql_mod.indexedRowidsForColumn(reader, schema, info, cname, lit, init.gpa)) |ids| {
             indexed_rowids = ids;
-            mode = "prepared-index-rowids";
+            mode = if (is_count_projection) "prepared-index-count" else "prepared-index-rowids";
         } else {
             return error.UnsupportedBenchmarkQuery;
         }
@@ -1080,15 +1083,23 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         if (rowid) |id| {
-            if (try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, id, init.gpa)) |found| {
-                total_rows += 1;
-                found.deinit(init.gpa);
-            }
-        } else if (indexed_rowids) |ids| {
-            for (ids) |id| {
+            if (is_count_projection) {
+                if (try sqlnano.sqlite.table_mod.rowidExists(reader, info.root_page, id)) total_rows += 1;
+            } else {
                 if (try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, id, init.gpa)) |found| {
                     total_rows += 1;
                     found.deinit(init.gpa);
+                }
+            }
+        } else if (indexed_rowids) |ids| {
+            if (is_count_projection) {
+                total_rows += ids.len;
+            } else {
+                for (ids) |id| {
+                    if (try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, id, init.gpa)) |found| {
+                        total_rows += 1;
+                        found.deinit(init.gpa);
+                    }
                 }
             }
         } else if (is_count_star) {

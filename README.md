@@ -28,7 +28,7 @@ SQLite is legendary and powers an enormous amount of software. sqlnano makes dif
 |--------------------------|-------------------------------------------|---------------------------------------------------|
 | **Schema parse per insert** | Once at `prepare`, reused                 | Once per op, into a page-allocator arena          |
 | **Write path**           | Page-diff rollback journal / WAL frames   | Row-level native WAL + in-memory image + `writeFile` on flush |
-| **Fast insert**          | B-tree walk + cell insert                 | O(1) rightmost-leaf cell append when leaf has room, O(n) rebuild on split |
+| **Fast insert**          | B-tree walk + cell insert                 | O(1) rightmost-leaf cell append when leaf has room, right-edge split/root promotion when full |
 | **Durability knob**      | `PRAGMA synchronous=FULL/NORMAL/OFF`      | Same three modes, same semantics, per-`Connection` |
 | **File format**          | Native SQLite `.db`                       | Native SQLite `.db` (writes a compatible image)   |
 | **Binary size**          | 1.5 MB shared library                     | ~900 KB static Zig binary                         |
@@ -79,7 +79,7 @@ Both engines now use the OS page cache (sqlnano via `mmap` + `MADV_WILLNEED` for
 
 The hot-cache COUNT(*) numbers are real measurements but reflect L2 cache speed, not "speed of one query against a fresh database". The cold-cache row above is closer to what you'll see for an actual query — and even there sqlnano stays ahead because:
 
-- `countRows` reads only the `cell_count` field of each leaf page header, not the rows themselves. SQLite's COUNT(*) walks rows through the VDBE.
+- `countBtreeEntries` reads only b-tree page headers, not row payloads, and simple `COUNT(*)` can choose a smaller covering index b-tree with the same cardinality.
 - `MADV_WILLNEED` on bench-read tells the kernel to start prefetching the file as soon as we know the query is a scan.
 - mmap + zero-syscall reads avoid the `pread` ⇒ kernel ⇒ userspace memcpy that SQLite's pager pays per page.
 
@@ -201,7 +201,7 @@ sqlite3 /tmp/t.db 'CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER);'
 ./zig-out/bin/sqlnano bench-write /tmp/t.db t 10000 normal
 # mode: connection-batch synchronous=normal
 # iterations: 10000
-# ops_per_sec: ~193000
+# ops_per_sec: ~478000
 ```
 
 ## How it works
@@ -222,9 +222,8 @@ Connection.insert(table, values)
 │     │     memcpy cell, update cell_count + pointer array + content_start
 │     │     bump file_change_counter
 │     │     return true  ← O(1), no allocation
-│     └─ else return false
-└─ 7. if fast path failed → applyInsertCore      # full tree rebuild + split
-      (currently triggered every ~400 rows at 4KB pages — the remaining cliff)
+│     └─ else split the right edge / promote root in O(depth)
+└─ 7. if fast path failed → applyInsertCore      # indexed/general fallback rebuild
 ```
 
 Flush boundary:
@@ -256,7 +255,7 @@ zig build test
 zig build test -Doptimize=ReleaseFast
 ```
 
-78 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
+83 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
 table/index creation, table rename/add-column/drop, table multi-leaf split verified by
 `PRAGMA integrity_check`, end-to-end INSERT/UPDATE/DELETE through `Connection`.
 
@@ -278,7 +277,8 @@ client for the same ecosystem — not a fork.
 - **Multi-page tables** — interior root + multi-leaf splits verified by `PRAGMA integrity_check`
 - **Native WAL** — group commit, crash recovery, fuzz-tested torn-WAL handling
 - **Configurable durability** — `synchronous=full/normal/off`
-- **Tiny SQL surface** — `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE ... RENAME TO`, `ALTER TABLE ... ADD COLUMN`, tail-safe `DROP TABLE`, `SELECT ... WHERE col = literal`, `INSERT INTO t VALUES (...)`, `UPDATE`/`DELETE` with single-equality `WHERE`
+- **Tiny SQL surface** — `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE ... RENAME TO`, `ALTER TABLE ... ADD COLUMN`, tail-safe `DROP TABLE`, `SELECT` with scalar predicates/joins/ORDER/LIMIT/aggregates, `INSERT INTO t VALUES (...)`, `UPDATE`/`DELETE` with single-equality `WHERE`
+- **Read-path shortcuts** — direct rowid existence checks, b-tree-pruned non-partial index equality, filtered `COUNT(*)` over indexes without row hydration, smallest-b-tree unfiltered `COUNT(*)`, and streaming `ORDER BY rowid ASC LIMIT`
 - **Prioritized FTS5 reads** — native shadow-table BM25 for compact bare-token and implicit-AND bareword MATCH queries, optional column weights, JSON hydration by content rowid, and simple pre-ranking filters. Rich MATCH syntax/snippets are correctness-first through the optional SQLite CLI fallback.
 
 ### What doesn't work (yet)
@@ -290,7 +290,7 @@ client for the same ecosystem — not a fork.
 - **Type affinity coercion** — we implement the common cases, not the full SQLite matrix
 - **Collations** — BINARY only
 - **Native full FTS5 query syntax** — phrase, boolean, NEAR, prefix, tokenizer parity, snippets/highlights, and virtual-table callback APIs are not the prioritized native shape yet; they use the SQLite CLI compatibility path for now
-- **Full SQL grammar** — the parser handles what `exec` / `bench-read` need; everything else errors out
+- **Full SQL grammar** — the parser is still a deliberately small subset; subqueries, GROUP BY/HAVING, CASE, CTEs, most functions, and broad UPDATE/DELETE WHERE forms are not implemented
 - **Writes to WAL-mode SQLite files** — sqlnano refuses to write a file whose header has `write_version=WAL` because we don't speak the SQLite WAL frame format
 
 Full live status: `sqlnano parity` or [src/sqlite/parity.zig](src/sqlite/parity.zig).
@@ -322,7 +322,7 @@ License: [Server Side Public License v1, with an author exception for justrach](
 | `sqlnano select <db> <table>`                        | Scan a table by name                              |
 | `sqlnano fts-match <db> <fts5_table> <term> [limit] [weights]` | Run a narrow weighted FTS5 BM25 search      |
 | `sqlnano fts-search <db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]` | Search and hydrate ranked JSON rows |
-| `sqlnano exec <db> "<SQL>"`                          | Run INSERT/UPDATE/DELETE                          |
+| `sqlnano exec <db> "<SQL>"`                          | Run CREATE/ALTER/DROP/INSERT/UPDATE/DELETE       |
 | `sqlnano bench-read <db> "<SQL>" <N>`                | Benchmark the hot read path (`N` iterations)     |
 | `sqlnano bench-write <db> <table> <N> [full\|normal\|off]` | Benchmark durable inserts via a long-lived `Connection` |
 | `sqlnano wal-status <db>`                            | Inspect the `*-snwal` sidecar                     |
@@ -347,7 +347,7 @@ src/sqlite/
   fts5.zig               FTS5 shadow-table reader + BM25 top-k
   fts5_bm25.zig          SQLite-style BM25 scoring
   tokenizer.zig          SQL tokenizer
-  parser.zig             SQL parser (SELECT / INSERT / UPDATE / DELETE subset)
+  parser.zig             SQL parser (DDL / SELECT / INSERT / UPDATE / DELETE subset)
   ast.zig                tiny AST
   sql.zig                query executor
   wal.zig                native sqlnano WAL (group commit + crash recovery)
