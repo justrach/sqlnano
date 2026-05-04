@@ -48,6 +48,11 @@ pub const Table = struct {
     }
 };
 
+pub const CountStats = struct {
+    entries: u64,
+    pages: u64,
+};
+
 pub fn scanTable(reader: page.PageReader, root_page: u32, allocator: std.mem.Allocator) TableError!Table {
     var rows: std.ArrayList(Row) = .empty;
     errdefer {
@@ -185,28 +190,44 @@ fn scanShouldStop(ctx: anytype) bool {
 /// allocation. Matches what SQLite's `SELECT COUNT(*)` compiles down
 /// to when there's no WHERE clause.
 pub fn countRows(reader: page.PageReader, root_page: u32) TableError!u64 {
-    var total: u64 = 0;
-    try countRowsPage(reader, root_page, &total);
-    return total;
+    return (try countBtreeEntries(reader, root_page)).entries;
 }
 
-fn countRowsPage(reader: page.PageReader, page_number: u32, total: *u64) TableError!void {
+pub fn countBtreeEntries(reader: page.PageReader, root_page: u32) TableError!CountStats {
+    var stats: CountStats = .{ .entries = 0, .pages = 0 };
+    try countBtreeEntriesPage(reader, root_page, &stats);
+    return stats;
+}
+
+fn countBtreeEntriesPage(reader: page.PageReader, page_number: u32, stats: *CountStats) TableError!void {
     const ref = try reader.page(page_number);
     const header = try btree.PageHeader.parse(ref);
+    stats.pages += 1;
     switch (header.page_type) {
-        .table_leaf => total.* += header.cell_count,
+        .table_leaf, .index_leaf => stats.entries += header.cell_count,
         .table_interior => {
             var i: usize = 0;
             while (i < header.cell_count) : (i += 1) {
                 const cell = try header.cell(ref, i);
                 if (cell.len < 5) return error.InvalidTableCell;
                 const left_child = readU32(cell[0..4]);
-                try countRowsPage(reader, left_child, total);
+                try countBtreeEntriesPage(reader, left_child, stats);
             }
             const right = header.right_most_pointer orelse return error.InvalidTableCell;
-            try countRowsPage(reader, right, total);
+            try countBtreeEntriesPage(reader, right, stats);
         },
-        else => return error.UnsupportedTableBTree,
+        .index_interior => {
+            stats.entries += header.cell_count;
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                if (cell.len < 4) return error.InvalidTableCell;
+                const left_child = readU32(cell[0..4]);
+                try countBtreeEntriesPage(reader, left_child, stats);
+            }
+            const right = header.right_most_pointer orelse return error.InvalidTableCell;
+            try countBtreeEntriesPage(reader, right, stats);
+        },
     }
 }
 
@@ -441,6 +462,31 @@ test "scan table root leaf page" {
     try std.testing.expectEqual(@as(usize, 1), table.rows.len);
     try std.testing.expectEqual(@as(i64, 7), table.rows[0].rowid);
     try std.testing.expectEqualStrings("alice", table.rows[0].values[1].text);
+}
+
+test "count btree entries handles index leaf pages" {
+    var bytes = [_]u8{0} ** 4096;
+    initTestHeader(bytes[0..], 4096, 1);
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.index_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 2;
+
+    const cell_1 = [_]u8{ 8, 3, 23, 9, 'a', 'l', 'i', 'c', 'e' };
+    const cell_2 = [_]u8{ 9, 3, 19, 1, 'b', 'o', 'b', 7 };
+    const cell_2_off = 4096 - cell_2.len;
+    const cell_1_off = cell_2_off - cell_1.len;
+    writeU16Test(bytes[page_base + 5 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 8 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 10 ..][0..2], @intCast(cell_2_off));
+    @memcpy(bytes[cell_1_off..][0..cell_1.len], &cell_1);
+    @memcpy(bytes[cell_2_off..][0..cell_2.len], &cell_2);
+
+    const reader = try page.PageReader.init(&bytes);
+    const stats = try countBtreeEntries(reader, 1);
+    try std.testing.expectEqual(@as(u64, 2), stats.entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.pages);
 }
 
 test "scan table foreach stops after caller sets stop_after" {

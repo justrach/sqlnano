@@ -1033,6 +1033,11 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     var rowid: ?i64 = null;
     var indexed_rowids: ?[]i64 = null;
     defer if (indexed_rowids) |ids| init.gpa.free(ids);
+    const count_root: u32 = if (is_count_star)
+        try sqlnano.sqlite.sql_mod.bestCountRootForTable(reader, schema, entry)
+    else
+        info.root_page;
+    if (is_count_star and count_root != info.root_page) mode = "count-star-index";
 
     // bench-read accepts the same tiny subset as before — a single
     // `col = lit` equality at the top of the WHERE tree. Anything
@@ -1087,7 +1092,7 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
                 }
             }
         } else if (is_count_star) {
-            const n = try sqlnano.sqlite.table_mod.countRows(reader, info.root_page);
+            const n = (try sqlnano.sqlite.table_mod.countBtreeEntries(reader, count_root)).entries;
             total_rows += @intCast(n);
         } else {
             // Zero-alloc full scan. `scanTableForEach` streams rows

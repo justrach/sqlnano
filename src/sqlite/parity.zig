@@ -57,7 +57,7 @@ pub const features = [_]Feature{
     .{
         .area = "Full query planner",
         .status = .partial,
-        .evidence = "Single-table WHERE with `rowid = N` or `indexed_col = lit` takes the direct-lookup / b-tree-pruned index-rowid fast path; everything else falls through to the general nested-loop scan (which handles JOIN + WHERE + ORDER BY + LIMIT + COUNT(*)). Joins are cross-product with incremental ON-predicate filtering; column resolution walks every source and rejects ambiguous unqualified refs.",
+        .evidence = "Single-table WHERE with `rowid = N` or `indexed_col = lit` takes the direct-lookup / b-tree-pruned index-rowid fast path. Simple COUNT(*) chooses the smallest table/index b-tree with matching cardinality and counts cells instead of rows. Everything else falls through to the general nested-loop scan (which handles JOIN + WHERE + ORDER BY + LIMIT). Joins are cross-product with incremental ON-predicate filtering; column resolution walks every source and rejects ambiguous unqualified refs.",
         .next = "Cost-based join ordering (current order is FROM-then-JOINs in source order), hash joins for large cross-products, index-driven sort pushdown for ORDER BY.",
     },
     .{

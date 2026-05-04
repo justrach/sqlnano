@@ -256,7 +256,7 @@ zig build test
 zig build test -Doptimize=ReleaseFast
 ```
 
-77 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
+78 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
 table/index creation, table rename/add-column/drop, table multi-leaf split verified by
 `PRAGMA integrity_check`, end-to-end INSERT/UPDATE/DELETE through `Connection`.
 

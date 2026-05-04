@@ -92,6 +92,11 @@ pub const QueryResult = struct {
     }
 };
 
+pub const CountPlan = struct {
+    root_page: u32,
+    stats: table.CountStats,
+};
+
 pub fn parseSelect(sql: []const u8, allocator: std.mem.Allocator) SqlError!SelectStatement {
     return parser_mod.parseSelect(sql, allocator) catch |err| return mapParseError(err);
 }
@@ -159,7 +164,7 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         stmt.projections.len == 1 and
         stmt.projections[0] == .count_star)
     {
-        return try buildPureCountResult(allocator, primary_info, primary_entry, reader, &sources);
+        return try buildPureCountResult(allocator, primary_info, primary_entry, db_schema, reader, &sources);
     }
 
     // The fast path only handles COUNT(*) among aggregates; if the
@@ -300,12 +305,13 @@ fn buildPureCountResult(
     allocator: std.mem.Allocator,
     primary_info: catalog.TableInfo,
     primary_entry: schema.SchemaEntry,
+    db_schema: schema.Schema,
     reader: page.PageReader,
     sources: *std.ArrayList(Source),
 ) SqlError!QueryResult {
     _ = sources;
-    _ = primary_entry;
-    const n = try table.countRows(reader, primary_info.root_page);
+    const count_plan = try bestCountPlanForTable(reader, db_schema, primary_entry);
+    const n = count_plan.stats.entries;
 
     var columns = try allocator.alloc(ResultColumn, 1);
     errdefer allocator.free(columns);
@@ -320,6 +326,40 @@ fn buildPureCountResult(
 
     const out_info = try cloneTableInfo(allocator, primary_info);
     return .{ .columns = columns, .table_info = out_info, .rows = rows };
+}
+
+pub fn bestCountRootForTable(reader: page.PageReader, db_schema: schema.Schema, table_entry: schema.SchemaEntry) SqlError!u32 {
+    return (try bestCountPlanForTable(reader, db_schema, table_entry)).root_page;
+}
+
+pub fn bestCountPlanForTable(reader: page.PageReader, db_schema: schema.Schema, table_entry: schema.SchemaEntry) SqlError!CountPlan {
+    if (table_entry.root_page <= 0) return error.TableNotFound;
+
+    var best: ?CountPlan = null;
+
+    for (db_schema.entries) |entry| {
+        if (!isUsableCountIndex(entry, table_entry.name)) continue;
+        const root: u32 = @intCast(entry.root_page);
+        const stats = table.countBtreeEntries(reader, root) catch continue;
+        if (best == null or stats.pages < best.?.stats.pages) {
+            best = .{ .root_page = root, .stats = stats };
+        }
+    }
+
+    if (best) |plan| return plan;
+
+    const table_root: u32 = @intCast(table_entry.root_page);
+    return .{
+        .root_page = table_root,
+        .stats = try table.countBtreeEntries(reader, table_root),
+    };
+}
+
+fn isUsableCountIndex(entry: schema.SchemaEntry, table_name: []const u8) bool {
+    if (!entry.isIndex() or entry.root_page <= 0) return false;
+    if (!asciiEql(entry.table_name, table_name)) return false;
+    if (entry.sql.len == 0) return true;
+    return !containsSqlKeyword(entry.sql, "WHERE");
 }
 
 /// Streaming single-table SELECT — the no-JOIN, no-ORDER-BY,
@@ -1860,6 +1900,24 @@ fn asciiEql(a: []const u8, b: []const u8) bool {
 /// Public wrapper for `main.zig`'s bench-read planner.
 pub fn asciiEqlPub(a: []const u8, b: []const u8) bool {
     return asciiEql(a, b);
+}
+
+fn containsSqlKeyword(sql: []const u8, keyword: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < sql.len) : (pos += 1) {
+        const before_ok = pos == 0 or !isIdent(sql[pos - 1]);
+        if (before_ok and startsWithKeyword(sql[pos..], keyword)) return true;
+    }
+    return false;
+}
+
+fn startsWithKeyword(text: []const u8, keyword: []const u8) bool {
+    if (text.len < keyword.len) return false;
+    if (text.len > keyword.len and isIdent(text[keyword.len])) return false;
+    for (keyword, 0..) |c, i| {
+        if (std.ascii.toUpper(text[i]) != c) return false;
+    }
+    return true;
 }
 
 fn isIdent(c: u8) bool {
