@@ -92,6 +92,11 @@ pub const QueryResult = struct {
     }
 };
 
+pub const CountPlan = struct {
+    root_page: u32,
+    stats: table.CountStats,
+};
+
 pub fn parseSelect(sql: []const u8, allocator: std.mem.Allocator) SqlError!SelectStatement {
     return parser_mod.parseSelect(sql, allocator) catch |err| return mapParseError(err);
 }
@@ -159,7 +164,29 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         stmt.projections.len == 1 and
         stmt.projections[0] == .count_star)
     {
-        return try buildPureCountResult(allocator, primary_info, primary_entry, reader, &sources);
+        return try buildPureCountResult(allocator, primary_info, primary_entry, db_schema, reader, stmt.projections[0]);
+    }
+
+    // --- Filtered COUNT(*) shortcut for point/index equality.
+    // The general indexed fast path hydrates table rows after getting
+    // rowids, which is useful for SELECT * but wasted for COUNT(*).
+    // Count directly from the table key/index hit count when the
+    // predicate shape is exact and single-table.
+    if (stmt.joins.len == 0 and
+        stmt.projections.len == 1 and
+        stmt.projections[0] == .count_star and
+        stmt.where_expr != null)
+    {
+        const where_expr = stmt.where_expr.?;
+        if (asSimpleRowidEq(where_expr)) |rid| {
+            const n: u64 = if (try table.rowidExists(reader, primary_info.root_page, rid)) 1 else 0;
+            return try buildCountResult(allocator, primary_info, stmt.projections[0], n);
+        }
+        if (asIndexableEq(where_expr)) |ieq| {
+            if (try indexedCountForColumn(reader, db_schema, primary_info, ieq.column_name, ieq.value, ascratch)) |n| {
+                return try buildCountResult(allocator, primary_info, stmt.projections[0], n);
+            }
+        }
     }
 
     // The fast path only handles COUNT(*) among aggregates; if the
@@ -174,21 +201,28 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
     // --- Fast path: single-table, WHERE is either `rowid = N` or an
     // indexed-column equality. ---
     if (!has_non_count_agg and sources.items.len == 1 and stmt.where_expr != null) {
+        const natural_rowid_order = if (stmt.order_by) |ob| isNaturalRowidAscOrder(ob, sources.items[0]) else false;
         if (asSimpleRowidEq(stmt.where_expr.?)) |rid| {
             return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, rid, null, allocator, ascratch);
         }
-        if (asIndexableEq(stmt.where_expr.?)) |ieq| {
-            const rowids = try indexedRowidsForColumn(reader, db_schema, primary_info, ieq.column_name, ieq.value, ascratch);
-            if (rowids) |rids| {
-                return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
+        if (stmt.order_by == null or natural_rowid_order) {
+            if (asIndexableEq(stmt.where_expr.?)) |ieq| {
+                const rowids = try indexedRowidsForColumn(reader, db_schema, primary_info, ieq.column_name, ieq.value, ascratch);
+                if (rowids) |rids| {
+                    return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
+                }
             }
         }
     }
 
-    // --- Streaming fast path: single source, no ORDER BY.
+    // --- Streaming fast path: single source, no ORDER BY, or natural
+    // rowid ASC order. Table b-trees are already visited in ascending
+    // rowid order, so ORDER BY rowid/IPK ASC LIMIT can stop early.
     // We can walk the table via `scanTableForEach` and apply
     // WHERE / projection per row, skipping full scan materialisation.
-    if (sources.items.len == 1 and stmt.order_by == null) {
+    if (sources.items.len == 1 and
+        (stmt.order_by == null or isNaturalRowidAscOrder(stmt.order_by.?, sources.items[0])))
+    {
         var has_agg = false;
         for (stmt.projections) |p| {
             if (p == .count_star or p == .aggregate) {
@@ -300,26 +334,75 @@ fn buildPureCountResult(
     allocator: std.mem.Allocator,
     primary_info: catalog.TableInfo,
     primary_entry: schema.SchemaEntry,
+    db_schema: schema.Schema,
     reader: page.PageReader,
-    sources: *std.ArrayList(Source),
+    projection: ast.Projection,
 ) SqlError!QueryResult {
-    _ = sources;
-    _ = primary_entry;
-    const n = try table.countRows(reader, primary_info.root_page);
+    const count_plan = try bestCountPlanForTable(reader, db_schema, primary_entry);
+    return try buildCountResult(allocator, primary_info, projection, count_plan.stats.entries);
+}
 
+fn buildCountResult(
+    allocator: std.mem.Allocator,
+    primary_info: catalog.TableInfo,
+    projection: ast.Projection,
+    n: u64,
+) SqlError!QueryResult {
+    const label = countStarLabel(projection);
     var columns = try allocator.alloc(ResultColumn, 1);
     errdefer allocator.free(columns);
-    columns[0] = .{ .name = "COUNT(*)" };
+    columns[0] = .{ .name = label };
 
     var values = try allocator.alloc(ResultCell, 1);
     errdefer allocator.free(values);
-    values[0] = .{ .name = "COUNT(*)", .value = .{ .integer = @intCast(n) } };
+    values[0] = .{ .name = label, .value = .{ .integer = @intCast(n) } };
 
     var rows = try allocator.alloc(ResultRow, 1);
     rows[0] = .{ .rowid = -1, .values = values };
 
     const out_info = try cloneTableInfo(allocator, primary_info);
     return .{ .columns = columns, .table_info = out_info, .rows = rows };
+}
+
+fn countStarLabel(projection: ast.Projection) []const u8 {
+    return switch (projection) {
+        .count_star => |cs| cs.alias orelse "COUNT(*)",
+        else => "COUNT(*)",
+    };
+}
+
+pub fn bestCountRootForTable(reader: page.PageReader, db_schema: schema.Schema, table_entry: schema.SchemaEntry) SqlError!u32 {
+    return (try bestCountPlanForTable(reader, db_schema, table_entry)).root_page;
+}
+
+pub fn bestCountPlanForTable(reader: page.PageReader, db_schema: schema.Schema, table_entry: schema.SchemaEntry) SqlError!CountPlan {
+    if (table_entry.root_page <= 0) return error.TableNotFound;
+
+    var best: ?CountPlan = null;
+
+    for (db_schema.entries) |entry| {
+        if (!isUsableCountIndex(entry, table_entry.name)) continue;
+        const root: u32 = @intCast(entry.root_page);
+        const stats = table.countBtreeEntries(reader, root) catch continue;
+        if (best == null or stats.pages < best.?.stats.pages) {
+            best = .{ .root_page = root, .stats = stats };
+        }
+    }
+
+    if (best) |plan| return plan;
+
+    const table_root: u32 = @intCast(table_entry.root_page);
+    return .{
+        .root_page = table_root,
+        .stats = try table.countBtreeEntries(reader, table_root),
+    };
+}
+
+fn isUsableCountIndex(entry: schema.SchemaEntry, table_name: []const u8) bool {
+    if (!entry.isIndex() or entry.root_page <= 0) return false;
+    if (!asciiEql(entry.table_name, table_name)) return false;
+    if (entry.sql.len == 0) return true;
+    return !containsSqlKeyword(entry.sql, "WHERE");
 }
 
 /// Streaming single-table SELECT — the no-JOIN, no-ORDER-BY,
@@ -352,9 +435,11 @@ fn streamSingleTable(
         sources: []const Source,
         stmt: SelectStatement,
         compiled_where: ?CompiledExpr,
+        columns: []const ResultColumn,
         rows_out: *std.ArrayList(ResultRow),
         allocator: std.mem.Allocator,
         ascratch: std.mem.Allocator,
+        simple_projection: bool,
         emitted: i64,
         limit: i64,
         stop_after: bool, // set to true once limit hit
@@ -367,9 +452,11 @@ fn streamSingleTable(
         .sources = sources,
         .stmt = stmt,
         .compiled_where = compiled_where,
+        .columns = columns,
         .rows_out = &rows,
         .allocator = allocator,
         .ascratch = ascratch,
+        .simple_projection = projectionsAreSimpleSingleSource(stmt.projections),
         .emitted = 0,
         .limit = stmt.limit orelse std.math.maxInt(i64),
         .stop_after = false,
@@ -378,18 +465,25 @@ fn streamSingleTable(
     const onRow = struct {
         fn call(c: *Ctx, rowid: i64, values: []const record.Value) SqlError!void {
             if (c.stop_after) return;
-            // Build a synthetic 1-element tuple for the executor's
-            // tuple-shaped predicates / projection. The row's `values`
-            // slice points into the page buffer; legal as long as
-            // we don't outlive the callback.
-            const arena_values = try c.ascratch.alloc(record.Value, values.len);
-            @memcpy(arena_values, values);
-            const row_in_arena = table.Row{ .rowid = rowid, .values = arena_values };
-            var tuple_buf: [1]SourcedRow = .{.{ .source_index = 0, .row = row_in_arena }};
-            if (c.compiled_where) |*cw| {
-                if (!isTruthy(try evalCompiled(cw, &tuple_buf, c.ascratch))) return;
+            var tuple_buf: [1]SourcedRow = undefined;
+            var have_tuple = false;
+            if (c.compiled_where != null or !c.simple_projection) {
+                // Build a synthetic 1-element tuple for tuple-shaped
+                // predicates / expression projections. Simple column
+                // projections below borrow `values` directly.
+                const arena_values = try c.ascratch.alloc(record.Value, values.len);
+                @memcpy(arena_values, values);
+                const row_in_arena = table.Row{ .rowid = rowid, .values = arena_values };
+                tuple_buf[0] = .{ .source_index = 0, .row = row_in_arena };
+                have_tuple = true;
             }
-            const out_values = try projectTuple(c.allocator, c.stmt.projections, c.sources, &tuple_buf, &.{}, c.ascratch);
+            if (c.compiled_where) |*cw| {
+                if (!isTruthy(try evalCompiled(cw, tuple_buf[0..], c.ascratch))) return;
+            }
+            const out_values = if (c.simple_projection)
+                try projectSingleSourceRow(c.allocator, c.stmt.projections, c.sources[0], rowid, values, c.columns)
+            else
+                try projectTuple(c.allocator, c.stmt.projections, c.sources, tuple_buf[0..@intFromBool(have_tuple)], c.columns, c.ascratch);
             try c.rows_out.append(c.allocator, .{ .rowid = rowid, .values = out_values });
             c.emitted += 1;
             if (c.emitted >= c.limit) c.stop_after = true;
@@ -1515,7 +1609,6 @@ fn projectTuple(
     columns: []const ResultColumn,
     scratch: std.mem.Allocator,
 ) SqlError![]ResultCell {
-    _ = columns;
     var out: std.ArrayList(ResultCell) = .empty;
     errdefer {
         for (out.items) |c| switch (c.value) {
@@ -1525,6 +1618,7 @@ fn projectTuple(
         };
         out.deinit(allocator);
     }
+    try out.ensureTotalCapacity(allocator, columns.len);
 
     for (projections) |p| {
         switch (p) {
@@ -1589,6 +1683,74 @@ fn projectTuple(
     return try out.toOwnedSlice(allocator);
 }
 
+fn projectionsAreSimpleSingleSource(projections: []const ast.Projection) bool {
+    for (projections) |p| switch (p) {
+        .star, .table_star, .column => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn projectSingleSourceRow(
+    allocator: std.mem.Allocator,
+    projections: []const ast.Projection,
+    source: Source,
+    rowid: i64,
+    values: []const record.Value,
+    columns: []const ResultColumn,
+) SqlError![]ResultCell {
+    var out: std.ArrayList(ResultCell) = .empty;
+    errdefer {
+        for (out.items) |c| switch (c.value) {
+            .text => |t| allocator.free(t),
+            .blob => |b| allocator.free(b),
+            else => {},
+        };
+        out.deinit(allocator);
+    }
+    try out.ensureTotalCapacity(allocator, columns.len);
+
+    for (projections) |p| switch (p) {
+        .star => {
+            for (source.info.columns, 0..) |c, idx| {
+                const v = rowColumnValue(source.info, rowid, values, idx);
+                out.appendAssumeCapacity(.{ .name = c.name, .value = try dupValue(allocator, v) });
+            }
+        },
+        .table_star => |qname| {
+            if (!source.matches(qname)) return error.TableNotFound;
+            for (source.info.columns, 0..) |c, idx| {
+                const v = rowColumnValue(source.info, rowid, values, idx);
+                out.appendAssumeCapacity(.{ .name = c.name, .value = try dupValue(allocator, v) });
+            }
+        },
+        .column => |col| {
+            if (col.ref.qualifier) |q| {
+                if (!source.matches(q)) return error.ColumnNotFound;
+            }
+            const v = if (asciiEql(col.ref.name, "rowid"))
+                record.Value{ .integer = rowid }
+            else blk: {
+                const idx = columnIndex(source.info, col.ref.name) orelse return error.ColumnNotFound;
+                break :blk rowColumnValue(source.info, rowid, values, idx);
+            };
+            const label = col.alias orelse col.ref.name;
+            out.appendAssumeCapacity(.{ .name = label, .value = try dupValue(allocator, v) });
+        },
+        .expr, .count_star, .aggregate => unreachable,
+    };
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn rowColumnValue(info: catalog.TableInfo, rowid: i64, values: []const record.Value, idx: usize) record.Value {
+    var v: record.Value = if (idx < values.len) values[idx] else .null;
+    if (info.integer_primary_key_index) |ipk| {
+        if (idx == ipk and v == .null) v = .{ .integer = rowid };
+    }
+    return v;
+}
+
 fn dupValue(allocator: std.mem.Allocator, v: record.Value) !record.Value {
     return switch (v) {
         .text => |t| .{ .text = try allocator.dupe(u8, t) },
@@ -1623,6 +1785,16 @@ fn asSimpleRowidEq(expr: *ast.Expr) ?i64 {
         .integer => |v| v,
         else => null,
     };
+}
+
+fn isNaturalRowidAscOrder(order_by: ast.OrderBy, source: Source) bool {
+    if (order_by.descending) return false;
+    if (order_by.column.qualifier) |q| {
+        if (!source.matches(q)) return false;
+    }
+    if (asciiEql(order_by.column.name, "rowid")) return true;
+    const idx = columnIndex(source.info, order_by.column.name) orelse return false;
+    return if (source.info.integer_primary_key_index) |ipk| idx == ipk else false;
 }
 
 /// Single-table SELECT fast-path planner: takes a direct rowid or a
@@ -1665,11 +1837,9 @@ fn buildFromSingleTable(
         for (stmt.projections) |p| if (p != .count_star) return error.UnsupportedSql;
         var n: i64 = 0;
         if (direct_rowid) |rid| {
-            if (try table.findRowByRowid(reader, info.root_page, rid, ascratch)) |_| n = 1;
+            if (try table.rowidExists(reader, info.root_page, rid)) n = 1;
         } else if (indexed_rowids) |rids| {
-            for (rids) |rid| {
-                if (try table.findRowByRowid(reader, info.root_page, rid, ascratch)) |_| n += 1;
-            }
+            n = @intCast(rids.len);
         }
         const values = try allocator.alloc(ResultCell, columns.len);
         for (values, 0..) |*v, i| v.* = .{ .name = columns[i].name, .value = .{ .integer = n } };
@@ -1775,17 +1945,30 @@ pub fn indexedRowidsForColumn(
 ) SqlError!?[]i64 {
     if (asciiEql(column_name, "rowid")) return null;
     const index_entry = findIndexForColumn(db_schema, info.name, column_name) orelse return null;
-    const scanned = try index_mod.scanIndex(reader, @intCast(index_entry.root_page), allocator);
-    defer scanned.deinit(allocator);
+    const lookup: index_mod.LookupValue = switch (value) {
+        .null => .null,
+        .integer => |v| .{ .integer = v },
+        .text => |v| .{ .text = v },
+    };
+    return try index_mod.rowidsForFirstColumnEquals(reader, @intCast(index_entry.root_page), lookup, allocator);
+}
 
-    var rowids: std.ArrayList(i64) = .empty;
-    errdefer rowids.deinit(allocator);
-    for (scanned.entries) |entry| {
-        if (entry.values.len < 2) continue;
-        if (!literalMatches(entry.values[0], value)) continue;
-        if (entry.rowid()) |rowid| try rowids.append(allocator, rowid);
-    }
-    return try rowids.toOwnedSlice(allocator);
+pub fn indexedCountForColumn(
+    reader: page.PageReader,
+    db_schema: schema.Schema,
+    info: catalog.TableInfo,
+    column_name: []const u8,
+    value: Literal,
+    allocator: std.mem.Allocator,
+) SqlError!?u64 {
+    if (asciiEql(column_name, "rowid")) return null;
+    const index_entry = findIndexForColumn(db_schema, info.name, column_name) orelse return null;
+    const lookup: index_mod.LookupValue = switch (value) {
+        .null => .null,
+        .integer => |v| .{ .integer = v },
+        .text => |v| .{ .text = v },
+    };
+    return try index_mod.countEntriesForFirstColumnEquals(reader, @intCast(index_entry.root_page), lookup, allocator);
 }
 
 fn findIndexForColumn(db_schema: schema.Schema, table_name: []const u8, column_name: []const u8) ?schema.SchemaEntry {
@@ -1793,6 +1976,7 @@ fn findIndexForColumn(db_schema: schema.Schema, table_name: []const u8, column_n
         if (!entry.isIndex() or entry.root_page <= 0) continue;
         if (!asciiEql(entry.table_name, table_name)) continue;
         if (entry.sql.len == 0) continue;
+        if (containsSqlKeyword(entry.sql, "WHERE")) continue;
         const indexed_column = parseFirstIndexColumn(entry.sql) orelse continue;
         if (asciiEql(indexed_column, column_name)) return entry;
     }
@@ -1867,6 +2051,24 @@ pub fn asciiEqlPub(a: []const u8, b: []const u8) bool {
     return asciiEql(a, b);
 }
 
+fn containsSqlKeyword(sql: []const u8, keyword: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < sql.len) : (pos += 1) {
+        const before_ok = pos == 0 or !isIdent(sql[pos - 1]);
+        if (before_ok and startsWithKeyword(sql[pos..], keyword)) return true;
+    }
+    return false;
+}
+
+fn startsWithKeyword(text: []const u8, keyword: []const u8) bool {
+    if (text.len < keyword.len) return false;
+    if (text.len > keyword.len and isIdent(text[keyword.len])) return false;
+    for (keyword, 0..) |c, i| {
+        if (std.ascii.toUpper(text[i]) != c) return false;
+    }
+    return true;
+}
+
 fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
@@ -1874,4 +2076,61 @@ fn isIdent(c: u8) bool {
 test "parse indexed column from create index" {
     try std.testing.expectEqualStrings("name", parseFirstIndexColumn("CREATE INDEX idx_users_name ON users(name)").?);
     try std.testing.expectEqualStrings("user name", parseFirstIndexColumn("CREATE INDEX idx ON users(\"user name\")").?);
+}
+
+test "findIndexForColumn skips partial indexes" {
+    var entries = [_]schema.SchemaEntry{
+        .{
+            .rowid = 1,
+            .object_type = "index",
+            .name = "idx_partial",
+            .table_name = "users",
+            .root_page = 3,
+            .sql = "CREATE INDEX idx_partial ON users(name) WHERE active = 1",
+        },
+        .{
+            .rowid = 2,
+            .object_type = "index",
+            .name = "idx_name",
+            .table_name = "users",
+            .root_page = 4,
+            .sql = "CREATE INDEX idx_name ON users(name)",
+        },
+    };
+    const db_schema = schema.Schema{ .entries = entries[0..] };
+    const entry = findIndexForColumn(db_schema, "users", "name").?;
+    try std.testing.expectEqualStrings("idx_name", entry.name);
+}
+
+test "natural rowid order recognizes rowid and integer primary key asc" {
+    var columns = [_]catalog.Column{
+        .{ .name = "id", .affinity = .integer, .is_integer_primary_key = true },
+        .{ .name = "name", .affinity = .text },
+    };
+    const source = Source{
+        .info = .{
+            .name = "users",
+            .root_page = 2,
+            .columns = columns[0..],
+            .integer_primary_key_index = 0,
+        },
+        .alias = "u",
+    };
+
+    try std.testing.expect(isNaturalRowidAscOrder(.{
+        .column = .{ .qualifier = null, .name = "rowid" },
+        .descending = false,
+    }, source));
+    try std.testing.expect(isNaturalRowidAscOrder(.{
+        .column = .{ .qualifier = "u", .name = "id" },
+        .descending = false,
+    }, source));
+    try std.testing.expect(!isNaturalRowidAscOrder(.{
+        .column = .{ .qualifier = "other", .name = "id" },
+        .descending = false,
+    }, source));
+    try std.testing.expect(!isNaturalRowidAscOrder(.{
+        .column = .{ .qualifier = null, .name = "id" },
+        .descending = true,
+    }, source));
 }

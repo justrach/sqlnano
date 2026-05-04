@@ -48,6 +48,11 @@ pub const Table = struct {
     }
 };
 
+pub const CountStats = struct {
+    entries: u64,
+    pages: u64,
+};
+
 pub fn scanTable(reader: page.PageReader, root_page: u32, allocator: std.mem.Allocator) TableError!Table {
     var rows: std.ArrayList(Row) = .empty;
     errdefer {
@@ -185,33 +190,53 @@ fn scanShouldStop(ctx: anytype) bool {
 /// allocation. Matches what SQLite's `SELECT COUNT(*)` compiles down
 /// to when there's no WHERE clause.
 pub fn countRows(reader: page.PageReader, root_page: u32) TableError!u64 {
-    var total: u64 = 0;
-    try countRowsPage(reader, root_page, &total);
-    return total;
+    return (try countBtreeEntries(reader, root_page)).entries;
 }
 
-fn countRowsPage(reader: page.PageReader, page_number: u32, total: *u64) TableError!void {
+pub fn countBtreeEntries(reader: page.PageReader, root_page: u32) TableError!CountStats {
+    var stats: CountStats = .{ .entries = 0, .pages = 0 };
+    try countBtreeEntriesPage(reader, root_page, &stats);
+    return stats;
+}
+
+fn countBtreeEntriesPage(reader: page.PageReader, page_number: u32, stats: *CountStats) TableError!void {
     const ref = try reader.page(page_number);
     const header = try btree.PageHeader.parse(ref);
+    stats.pages += 1;
     switch (header.page_type) {
-        .table_leaf => total.* += header.cell_count,
+        .table_leaf, .index_leaf => stats.entries += header.cell_count,
         .table_interior => {
             var i: usize = 0;
             while (i < header.cell_count) : (i += 1) {
                 const cell = try header.cell(ref, i);
                 if (cell.len < 5) return error.InvalidTableCell;
                 const left_child = readU32(cell[0..4]);
-                try countRowsPage(reader, left_child, total);
+                try countBtreeEntriesPage(reader, left_child, stats);
             }
             const right = header.right_most_pointer orelse return error.InvalidTableCell;
-            try countRowsPage(reader, right, total);
+            try countBtreeEntriesPage(reader, right, stats);
         },
-        else => return error.UnsupportedTableBTree,
+        .index_interior => {
+            stats.entries += header.cell_count;
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                if (cell.len < 4) return error.InvalidTableCell;
+                const left_child = readU32(cell[0..4]);
+                try countBtreeEntriesPage(reader, left_child, stats);
+            }
+            const right = header.right_most_pointer orelse return error.InvalidTableCell;
+            try countBtreeEntriesPage(reader, right, stats);
+        },
     }
 }
 
 pub fn findRowByRowid(reader: page.PageReader, root_page: u32, wanted_rowid: i64, allocator: std.mem.Allocator) TableError!?Row {
     return findRowInPage(reader, root_page, wanted_rowid, allocator);
+}
+
+pub fn rowidExists(reader: page.PageReader, root_page: u32, wanted_rowid: i64) TableError!bool {
+    return rowidExistsInPage(reader, root_page, wanted_rowid);
 }
 
 fn findRowInPage(reader: page.PageReader, page_number: u32, wanted_rowid: i64, allocator: std.mem.Allocator) TableError!?Row {
@@ -222,6 +247,18 @@ fn findRowInPage(reader: page.PageReader, page_number: u32, wanted_rowid: i64, a
     return switch (header.page_type) {
         .table_leaf => try findRowInLeaf(reader, ref, header, wanted_rowid, allocator),
         .table_interior => try findRowInInterior(reader, ref, header, wanted_rowid, allocator),
+        else => error.UnsupportedTableBTree,
+    };
+}
+
+fn rowidExistsInPage(reader: page.PageReader, page_number: u32, wanted_rowid: i64) TableError!bool {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    if (!header.page_type.isTable()) return error.UnsupportedTableBTree;
+
+    return switch (header.page_type) {
+        .table_leaf => try rowidExistsInLeaf(ref, header, wanted_rowid),
+        .table_interior => try rowidExistsInInterior(reader, ref, header, wanted_rowid),
         else => error.UnsupportedTableBTree,
     };
 }
@@ -242,6 +279,24 @@ fn findRowInLeaf(reader: page.PageReader, ref: page.PageRef, header: btree.PageH
         }
     }
     return null;
+}
+
+fn rowidExistsInLeaf(ref: page.PageRef, header: btree.PageHeader, wanted_rowid: i64) TableError!bool {
+    var lo: usize = 0;
+    var hi: usize = header.cell_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const cell = try header.cell(ref, mid);
+        const prefix = try parseTableLeafCellPrefix(cell);
+        if (wanted_rowid < prefix.rowid) {
+            hi = mid;
+        } else if (wanted_rowid > prefix.rowid) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn findRowInInterior(reader: page.PageReader, ref: page.PageRef, header: btree.PageHeader, wanted_rowid: i64, allocator: std.mem.Allocator) TableError!?Row {
@@ -268,6 +323,32 @@ fn findRowInInterior(reader: page.PageReader, ref: page.PageRef, header: btree.P
 
     const right = header.right_most_pointer orelse return error.InvalidTableCell;
     return try findRowInPage(reader, right, wanted_rowid, allocator);
+}
+
+fn rowidExistsInInterior(reader: page.PageReader, ref: page.PageRef, header: btree.PageHeader, wanted_rowid: i64) TableError!bool {
+    var lo: usize = 0;
+    var hi: usize = header.cell_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const cell = try header.cell(ref, mid);
+        if (cell.len < 5) return error.InvalidTableCell;
+        const sep = try parseVarint(cell[4..]);
+        if (wanted_rowid <= @as(i64, @intCast(sep.value))) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    if (lo < header.cell_count) {
+        const cell = try header.cell(ref, lo);
+        if (cell.len < 5) return error.InvalidTableCell;
+        const left_child = readU32(cell[0..4]);
+        return try rowidExistsInPage(reader, left_child, wanted_rowid);
+    }
+
+    const right = header.right_most_pointer orelse return error.InvalidTableCell;
+    return try rowidExistsInPage(reader, right, wanted_rowid);
 }
 
 fn scanTablePage(reader: page.PageReader, page_number: u32, allocator: std.mem.Allocator, rows: *std.ArrayList(Row)) TableError!void {
@@ -441,6 +522,56 @@ test "scan table root leaf page" {
     try std.testing.expectEqual(@as(usize, 1), table.rows.len);
     try std.testing.expectEqual(@as(i64, 7), table.rows[0].rowid);
     try std.testing.expectEqualStrings("alice", table.rows[0].values[1].text);
+}
+
+test "rowidExists checks leaf keys without decoding payload" {
+    var bytes = [_]u8{0} ** 4096;
+    initTestHeader(bytes[0..], 4096, 1);
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.table_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 2;
+
+    const cell_1 = [_]u8{ 5, 3, 3, 1, 1, 10, 20 };
+    const cell_2 = [_]u8{ 5, 9, 3, 1, 1, 30, 40 };
+    const cell_2_off = 4096 - cell_2.len;
+    const cell_1_off = cell_2_off - cell_1.len;
+    writeU16Test(bytes[page_base + 5 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 8 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 10 ..][0..2], @intCast(cell_2_off));
+    @memcpy(bytes[cell_1_off..][0..cell_1.len], &cell_1);
+    @memcpy(bytes[cell_2_off..][0..cell_2.len], &cell_2);
+
+    const reader = try page.PageReader.init(&bytes);
+    try std.testing.expect(try rowidExists(reader, 1, 3));
+    try std.testing.expect(try rowidExists(reader, 1, 9));
+    try std.testing.expect(!(try rowidExists(reader, 1, 4)));
+}
+
+test "count btree entries handles index leaf pages" {
+    var bytes = [_]u8{0} ** 4096;
+    initTestHeader(bytes[0..], 4096, 1);
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.index_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 2;
+
+    const cell_1 = [_]u8{ 8, 3, 23, 9, 'a', 'l', 'i', 'c', 'e' };
+    const cell_2 = [_]u8{ 9, 3, 19, 1, 'b', 'o', 'b', 7 };
+    const cell_2_off = 4096 - cell_2.len;
+    const cell_1_off = cell_2_off - cell_1.len;
+    writeU16Test(bytes[page_base + 5 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 8 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 10 ..][0..2], @intCast(cell_2_off));
+    @memcpy(bytes[cell_1_off..][0..cell_1.len], &cell_1);
+    @memcpy(bytes[cell_2_off..][0..cell_2.len], &cell_2);
+
+    const reader = try page.PageReader.init(&bytes);
+    const stats = try countBtreeEntries(reader, 1);
+    try std.testing.expectEqual(@as(u64, 2), stats.entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.pages);
 }
 
 test "scan table foreach stops after caller sets stop_after" {

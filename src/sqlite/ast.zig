@@ -212,6 +212,23 @@ pub const CreateIndexStatement = struct {
     unique: bool = false,
 };
 
+pub const AlterTableKind = enum {
+    rename_table,
+    add_column,
+};
+
+pub const AlterTableStatement = struct {
+    table_name: []const u8,
+    kind: AlterTableKind,
+    new_table_name: ?[]const u8 = null,
+    column_sql: ?[]const u8 = null,
+};
+
+pub const DropTableStatement = struct {
+    table_name: []const u8,
+    if_exists: bool = false,
+};
+
 pub const Assignment = struct {
     column_name: []const u8,
     value: Literal,
