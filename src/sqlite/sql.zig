@@ -189,6 +189,13 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         }
     }
 
+    // --- MIN/MAX shortcut: `SELECT MIN(indexed_col) FROM t` or
+    // `SELECT MAX(indexed_col) FROM t` can read one non-NULL edge
+    // value from the index instead of scanning table rows.
+    if (try buildIndexedMinMaxResult(allocator, primary_info, db_schema, reader, stmt, sources.items, ascratch)) |result| {
+        return result;
+    }
+
     // The fast path only handles COUNT(*) among aggregates; if the
     // query mentions SUM/MIN/MAX/AVG/COUNT(col) fall through to the
     // general scan so reduceAggregates can do the math.
@@ -340,6 +347,58 @@ fn buildPureCountResult(
 ) SqlError!QueryResult {
     const count_plan = try bestCountPlanForTable(reader, db_schema, primary_entry);
     return try buildCountResult(allocator, primary_info, projection, count_plan.stats.entries);
+}
+
+fn buildIndexedMinMaxResult(
+    allocator: std.mem.Allocator,
+    primary_info: catalog.TableInfo,
+    db_schema: schema.Schema,
+    reader: page.PageReader,
+    stmt: SelectStatement,
+    sources: []const Source,
+    ascratch: std.mem.Allocator,
+) SqlError!?QueryResult {
+    if (stmt.where_expr != null or stmt.joins.len != 0 or stmt.projections.len != 1) return null;
+    if (stmt.projections[0] != .aggregate) return null;
+
+    const ag = stmt.projections[0].aggregate;
+    if (ag.func != .min and ag.func != .max) return null;
+    if (ag.column.qualifier) |q| {
+        if (sources.len == 0 or !sources[0].matches(q)) return null;
+    }
+    if (asciiEql(ag.column.name, "rowid")) return null;
+
+    const index_entry = findIndexForColumn(db_schema, primary_info.name, ag.column.name) orelse return null;
+    const edge = try index_mod.firstNonNullFirstColumnEdgeValue(
+        reader,
+        @intCast(index_entry.root_page),
+        ag.func == .max,
+        ascratch,
+    );
+
+    const columns = try buildResultColumns(allocator, stmt.projections, sources);
+    errdefer allocator.free(columns);
+
+    var value: record.Value = .null;
+    if (edge) |edge_value| {
+        defer edge_value.deinit(ascratch);
+        value = try dupValue(allocator, edge_value.value);
+    }
+    errdefer freeValue(allocator, value);
+
+    var values = try allocator.alloc(ResultCell, 1);
+    errdefer allocator.free(values);
+    values[0] = .{ .name = columns[0].name, .value = value };
+
+    var rows = try allocator.alloc(ResultRow, 1);
+    errdefer allocator.free(rows);
+    rows[0] = .{ .rowid = -1, .values = values };
+
+    return .{
+        .columns = columns,
+        .table_info = try cloneTableInfo(allocator, primary_info),
+        .rows = rows,
+    };
 }
 
 fn buildCountResult(
@@ -1757,6 +1816,14 @@ fn dupValue(allocator: std.mem.Allocator, v: record.Value) !record.Value {
         .blob => |b| .{ .blob = try allocator.dupe(u8, b) },
         else => v,
     };
+}
+
+fn freeValue(allocator: std.mem.Allocator, v: record.Value) void {
+    switch (v) {
+        .text => |t| allocator.free(t),
+        .blob => |b| allocator.free(b),
+        else => {},
+    }
 }
 
 /// Extract `col = literal` (or `col = literal`'s mirror) from an

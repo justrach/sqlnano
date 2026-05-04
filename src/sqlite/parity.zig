@@ -39,7 +39,7 @@ pub const features = [_]Feature{
     .{
         .area = "Index b-tree reads",
         .status = .partial,
-        .evidence = "Scans simple indexes, uses b-tree-pruned non-partial single-column equality indexes for SELECT and FTS pre-filters, and can count first-column equality matches without materializing rowids.",
+        .evidence = "Scans simple indexes, uses b-tree-pruned non-partial single-column equality indexes for SELECT and FTS pre-filters, can count first-column equality matches without materializing rowids, and can read the first/last non-NULL first-column edge value for MIN/MAX shortcuts.",
         .next = "Implement range traversal, ORDER BY pushdown, and broader composite-index planning.",
     },
     .{
@@ -57,7 +57,7 @@ pub const features = [_]Feature{
     .{
         .area = "Full query planner",
         .status = .partial,
-        .evidence = "Single-table WHERE with `rowid = N` or `indexed_col = lit` takes the direct-lookup / b-tree-pruned index-rowid fast path. Filtered COUNT(*) over rowid/index equality counts keys directly instead of hydrating rows. Simple COUNT(*) chooses the smallest table/index b-tree with matching cardinality and counts cells instead of rows. Single-source ORDER BY rowid ASC (or integer-primary-key alias ASC) streams in natural b-tree order and can stop at LIMIT. Everything else falls through to the general nested-loop scan (which handles JOIN + WHERE + ORDER BY + LIMIT). Joins are cross-product with incremental ON-predicate filtering; column resolution walks every source and rejects ambiguous unqualified refs.",
+        .evidence = "Single-table WHERE with `rowid = N` or `indexed_col = lit` takes the direct-lookup / b-tree-pruned index-rowid fast path. Filtered COUNT(*) over rowid/index equality counts keys directly instead of hydrating rows. Simple COUNT(*) chooses the smallest table/index b-tree with matching cardinality and counts cells instead of rows. Simple MIN/MAX over an indexed column reads one non-NULL index edge value instead of scanning rows. Single-source ORDER BY rowid ASC (or integer-primary-key alias ASC) streams in natural b-tree order and can stop at LIMIT. Everything else falls through to the general nested-loop scan (which handles JOIN + WHERE + ORDER BY + LIMIT). Joins are cross-product with incremental ON-predicate filtering; column resolution walks every source and rejects ambiguous unqualified refs.",
         .next = "Cost-based join ordering (current order is FROM-then-JOINs in source order), hash joins for large cross-products, broader index-driven sort pushdown for ORDER BY.",
     },
     .{

@@ -77,6 +77,15 @@ const FirstValueView = struct {
     }
 };
 
+pub const EdgeValue = struct {
+    value: record.Value,
+    owned: ?IndexEntry = null,
+
+    pub fn deinit(self: EdgeValue, allocator: std.mem.Allocator) void {
+        if (self.owned) |entry| entry.deinit(allocator);
+    }
+};
+
 pub fn scanIndex(reader: page.PageReader, root_page: u32, allocator: std.mem.Allocator) IndexError!Index {
     var entries: std.ArrayList(IndexEntry) = .empty;
     errdefer {
@@ -111,6 +120,18 @@ pub fn countEntriesForFirstColumnEquals(
     allocator: std.mem.Allocator,
 ) IndexError!u64 {
     return try countEntriesForFirstColumnEqualsPage(reader, root_page, value, allocator);
+}
+
+/// Return the first non-NULL first-column value from the left or right
+/// edge of an index b-tree. This is the direct b-tree-reader version
+/// of SQLite's MIN/MAX index-edge shortcut.
+pub fn firstNonNullFirstColumnEdgeValue(
+    reader: page.PageReader,
+    root_page: u32,
+    reverse: bool,
+    allocator: std.mem.Allocator,
+) IndexError!?EdgeValue {
+    return try firstNonNullFirstColumnEdgeValuePage(reader, root_page, reverse, allocator);
 }
 
 fn scanIndexPage(reader: page.PageReader, page_number: u32, allocator: std.mem.Allocator, entries: *std.ArrayList(IndexEntry)) IndexError!void {
@@ -216,6 +237,83 @@ fn countEntriesForFirstColumnEqualsPage(
 
     const right = header.right_most_pointer orelse return error.InvalidIndexCell;
     return try addCount(count, try countEntriesForFirstColumnEqualsPage(reader, right, value, allocator));
+}
+
+fn firstNonNullFirstColumnEdgeValuePage(
+    reader: page.PageReader,
+    page_number: u32,
+    reverse: bool,
+    allocator: std.mem.Allocator,
+) IndexError!?EdgeValue {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    if (!header.page_type.isIndex()) return error.UnsupportedIndexBTree;
+
+    if (header.page_type == .index_leaf) {
+        return try firstNonNullFirstColumnEdgeValueLeaf(reader, ref, header, reverse, allocator);
+    }
+
+    if (reverse) {
+        const right = header.right_most_pointer orelse return error.InvalidIndexCell;
+        if (try firstNonNullFirstColumnEdgeValuePage(reader, right, reverse, allocator)) |value| return value;
+
+        var i = header.cell_count;
+        while (i > 0) {
+            i -= 1;
+            const cell = try header.cell(ref, i);
+            if (cell.len < 4) return error.InvalidIndexCell;
+            if (try firstNonNullFirstColumnFromCell(reader, cell[4..], allocator)) |value| return value;
+            const left_child = readU32(cell[0..4]);
+            if (try firstNonNullFirstColumnEdgeValuePage(reader, left_child, reverse, allocator)) |value| return value;
+        }
+        return null;
+    }
+
+    var i: usize = 0;
+    while (i < header.cell_count) : (i += 1) {
+        const cell = try header.cell(ref, i);
+        if (cell.len < 4) return error.InvalidIndexCell;
+        const left_child = readU32(cell[0..4]);
+        if (try firstNonNullFirstColumnEdgeValuePage(reader, left_child, reverse, allocator)) |value| return value;
+        if (try firstNonNullFirstColumnFromCell(reader, cell[4..], allocator)) |value| return value;
+    }
+
+    const right = header.right_most_pointer orelse return error.InvalidIndexCell;
+    return try firstNonNullFirstColumnEdgeValuePage(reader, right, reverse, allocator);
+}
+
+fn firstNonNullFirstColumnEdgeValueLeaf(
+    reader: page.PageReader,
+    ref: page.PageRef,
+    header: btree.PageHeader,
+    reverse: bool,
+    allocator: std.mem.Allocator,
+) IndexError!?EdgeValue {
+    if (reverse) {
+        var i = header.cell_count;
+        while (i > 0) {
+            i -= 1;
+            const cell = try header.cell(ref, i);
+            if (try firstNonNullFirstColumnFromCell(reader, cell, allocator)) |value| return value;
+        }
+        return null;
+    }
+
+    var i: usize = 0;
+    while (i < header.cell_count) : (i += 1) {
+        const cell = try header.cell(ref, i);
+        if (try firstNonNullFirstColumnFromCell(reader, cell, allocator)) |value| return value;
+    }
+    return null;
+}
+
+fn firstNonNullFirstColumnFromCell(reader: page.PageReader, cell: []const u8, allocator: std.mem.Allocator) IndexError!?EdgeValue {
+    const first = try parseFirstIndexValueView(reader, cell, allocator);
+    if (first.value == .null) {
+        first.deinit(allocator);
+        return null;
+    }
+    return .{ .value = first.value, .owned = first.owned };
 }
 
 fn rowidsForFirstColumnEqualsLeaf(
@@ -651,6 +749,42 @@ test "countEntriesForFirstColumnEquals counts matching interior separators and b
         @as(u64, 0),
         try countEntriesForFirstColumnEquals(reader, 1, .{ .text = "carol" }, std.testing.allocator),
     );
+}
+
+test "firstNonNullFirstColumnEdgeValue reads min and max index edges" {
+    var bytes = [_]u8{0} ** 4096;
+    initIndexTestHeader(bytes[0..], 4096, 1);
+
+    const cells = [_][]const u8{
+        &.{ 4, 3, 0, 1, 5 },
+        &.{ 5, 3, 1, 1, 42, 7 },
+        &.{ 7, 3, 19, 1, 'b', 'o', 'b', 8 },
+    };
+    writeIndexLeafPageTest(bytes[0..], 0, 100, 4096, &cells);
+
+    const reader = try page.PageReader.init(&bytes);
+    const min_value = (try firstNonNullFirstColumnEdgeValue(reader, 1, false, std.testing.allocator)).?;
+    defer min_value.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 42), min_value.value.integer);
+
+    const max_value = (try firstNonNullFirstColumnEdgeValue(reader, 1, true, std.testing.allocator)).?;
+    defer max_value.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("bob", max_value.value.text);
+}
+
+test "firstNonNullFirstColumnEdgeValue returns null for all-null index" {
+    var bytes = [_]u8{0} ** 4096;
+    initIndexTestHeader(bytes[0..], 4096, 1);
+
+    const cells = [_][]const u8{
+        &.{ 4, 3, 0, 1, 5 },
+        &.{ 4, 3, 0, 1, 7 },
+    };
+    writeIndexLeafPageTest(bytes[0..], 0, 100, 4096, &cells);
+
+    const reader = try page.PageReader.init(&bytes);
+    try std.testing.expectEqual(@as(?EdgeValue, null), try firstNonNullFirstColumnEdgeValue(reader, 1, false, std.testing.allocator));
+    try std.testing.expectEqual(@as(?EdgeValue, null), try firstNonNullFirstColumnEdgeValue(reader, 1, true, std.testing.allocator));
 }
 
 fn initIndexTestHeader(bytes: []u8, comptime page_size: u16, page_count: u32) void {
