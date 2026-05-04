@@ -2160,6 +2160,12 @@ fn applyDeleteCore(gpa: Allocator, image: *MappedFile, stmt: @import("ast.zig").
     defer deinitMutableRows(kept, gpa);
 
     try rebuildTableAndIndexes(gpa, image, reader.db_header, reader, db_schema, info, kept.items);
+
+    // The rebuild may leave former leaves orphaned past the new high
+    // water mark. SQLite's `PRAGMA integrity_check` reports them as
+    // "Page N: never used". Truncate the trailing tail back to the
+    // last reachable page so the file matches its content.
+    reclaimUnreachableTrailingPages(gpa, image) catch {};
     return changed;
 }
 
@@ -3730,6 +3736,137 @@ fn rewriteLeafPage(
     writeU16(mutable[base + 5 .. base + 7], stored_content_start);
     mutable[base + 7] = 0; // fragmented free bytes
 }
+
+/// Walk the b-tree forest from `sqlite_schema`, including overflow
+/// chains, and shrink the file back to the last reachable page.
+/// SQLite reads `database_page_count` (header offset 28) — keeping
+/// it in sync with the file extent is what `PRAGMA integrity_check`
+/// requires. Skipped silently on any structural anomaly: the worst
+/// outcome is we leave a few orphan pages, which is still less
+/// harmful than truncating live data.
+fn reclaimUnreachableTrailingPages(gpa: Allocator, image: *MappedFile) WriteError!void {
+    const reader = page.PageReader.init(image.items) catch return;
+    const page_size: usize = reader.db_header.page_size;
+    if (page_size == 0 or page_size > image.items.len) return;
+    const file_pages: u32 = @intCast(image.items.len / page_size);
+    const declared: u32 = reader.db_header.database_page_count;
+    const n_pages: u32 = @max(file_pages, declared);
+    if (n_pages < 2) return;
+
+    const reachable = try gpa.alloc(bool, @as(usize, n_pages) + 1);
+    defer gpa.free(reachable);
+    @memset(reachable, false);
+
+    const db_schema = schema.readSchema(reader, gpa) catch return;
+    defer db_schema.deinit(gpa);
+
+    // Page 1 holds the header + sqlite_schema root; walk that whole
+    // b-tree first, then every other table/index root we know about.
+    markReachableBTree(reader, 1, reachable) catch {};
+    for (db_schema.entries) |entry| {
+        if (entry.root_page <= 0) continue;
+        if (entry.root_page > n_pages) continue;
+        markReachableBTree(reader, @intCast(entry.root_page), reachable) catch return;
+    }
+
+    var max_reach: u32 = 1;
+    var i: u32 = n_pages;
+    while (i > 0) : (i -= 1) {
+        if (reachable[i]) {
+            max_reach = i;
+            break;
+        }
+    }
+    if (max_reach >= n_pages) return;
+
+    // Atomically: bump file_change_counter, set the declared page
+    // count, and shrink the mmap. Pointers into `image.items` taken
+    // before this call are invalid by the time we return.
+    const counter = readU32(image.items[24..28]) +% 1;
+    writeU32(image.items[24..28], counter);
+    writeU32(image.items[28..32], max_reach);
+    if (image.items.len >= 96) writeU32(image.items[92..96], counter);
+
+    image.resize(@as(u64, max_reach) * @as(u64, page_size)) catch return;
+}
+
+fn markReachableBTree(reader: page.PageReader, p: u32, reachable: []bool) WriteError!void {
+    if (p == 0 or @as(usize, p) >= reachable.len) return;
+    if (reachable[p]) return;
+    reachable[p] = true;
+
+    const ref = reader.page(p) catch return;
+    const hdr = btree.PageHeader.parse(ref) catch return;
+
+    switch (hdr.page_type) {
+        .table_interior, .index_interior => {
+            var i: usize = 0;
+            while (i < hdr.cell_count) : (i += 1) {
+                const cell = hdr.cell(ref, i) catch break;
+                if (cell.len < 4) break;
+                const child = readU32(cell[0..4]);
+                try markReachableBTree(reader, child, reachable);
+            }
+            if (hdr.right_most_pointer) |right| {
+                try markReachableBTree(reader, right, reachable);
+            }
+        },
+        .table_leaf, .index_leaf => {
+            const usable: usize = ref.bytes.len - ref.reserved_space;
+            var i: usize = 0;
+            while (i < hdr.cell_count) : (i += 1) {
+                const cell = hdr.cell(ref, i) catch break;
+                if (cell.len == 0) break;
+
+                var pos: usize = 0;
+                const payload_size = parseInlineVarint(cell, &pos) orelse break;
+                if (hdr.page_type == .table_leaf) {
+                    _ = parseInlineVarint(cell, &pos) orelse break;
+                }
+                const psz: usize = @intCast(@min(payload_size, std.math.maxInt(usize)));
+                const info = if (hdr.page_type == .table_leaf)
+                    btree.tableLeafPayloadInfo(psz, usable)
+                else
+                    btree.indexPayloadInfo(psz, usable);
+                if (info.overflow_page == null) continue;
+
+                const overflow_off = pos + info.local_len;
+                if (overflow_off + 4 > cell.len) break;
+                const first_overflow = readU32(cell[overflow_off..][0..4]);
+                markOverflowChain(reader, first_overflow, reachable) catch {};
+            }
+        },
+    }
+}
+
+fn markOverflowChain(reader: page.PageReader, first_page: u32, reachable: []bool) WriteError!void {
+    var p = first_page;
+    while (p != 0 and @as(usize, p) < reachable.len) {
+        if (reachable[p]) return;
+        reachable[p] = true;
+        const ref = reader.page(p) catch return;
+        if (ref.bytes.len < 4) return;
+        p = readU32(ref.bytes[0..4]);
+    }
+}
+
+fn parseInlineVarint(buf: []const u8, pos: *usize) ?u64 {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < 8 and pos.* + i < buf.len) : (i += 1) {
+        const b = buf[pos.* + i];
+        v = (v << 7) | (b & 0x7f);
+        if (b < 0x80) {
+            pos.* += i + 1;
+            return v;
+        }
+    }
+    if (pos.* + 8 >= buf.len) return null;
+    v = (v << 8) | buf[pos.* + 8];
+    pos.* += 9;
+    return v;
+}
+
 
 test "encode record for insert" {
     const entry = schema.SchemaEntry{
