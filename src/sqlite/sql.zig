@@ -214,7 +214,15 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         }
         if (stmt.order_by == null or natural_rowid_order) {
             if (asIndexableEq(stmt.where_expr.?)) |ieq| {
-                const rowids = try indexedRowidsForColumn(reader, db_schema, primary_info, ieq.column_name, ieq.value, ascratch);
+                // When the caller asks for only a handful of rows, stop the
+                // index walk as soon as we have them. Without this a small
+                // LIMIT on a high-cardinality bucket still materialises every
+                // matching rowid in the index page range.
+                const small_limit: ?usize = if (stmt.limit) |l| (if (l > 0 and l < 1000) @as(usize, @intCast(l)) else null) else null;
+                const rowids = if (small_limit) |limit|
+                    try indexedRowidsForColumnWithLimit(reader, db_schema, primary_info, ieq.column_name, ieq.value, limit, ascratch)
+                else
+                    try indexedRowidsForColumn(reader, db_schema, primary_info, ieq.column_name, ieq.value, ascratch);
                 if (rowids) |rids| {
                     return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
                 }
@@ -368,7 +376,7 @@ fn buildIndexedMinMaxResult(
     }
     if (asciiEql(ag.column.name, "rowid")) return null;
 
-    const index_entry = findIndexForColumn(db_schema, primary_info.name, ag.column.name) orelse return null;
+    const index_entry = findIndexForColumn(db_schema, primary_info, ag.column.name) orelse return null;
     const edge = try index_mod.firstNonNullFirstColumnEdgeValue(
         reader,
         @intCast(index_entry.root_page),
@@ -2011,13 +2019,36 @@ pub fn indexedRowidsForColumn(
     allocator: std.mem.Allocator,
 ) SqlError!?[]i64 {
     if (asciiEql(column_name, "rowid")) return null;
-    const index_entry = findIndexForColumn(db_schema, info.name, column_name) orelse return null;
+    const index_entry = findIndexForColumn(db_schema, info, column_name) orelse return null;
     const lookup: index_mod.LookupValue = switch (value) {
         .null => .null,
         .integer => |v| .{ .integer = v },
         .text => |v| .{ .text = v },
     };
     return try index_mod.rowidsForFirstColumnEquals(reader, @intCast(index_entry.root_page), lookup, allocator);
+}
+
+/// LIMIT-aware variant of `indexedRowidsForColumn`. Stops walking the
+/// index b-tree once `limit` rowids have been collected, which keeps
+/// `WHERE col = ? LIMIT 1` from materialising every matching rowid in
+/// large index buckets.
+pub fn indexedRowidsForColumnWithLimit(
+    reader: page.PageReader,
+    db_schema: schema.Schema,
+    info: catalog.TableInfo,
+    column_name: []const u8,
+    value: Literal,
+    limit: usize,
+    allocator: std.mem.Allocator,
+) SqlError!?[]i64 {
+    if (asciiEql(column_name, "rowid")) return null;
+    const index_entry = findIndexForColumn(db_schema, info, column_name) orelse return null;
+    const lookup: index_mod.LookupValue = switch (value) {
+        .null => .null,
+        .integer => |v| .{ .integer = v },
+        .text => |v| .{ .text = v },
+    };
+    return try index_mod.rowidsForFirstColumnEqualsLimit(reader, @intCast(index_entry.root_page), lookup, limit, allocator);
 }
 
 pub fn indexedCountForColumn(
@@ -2029,7 +2060,7 @@ pub fn indexedCountForColumn(
     allocator: std.mem.Allocator,
 ) SqlError!?u64 {
     if (asciiEql(column_name, "rowid")) return null;
-    const index_entry = findIndexForColumn(db_schema, info.name, column_name) orelse return null;
+    const index_entry = findIndexForColumn(db_schema, info, column_name) orelse return null;
     const lookup: index_mod.LookupValue = switch (value) {
         .null => .null,
         .integer => |v| .{ .integer = v },
@@ -2038,16 +2069,182 @@ pub fn indexedCountForColumn(
     return try index_mod.countEntriesForFirstColumnEquals(reader, @intCast(index_entry.root_page), lookup, allocator);
 }
 
-fn findIndexForColumn(db_schema: schema.Schema, table_name: []const u8, column_name: []const u8) ?schema.SchemaEntry {
+fn findIndexForColumn(db_schema: schema.Schema, info: catalog.TableInfo, column_name: []const u8) ?schema.SchemaEntry {
     for (db_schema.entries) |entry| {
         if (!entry.isIndex() or entry.root_page <= 0) continue;
-        if (!asciiEql(entry.table_name, table_name)) continue;
-        if (entry.sql.len == 0) continue;
+        if (!asciiEql(entry.table_name, info.name)) continue;
+        if (entry.sql.len == 0) {
+            // Implicit autoindex: SQLite emits `sqlite_autoindex_<table>_<n>`
+            // for every UNIQUE / PRIMARY KEY constraint that is NOT an INTEGER
+            // PRIMARY KEY (which aliases rowid). For our scope we only match
+            // single-column non-integer PRIMARY KEY tables.
+            if (!std.mem.startsWith(u8, entry.name, "sqlite_autoindex_")) continue;
+            if (info.integer_primary_key_index != null) continue;
+            const pk_col = singlePrimaryKeyColumn(db_schema, info.name) orelse continue;
+            if (asciiEql(pk_col, column_name)) return entry;
+            continue;
+        }
         if (containsSqlKeyword(entry.sql, "WHERE")) continue;
         const indexed_column = parseFirstIndexColumn(entry.sql) orelse continue;
         if (asciiEql(indexed_column, column_name)) return entry;
     }
     return null;
+}
+
+/// Return the name of the table's lone single-column PRIMARY KEY column,
+/// excluding INTEGER PRIMARY KEY (which is the rowid alias and has no
+/// implicit autoindex). Returns null if there isn't exactly one matching
+/// column or if the table SQL can't be located.
+fn singlePrimaryKeyColumn(db_schema: schema.Schema, table_name: []const u8) ?[]const u8 {
+    const table_entry = db_schema.findTable(table_name) orelse return null;
+    const sql = table_entry.sql;
+    if (sql.len == 0) return null;
+    const open = std.mem.indexOfScalar(u8, sql, '(') orelse return null;
+    const close = findCreateTableClose(sql, open) orelse return null;
+    const body = sql[open + 1 .. close];
+
+    var found: ?[]const u8 = null;
+    var pos: usize = 0;
+    while (pos < body.len) {
+        const start = pos;
+        pos = findColumnDefEnd(body, pos);
+        const part = std.mem.trim(u8, body[start..pos], " \t\r\n");
+        if (pos < body.len and body[pos] == ',') pos += 1;
+        if (part.len == 0) continue;
+        if (startsWithKeywordCi(part, "CONSTRAINT") or
+            startsWithKeywordCi(part, "PRIMARY") or
+            startsWithKeywordCi(part, "FOREIGN") or
+            startsWithKeywordCi(part, "UNIQUE") or
+            startsWithKeywordCi(part, "CHECK"))
+        {
+            // A composite PRIMARY KEY constraint at table level disqualifies
+            // a single-column autoindex match.
+            if (startsWithKeywordCi(part, "PRIMARY")) return null;
+            continue;
+        }
+        const name = parseColumnNameFromDef(part) orelse continue;
+        if (!hasColumnPrimaryKey(part)) continue;
+        if (isIntegerAffinity(part)) continue;
+        if (found != null) return null;
+        found = name;
+    }
+    return found;
+}
+
+fn findCreateTableClose(sql: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var quote: ?u8 = null;
+    var i = open;
+    while (i < sql.len) : (i += 1) {
+        const c = sql[i];
+        if (quote) |q| {
+            if (c == q) quote = null;
+            continue;
+        }
+        if (c == '\'' or c == '"' or c == '`') {
+            quote = c;
+            continue;
+        }
+        if (c == '(') depth += 1;
+        if (c == ')') {
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return null;
+}
+
+fn findColumnDefEnd(body: []const u8, start: usize) usize {
+    var depth: usize = 0;
+    var quote: ?u8 = null;
+    var i = start;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (quote) |q| {
+            if (c == q) quote = null;
+            continue;
+        }
+        if (c == '\'' or c == '"' or c == '`') {
+            quote = c;
+            continue;
+        }
+        if (c == '(') depth += 1;
+        if (c == ')' and depth > 0) depth -= 1;
+        if (c == ',' and depth == 0) return i;
+    }
+    return body.len;
+}
+
+fn parseColumnNameFromDef(def: []const u8) ?[]const u8 {
+    if (def.len == 0) return null;
+    if (def[0] == '"' or def[0] == '`' or def[0] == '[') {
+        const close: u8 = if (def[0] == '[') ']' else def[0];
+        const end = std.mem.indexOfScalarPos(u8, def, 1, close) orelse return null;
+        return def[1..end];
+    }
+    var end: usize = 0;
+    while (end < def.len and !std.ascii.isWhitespace(def[end]) and def[end] != ',') : (end += 1) {}
+    if (end == 0) return null;
+    return def[0..end];
+}
+
+fn hasColumnPrimaryKey(def: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < def.len) : (pos += 1) {
+        if (startsKeywordAtCi(def, pos, "PRIMARY")) {
+            var after = pos + "PRIMARY".len;
+            while (after < def.len and std.ascii.isWhitespace(def[after])) after += 1;
+            if (startsKeywordAtCi(def, after, "KEY")) return true;
+        }
+    }
+    return false;
+}
+
+fn isIntegerAffinity(def: []const u8) bool {
+    var pos: usize = 0;
+    if (pos < def.len and (def[pos] == '"' or def[pos] == '`' or def[pos] == '[')) {
+        const close: u8 = if (def[pos] == '[') ']' else def[pos];
+        pos += 1;
+        while (pos < def.len and def[pos] != close) pos += 1;
+        if (pos < def.len) pos += 1;
+    } else {
+        while (pos < def.len and !std.ascii.isWhitespace(def[pos])) pos += 1;
+    }
+    while (pos < def.len and std.ascii.isWhitespace(def[pos])) pos += 1;
+    const type_start = pos;
+    var depth: usize = 0;
+    while (pos < def.len) : (pos += 1) {
+        const c = def[pos];
+        if (c == '(') depth += 1;
+        if (c == ')' and depth > 0) depth -= 1;
+        if (depth == 0 and (startsKeywordAtCi(def, pos, "PRIMARY") or
+            startsKeywordAtCi(def, pos, "NOT") or
+            startsKeywordAtCi(def, pos, "NULL") or
+            startsKeywordAtCi(def, pos, "DEFAULT") or
+            startsKeywordAtCi(def, pos, "COLLATE") or
+            startsKeywordAtCi(def, pos, "REFERENCES") or
+            startsKeywordAtCi(def, pos, "CHECK") or
+            startsKeywordAtCi(def, pos, "UNIQUE"))) break;
+    }
+    const type_name = std.mem.trim(u8, def[type_start..pos], " \t\r\n");
+    var upper_buf: [128]u8 = undefined;
+    const len = @min(type_name.len, upper_buf.len);
+    for (type_name[0..len], 0..) |c, i| upper_buf[i] = std.ascii.toUpper(c);
+    return std.mem.indexOf(u8, upper_buf[0..len], "INT") != null;
+}
+
+fn startsWithKeywordCi(bytes: []const u8, keyword: []const u8) bool {
+    return startsKeywordAtCi(bytes, 0, keyword);
+}
+
+fn startsKeywordAtCi(bytes: []const u8, pos: usize, keyword: []const u8) bool {
+    if (pos + keyword.len > bytes.len) return false;
+    if (pos > 0 and isIdent(bytes[pos - 1])) return false;
+    if (pos + keyword.len < bytes.len and isIdent(bytes[pos + keyword.len])) return false;
+    for (keyword, 0..) |c, i| {
+        if (std.ascii.toUpper(bytes[pos + i]) != c) return false;
+    }
+    return true;
 }
 
 fn parseFirstIndexColumn(sql: []const u8) ?[]const u8 {
@@ -2165,8 +2362,86 @@ test "findIndexForColumn skips partial indexes" {
         },
     };
     const db_schema = schema.Schema{ .entries = entries[0..] };
-    const entry = findIndexForColumn(db_schema, "users", "name").?;
+    var columns = [_]catalog.Column{
+        .{ .name = "id", .affinity = .integer, .is_integer_primary_key = true },
+        .{ .name = "name", .affinity = .text },
+    };
+    const info = catalog.TableInfo{
+        .name = "users",
+        .root_page = 2,
+        .columns = columns[0..],
+        .integer_primary_key_index = 0,
+    };
+    const entry = findIndexForColumn(db_schema, info, "name").?;
     try std.testing.expectEqualStrings("idx_name", entry.name);
+}
+
+test "findIndexForColumn matches sqlite_autoindex for TEXT PRIMARY KEY" {
+    var entries = [_]schema.SchemaEntry{
+        .{
+            .rowid = 1,
+            .object_type = "table",
+            .name = "judgments",
+            .table_name = "judgments",
+            .root_page = 2,
+            .sql = "CREATE TABLE judgments (citation TEXT PRIMARY KEY, court TEXT)",
+        },
+        .{
+            .rowid = 2,
+            .object_type = "index",
+            .name = "sqlite_autoindex_judgments_1",
+            .table_name = "judgments",
+            .root_page = 5,
+            .sql = "",
+        },
+    };
+    const db_schema = schema.Schema{ .entries = entries[0..] };
+    var columns = [_]catalog.Column{
+        .{ .name = "citation", .affinity = .text },
+        .{ .name = "court", .affinity = .text },
+    };
+    const info = catalog.TableInfo{
+        .name = "judgments",
+        .root_page = 2,
+        .columns = columns[0..],
+        .integer_primary_key_index = null,
+    };
+    const entry = findIndexForColumn(db_schema, info, "citation").?;
+    try std.testing.expectEqualStrings("sqlite_autoindex_judgments_1", entry.name);
+    try std.testing.expectEqual(@as(?schema.SchemaEntry, null), findIndexForColumn(db_schema, info, "court"));
+}
+
+test "findIndexForColumn skips autoindex for INTEGER PRIMARY KEY tables" {
+    var entries = [_]schema.SchemaEntry{
+        .{
+            .rowid = 1,
+            .object_type = "table",
+            .name = "users",
+            .table_name = "users",
+            .root_page = 2,
+            .sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        },
+        .{
+            .rowid = 2,
+            .object_type = "index",
+            .name = "sqlite_autoindex_users_1",
+            .table_name = "users",
+            .root_page = 5,
+            .sql = "",
+        },
+    };
+    const db_schema = schema.Schema{ .entries = entries[0..] };
+    var columns = [_]catalog.Column{
+        .{ .name = "id", .affinity = .integer, .is_integer_primary_key = true },
+        .{ .name = "name", .affinity = .text },
+    };
+    const info = catalog.TableInfo{
+        .name = "users",
+        .root_page = 2,
+        .columns = columns[0..],
+        .integer_primary_key_index = 0,
+    };
+    try std.testing.expectEqual(@as(?schema.SchemaEntry, null), findIndexForColumn(db_schema, info, "id"));
 }
 
 test "natural rowid order recognizes rowid and integer primary key asc" {

@@ -109,6 +109,23 @@ pub fn rowidsForFirstColumnEquals(
     return try rowids.toOwnedSlice(allocator);
 }
 
+/// LIMIT-aware variant. Stops walking once the collected rowid count
+/// reaches `limit`. A `limit` of zero collects nothing.
+pub fn rowidsForFirstColumnEqualsLimit(
+    reader: page.PageReader,
+    root_page: u32,
+    value: LookupValue,
+    limit: usize,
+    allocator: std.mem.Allocator,
+) IndexError![]i64 {
+    var rowids: std.ArrayList(i64) = .empty;
+    errdefer rowids.deinit(allocator);
+    if (limit > 0) {
+        try rowidsForFirstColumnEqualsPageLimit(reader, root_page, value, limit, allocator, &rowids);
+    }
+    return try rowids.toOwnedSlice(allocator);
+}
+
 /// Count index entries whose first indexed column equals `value`.
 /// Traversal is constrained to b-tree ranges that can contain the key;
 /// inline cells stay zero-allocation, while overflow cells may use
@@ -340,6 +357,90 @@ fn rowidsForFirstColumnEqualsLeaf(
 
     var i = lo;
     while (i < header.cell_count) : (i += 1) {
+        const cell = try header.cell(ref, i);
+        var inline_rec: record.InlineRecord = undefined;
+        const entry = try parseIndexCellView(reader, cell, allocator, &inline_rec);
+        defer entry.deinit(allocator);
+        const cmp = compareFirstValueToLookup(entry.values, value);
+        if (cmp > 0) break;
+        if (cmp == 0 and valuesMatchLookup(entry.values, value)) {
+            if (rowidFromValues(entry.values)) |rowid| try rowids.append(allocator, rowid);
+        }
+    }
+}
+
+fn rowidsForFirstColumnEqualsPageLimit(
+    reader: page.PageReader,
+    page_number: u32,
+    value: LookupValue,
+    limit: usize,
+    allocator: std.mem.Allocator,
+    rowids: *std.ArrayList(i64),
+) IndexError!void {
+    if (rowids.items.len >= limit) return;
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    if (!header.page_type.isIndex()) return error.UnsupportedIndexBTree;
+
+    if (header.page_type == .index_leaf) {
+        return rowidsForFirstColumnEqualsLeafLimit(reader, ref, header, value, limit, allocator, rowids);
+    }
+
+    var i: usize = 0;
+    while (i < header.cell_count) : (i += 1) {
+        if (rowids.items.len >= limit) return;
+        const cell = try header.cell(ref, i);
+        if (cell.len < 4) return error.InvalidIndexCell;
+        const left_child = readU32(cell[0..4]);
+        var inline_rec: record.InlineRecord = undefined;
+        const entry = try parseIndexCellView(reader, cell[4..], allocator, &inline_rec);
+        defer entry.deinit(allocator);
+        const cmp = compareFirstValueToLookup(entry.values, value);
+
+        if (cmp >= 0) {
+            try rowidsForFirstColumnEqualsPageLimit(reader, left_child, value, limit, allocator, rowids);
+            if (rowids.items.len >= limit) return;
+        }
+        if (cmp == 0 and valuesMatchLookup(entry.values, value)) {
+            if (rowidFromValues(entry.values)) |rowid| {
+                try rowids.append(allocator, rowid);
+                if (rowids.items.len >= limit) return;
+            }
+        }
+        if (cmp > 0) return;
+    }
+
+    const right = header.right_most_pointer orelse return error.InvalidIndexCell;
+    try rowidsForFirstColumnEqualsPageLimit(reader, right, value, limit, allocator, rowids);
+}
+
+fn rowidsForFirstColumnEqualsLeafLimit(
+    reader: page.PageReader,
+    ref: page.PageRef,
+    header: btree.PageHeader,
+    value: LookupValue,
+    limit: usize,
+    allocator: std.mem.Allocator,
+    rowids: *std.ArrayList(i64),
+) IndexError!void {
+    if (rowids.items.len >= limit) return;
+    var lo: usize = 0;
+    var hi: usize = header.cell_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const cell = try header.cell(ref, mid);
+        const first = try parseFirstIndexValueView(reader, cell, allocator);
+        defer first.deinit(allocator);
+        if (compareValueToLookup(first.value, value) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    var i = lo;
+    while (i < header.cell_count) : (i += 1) {
+        if (rowids.items.len >= limit) return;
         const cell = try header.cell(ref, i);
         var inline_rec: record.InlineRecord = undefined;
         const entry = try parseIndexCellView(reader, cell, allocator, &inline_rec);
@@ -834,4 +935,52 @@ fn writeIndexInteriorRootTest(
     std.mem.writeInt(u16, bytes[page_base + 12 ..][0..2], @intCast(cell_off), .big);
     std.mem.writeInt(u32, bytes[cell_off..][0..4], left_child, .big);
     @memcpy(bytes[cell_off + 4 ..][0..separator.len], separator);
+}
+
+test "rowidsForFirstColumnEqualsLimit stops at the requested count" {
+    var bytes = [_]u8{0} ** 4096;
+    @memcpy(bytes[0..16], @import("header.zig").MAGIC);
+    bytes[16] = 0x10;
+    bytes[17] = 0x00;
+    bytes[18] = 1;
+    bytes[19] = 1;
+    bytes[21] = 64;
+    bytes[22] = 32;
+    bytes[23] = 32;
+    bytes[31] = 1;
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.index_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 4;
+
+    const cells = [_][]const u8{
+        &.{ 8, 3, 23, 9, 'a', 'l', 'i', 'c', 'e' },
+        &.{ 7, 3, 19, 1, 'b', 'o', 'b', 7 },
+        &.{ 7, 3, 19, 1, 'b', 'o', 'b', 8 },
+        &.{ 7, 3, 19, 1, 'z', 'e', 'd', 9 },
+    };
+
+    var off: usize = bytes.len;
+    for (cells, 0..) |cell, i| {
+        off -= cell.len;
+        @memcpy(bytes[off..][0..cell.len], cell);
+        std.mem.writeInt(u16, bytes[page_base + 8 + i * 2 ..][0..2], @intCast(off), .big);
+    }
+    std.mem.writeInt(u16, bytes[page_base + 5 ..][0..2], @intCast(off), .big);
+
+    const reader = try page.PageReader.init(&bytes);
+
+    const limited = try rowidsForFirstColumnEqualsLimit(reader, 1, .{ .text = "bob" }, 1, std.testing.allocator);
+    defer std.testing.allocator.free(limited);
+    try std.testing.expectEqual(@as(usize, 1), limited.len);
+    try std.testing.expectEqual(@as(i64, 7), limited[0]);
+
+    const all = try rowidsForFirstColumnEqualsLimit(reader, 1, .{ .text = "bob" }, 99, std.testing.allocator);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+
+    const zero = try rowidsForFirstColumnEqualsLimit(reader, 1, .{ .text = "bob" }, 0, std.testing.allocator);
+    defer std.testing.allocator.free(zero);
+    try std.testing.expectEqual(@as(usize, 0), zero.len);
 }
