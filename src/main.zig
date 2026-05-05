@@ -444,7 +444,9 @@ fn inspectDatabase(init: std.process.Init, writer: *std.Io.Writer, path: []const
                     .allocator = init.gpa,
                     .limit = preview_count,
                 };
-                try sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &preview_ctx, InspectPreviewCtx.onRow);
+                sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &preview_ctx, InspectPreviewCtx.onRow) catch |err| {
+                    try writer.print("  preview: unavailable ({s})\n", .{@errorName(err)});
+                };
             }
             const preview_count_u64: u64 = @intCast(preview_count);
             if (row_stats.entries > preview_count_u64) try writer.print("  ... {d} more rows\n", .{row_stats.entries - preview_count_u64});
