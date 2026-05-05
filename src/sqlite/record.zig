@@ -43,6 +43,154 @@ pub const InlineRecord = struct {
     }
 };
 
+/// Bitmask of which column indexes a caller actually wants from a row.
+/// Bit `i` set means column `i` should be decoded into the output
+/// `InlineRecord` slot `i`; other slots are filled with `.null`.
+pub const ProjectionMask = struct {
+    bits: u64 = 0,
+    max_index: u8 = 0,
+
+    pub fn empty() ProjectionMask {
+        return .{};
+    }
+
+    pub fn set(self: *ProjectionMask, idx: usize) void {
+        if (idx >= MAX_INLINE_VALUES) return;
+        self.bits |= (@as(u64, 1) << @intCast(idx));
+        const next: u8 = @intCast(idx + 1);
+        if (next > self.max_index) self.max_index = next;
+    }
+
+    pub fn isSet(self: ProjectionMask, idx: usize) bool {
+        if (idx >= MAX_INLINE_VALUES) return false;
+        return (self.bits & (@as(u64, 1) << @intCast(idx))) != 0;
+    }
+
+    pub fn isEmpty(self: ProjectionMask) bool {
+        return self.bits == 0;
+    }
+};
+
+/// Parse only the columns selected in `mask`. Unselected TEXT/BLOB
+/// columns advance the body cursor by length without loading payload
+/// bytes, and parsing stops after the highest requested column.
+pub fn parseInlineProjected(bytes: []const u8, mask: ProjectionMask, out: *InlineRecord) RecordError!void {
+    const header_size_varint = try parseVarint(bytes);
+    const header_size: usize = @intCast(header_size_varint.value);
+    if (header_size == 0 or header_size > bytes.len) return error.InvalidHeaderSize;
+
+    var fill: usize = 0;
+    while (fill < mask.max_index and fill < MAX_INLINE_VALUES) : (fill += 1) {
+        out.values[fill] = .null;
+    }
+
+    var header_pos: usize = header_size_varint.len;
+    var body_pos = header_size;
+    var n: usize = 0;
+    while (header_pos < header_size) {
+        if (n >= mask.max_index) break;
+        if (n >= MAX_INLINE_VALUES) return error.TooManyColumns;
+        const serial = try parseVarint(bytes[header_pos..header_size]);
+        header_pos += serial.len;
+        const want = mask.isSet(n);
+        switch (serial.value) {
+            0 => {},
+            1 => {
+                if (want) out.values[n] = .{ .integer = try readSigned(bytes[body_pos..], 1) };
+                body_pos += 1;
+            },
+            2 => {
+                if (want) out.values[n] = .{ .integer = try readSigned(bytes[body_pos..], 2) };
+                body_pos += 2;
+            },
+            3 => {
+                if (want) out.values[n] = .{ .integer = try readSigned(bytes[body_pos..], 3) };
+                body_pos += 3;
+            },
+            4 => {
+                if (want) out.values[n] = .{ .integer = try readSigned(bytes[body_pos..], 4) };
+                body_pos += 4;
+            },
+            5 => {
+                if (want) out.values[n] = .{ .integer = try readSigned(bytes[body_pos..], 6) };
+                body_pos += 6;
+            },
+            6 => {
+                if (want) out.values[n] = .{ .integer = try readSigned(bytes[body_pos..], 8) };
+                body_pos += 8;
+            },
+            7 => {
+                if (want) {
+                    if (bytes.len - body_pos < 8) return error.ValueOutOfBounds;
+                    const raw = std.mem.readInt(u64, bytes[body_pos..][0..8], .big);
+                    out.values[n] = .{ .real = @bitCast(raw) };
+                }
+                body_pos += 8;
+            },
+            8 => {
+                if (want) out.values[n] = .{ .integer = 0 };
+            },
+            9 => {
+                if (want) out.values[n] = .{ .integer = 1 };
+            },
+            10, 11 => return error.InvalidSerialType,
+            else => {
+                const len: usize = if (serial.value % 2 == 0)
+                    @intCast((serial.value - 12) / 2)
+                else
+                    @intCast((serial.value - 13) / 2);
+                if (want) {
+                    if (bytes.len - body_pos < len) return error.ValueOutOfBounds;
+                    if (serial.value % 2 == 0) {
+                        out.values[n] = .{ .blob = bytes[body_pos..][0..len] };
+                    } else {
+                        out.values[n] = .{ .text = bytes[body_pos..][0..len] };
+                    }
+                }
+                body_pos += len;
+            },
+        }
+        n += 1;
+    }
+    out.len = n;
+}
+
+/// True when every byte needed by `mask` is present in `local_bytes`,
+/// so a caller can satisfy the projection without following overflow
+/// pages. Malformed local records return false so the caller can fall
+/// back to the normal full-payload path and surface the real error.
+pub fn projectedBodyFitsLocal(local_bytes: []const u8, mask: ProjectionMask) bool {
+    const header_size_varint = parseVarint(local_bytes) catch return false;
+    const header_size: usize = @intCast(header_size_varint.value);
+    if (header_size == 0 or header_size > local_bytes.len) return false;
+
+    var header_pos: usize = header_size_varint.len;
+    var body_pos = header_size;
+    var n: usize = 0;
+    while (header_pos < header_size and n < mask.max_index) {
+        const serial = parseVarint(local_bytes[header_pos..header_size]) catch return false;
+        header_pos += serial.len;
+        const advance: usize = switch (serial.value) {
+            0, 8, 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6, 7 => 8,
+            10, 11 => return false,
+            else => if (serial.value % 2 == 0)
+                @intCast((serial.value - 12) / 2)
+            else
+                @intCast((serial.value - 13) / 2),
+        };
+        if (mask.isSet(n) and body_pos + advance > local_bytes.len) return false;
+        body_pos += advance;
+        n += 1;
+    }
+    return true;
+}
+
 /// Parse a SQLite record into a stack-allocated buffer — no heap
 /// allocation at all. Returns `error.TooManyColumns` when the record
 /// has more than `MAX_INLINE_VALUES` columns; the caller should fall

@@ -618,13 +618,16 @@ fn selectSqlStreamingSimple(
         if (!isNaturalRowidAscOrderLocal(ob, info, stmt.table_name, stmt.table_alias)) return false;
     }
     if (!streamingProjectionColumnsExist(stmt, info)) return false;
+    const mask = streamingProjectionMask(stmt, info) orelse return false;
 
-    const stats = try sqlnano.sqlite.table_mod.countBtreeEntries(reader, info.root_page);
     const limit_rows: u64 = if (stmt.limit) |lim|
         if (lim <= 0) 0 else @intCast(lim)
     else
         std.math.maxInt(u64);
-    const rows_to_emit = @min(stats.entries, limit_rows);
+    const rows_to_emit = if (stmt.limit != null)
+        try countStreamingRowsUpTo(reader, info.root_page, init.gpa, limit_rows)
+    else
+        (try sqlnano.sqlite.table_mod.countBtreeEntries(reader, info.root_page)).entries;
 
     try writer.print("table: {s}\n", .{entry.name});
     try writer.writeAll("columns: [");
@@ -639,8 +642,38 @@ fn selectSqlStreamingSimple(
         .info = info,
         .limit = rows_to_emit,
     };
-    try sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &ctx, SelectSqlStreamCtx.onRow);
+    try sqlnano.sqlite.table_mod.scanTableForEachProjected(reader, info.root_page, init.gpa, mask, &ctx, SelectSqlStreamCtx.onRow);
     return true;
+}
+
+const CountRowsUpToCtx = struct {
+    limit: u64,
+    count: u64 = 0,
+    stop_after: bool = false,
+
+    fn onRow(ctx: *@This(), _: i64, _: []const sqlnano.sqlite.Value) !void {
+        ctx.count += 1;
+        if (ctx.count >= ctx.limit) ctx.stop_after = true;
+    }
+};
+
+fn countStreamingRowsUpTo(
+    reader: sqlnano.sqlite.PageReader,
+    root_page: u32,
+    allocator: std.mem.Allocator,
+    limit: u64,
+) !u64 {
+    if (limit == 0) return 0;
+    var ctx = CountRowsUpToCtx{ .limit = limit };
+    try sqlnano.sqlite.table_mod.scanTableForEachProjected(
+        reader,
+        root_page,
+        allocator,
+        sqlnano.sqlite.record_mod.ProjectionMask.empty(),
+        &ctx,
+        CountRowsUpToCtx.onRow,
+    );
+    return ctx.count;
 }
 
 const SelectSqlStreamCtx = struct {
@@ -694,6 +727,27 @@ fn streamingQualifierMatches(qualifier: []const u8, table_name: []const u8, tabl
         if (std.ascii.eqlIgnoreCase(qualifier, alias)) return true;
     }
     return std.ascii.eqlIgnoreCase(qualifier, table_name);
+}
+
+fn streamingProjectionMask(
+    stmt: sqlnano.sqlite.SelectStatement,
+    info: sqlnano.sqlite.TableInfo,
+) ?sqlnano.sqlite.record_mod.ProjectionMask {
+    var mask = sqlnano.sqlite.record_mod.ProjectionMask.empty();
+    for (stmt.projections) |projection| switch (projection) {
+        .star, .table_star => {
+            if (info.columns.len > sqlnano.sqlite.record_mod.MAX_INLINE_VALUES) return null;
+            for (info.columns, 0..) |_, idx| mask.set(idx);
+        },
+        .column => |col| {
+            if (std.ascii.eqlIgnoreCase(col.ref.name, "rowid")) continue;
+            const idx = columnIndex(info, col.ref.name) orelse return null;
+            if (idx >= sqlnano.sqlite.record_mod.MAX_INLINE_VALUES) return null;
+            mask.set(idx);
+        },
+        else => return null,
+    };
+    return mask;
 }
 
 fn printStreamingProjectionColumns(
@@ -1212,7 +1266,6 @@ fn benchQuery(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, 
 
     var mf = try sqlnano.sqlite.mapped_file.MappedFile.open(init.io, path, .read_only);
     defer mf.deinit();
-    mf.advise(.willneed) catch {};
     mf.advise(.sequential) catch {};
 
     const reader = try sqlnano.sqlite.PageReader.init(mf.items);
@@ -1349,18 +1402,24 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
         }
     }
 
-    // Hint the kernel: COUNT(*) and full scans walk every leaf page
-    // sequentially, so `MADV_WILLNEED` gets us the same eager
-    // readahead SQLite's pager-with-pread enjoys. Point lookups
-    // benefit from `MADV_RANDOM` instead — they touch ~3 pages
-    // scattered across the file, and `random` short-circuits the
-    // kernel's default readahead.
+    // Hint the kernel about access pattern without eager full-file
+    // prefetch. `WILLNEED` improves some cold scans but can make RSS
+    // look like the whole mmap is resident on multi-GB databases.
+    // Point lookups benefit from `MADV_RANDOM` instead — they touch
+    // just a few pages and avoid default readahead.
     if (rowid == null and indexed_rowids == null) {
-        mf.advise(.willneed) catch {};
         mf.advise(.sequential) catch {};
     } else {
         mf.advise(.random) catch {};
     }
+
+    const projected_scan_mask: ?sqlnano.sqlite.record_mod.ProjectionMask =
+        if (stmt.where_expr == null and stmt.joins.len == 0 and
+        streamingProjectionsSupported(stmt) and
+        streamingProjectionColumnsExist(stmt, info))
+            streamingProjectionMask(stmt, info)
+        else
+            null;
 
     var total_rows: usize = 0;
     const start = std.Io.Clock.awake.now(init.io).toNanoseconds();
@@ -1429,22 +1488,26 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
             var rows_this_iter: u64 = 0;
             var sink: i64 = 0;
             var ctx: Counter = .{ .total = &rows_this_iter, .sink = &sink, .limit = limit_rows };
-            sqlnano.sqlite.table_mod.scanTableForEach(reader, info.root_page, &ctx, Counter.tick) catch |err| switch (err) {
-                error.PayloadOverflowUnsupported => {
-                    // Reset and retry on the alloc path. The first
-                    // attempt may have partially populated `sink` /
-                    // `rows_this_iter` before bailing; reset so we
-                    // don't double-count.
-                    rows_this_iter = 0;
-                    sink = 0;
-                    ctx.stop_after = false;
-                    sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &ctx, Counter.tick) catch |err2| switch (err2) {
-                        error.PayloadOverflowUnsupported => return err2,
-                        else => return err2,
-                    };
-                },
-                else => return err,
-            };
+            if (projected_scan_mask) |mask| {
+                try sqlnano.sqlite.table_mod.scanTableForEachProjected(reader, info.root_page, init.gpa, mask, &ctx, Counter.tick);
+            } else {
+                sqlnano.sqlite.table_mod.scanTableForEach(reader, info.root_page, &ctx, Counter.tick) catch |err| switch (err) {
+                    error.PayloadOverflowUnsupported => {
+                        // Reset and retry on the alloc path. The first
+                        // attempt may have partially populated `sink` /
+                        // `rows_this_iter` before bailing; reset so we
+                        // don't double-count.
+                        rows_this_iter = 0;
+                        sink = 0;
+                        ctx.stop_after = false;
+                        sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &ctx, Counter.tick) catch |err2| switch (err2) {
+                            error.PayloadOverflowUnsupported => return err2,
+                            else => return err2,
+                        };
+                    },
+                    else => return err,
+                };
+            }
             total_rows += rows_this_iter;
             std.mem.doNotOptimizeAway(sink);
         }

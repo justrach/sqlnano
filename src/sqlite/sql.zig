@@ -515,6 +515,7 @@ fn streamSingleTable(
     // dispatch instead of a recursive AST walk.
     var compiled_where: ?CompiledExpr = null;
     if (stmt.where_expr) |w| compiled_where = try compileExpr(w, sources, ascratch);
+    const simple_projection = projectionsAreSimpleSingleSource(stmt.projections);
     var ctx: Ctx = .{
         .sources = sources,
         .stmt = stmt,
@@ -523,7 +524,7 @@ fn streamSingleTable(
         .rows_out = &rows,
         .allocator = allocator,
         .ascratch = ascratch,
-        .simple_projection = projectionsAreSimpleSingleSource(stmt.projections),
+        .simple_projection = simple_projection,
         .emitted = 0,
         .limit = stmt.limit orelse std.math.maxInt(i64),
         .stop_after = false,
@@ -557,66 +558,89 @@ fn streamSingleTable(
         }
     }.call;
 
-    table.scanTableForEach(reader, info.root_page, &ctx, onRow) catch |err| handle_scan_err: {
-        if (err == error.PayloadOverflowUnsupported) {
-            for (rows.items) |r| r.deinit(allocator);
-            rows.clearRetainingCapacity();
-            ctx.emitted = 0;
-            ctx.stop_after = false;
-            table.scanTableForEachAlloc(reader, info.root_page, allocator, &ctx, onRow) catch |alloc_err| {
-                return switch (alloc_err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.TooManyColumns => error.TooManyColumns,
-                    error.PayloadOverflowUnsupported => error.PayloadOverflowUnsupported,
-                    error.CellOffsetOutOfBounds => error.CellOffsetOutOfBounds,
-                    error.InvalidCellIndex => error.InvalidCellIndex,
-                    error.InvalidHeaderSize => error.InvalidHeaderSize,
-                    error.InvalidOverflowPage => error.InvalidOverflowPage,
-                    error.InvalidPageHeader => error.InvalidPageHeader,
-                    error.InvalidPageNumber => error.InvalidPageNumber,
-                    error.InvalidPageType => error.InvalidPageType,
-                    error.InvalidSerialType => error.InvalidSerialType,
-                    error.InvalidTableCell => error.InvalidTableCell,
-                    error.Overflow => error.Overflow,
-                    error.PageOutOfBounds => error.PageOutOfBounds,
-                    error.PageTooSmall => error.PageTooSmall,
-                    error.RowNotFound => error.RowNotFound,
-                    error.ValueOutOfBounds => error.ValueOutOfBounds,
-                    error.VarintOverflow => error.VarintOverflow,
-                    error.VarintTooSmall => error.VarintTooSmall,
-                    else => error.UnsupportedSql,
-                };
-            };
-            break :handle_scan_err;
-        }
-        return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.TooManyColumns => error.TooManyColumns,
-            error.PayloadOverflowUnsupported => error.PayloadOverflowUnsupported,
-            error.CellOffsetOutOfBounds => error.CellOffsetOutOfBounds,
-            error.InvalidCellIndex => error.InvalidCellIndex,
-            error.InvalidHeaderSize => error.InvalidHeaderSize,
-            error.InvalidPageHeader => error.InvalidPageHeader,
-            error.InvalidPageNumber => error.InvalidPageNumber,
-            error.InvalidPageType => error.InvalidPageType,
-            error.InvalidSerialType => error.InvalidSerialType,
-            error.InvalidTableCell => error.InvalidTableCell,
-            error.Overflow => error.Overflow,
-            error.PageOutOfBounds => error.PageOutOfBounds,
-            error.PageTooSmall => error.PageTooSmall,
-            error.RowNotFound => error.RowNotFound,
-            error.ValueOutOfBounds => error.ValueOutOfBounds,
-            error.VarintOverflow => error.VarintOverflow,
-            error.VarintTooSmall => error.VarintTooSmall,
-            else => error.UnsupportedSql,
+    var mask = record.ProjectionMask.empty();
+    var mask_safe = simple_projection and stmt.where_expr == null and sources.len == 1;
+    if (mask_safe) mask_safe = try buildProjectionMaskFromProjections(stmt.projections, sources[0], &mask);
+
+    if (mask_safe) {
+        table.scanTableForEachProjected(reader, info.root_page, allocator, mask, &ctx, onRow) catch |err| {
+            return mapTableScanErr(err);
         };
-    };
+    } else {
+        table.scanTableForEach(reader, info.root_page, &ctx, onRow) catch |err| handle_scan_err: {
+            if (err == error.PayloadOverflowUnsupported) {
+                for (rows.items) |r| r.deinit(allocator);
+                rows.clearRetainingCapacity();
+                ctx.emitted = 0;
+                ctx.stop_after = false;
+                table.scanTableForEachAlloc(reader, info.root_page, allocator, &ctx, onRow) catch |alloc_err| {
+                    return mapTableScanErr(alloc_err);
+                };
+                break :handle_scan_err;
+            }
+            return mapTableScanErr(err);
+        };
+    }
 
     return .{
         .columns = columns,
         .table_info = try cloneTableInfo(allocator, info),
         .rows = try rows.toOwnedSlice(allocator),
     };
+}
+
+fn mapTableScanErr(err: anyerror) SqlError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooManyColumns => error.TooManyColumns,
+        error.PayloadOverflowUnsupported => error.PayloadOverflowUnsupported,
+        error.CellOffsetOutOfBounds => error.CellOffsetOutOfBounds,
+        error.InvalidCellIndex => error.InvalidCellIndex,
+        error.InvalidHeaderSize => error.InvalidHeaderSize,
+        error.InvalidOverflowPage => error.InvalidOverflowPage,
+        error.InvalidPageHeader => error.InvalidPageHeader,
+        error.InvalidPageNumber => error.InvalidPageNumber,
+        error.InvalidPageType => error.InvalidPageType,
+        error.InvalidSerialType => error.InvalidSerialType,
+        error.InvalidTableCell => error.InvalidTableCell,
+        error.Overflow => error.Overflow,
+        error.PageOutOfBounds => error.PageOutOfBounds,
+        error.PageTooSmall => error.PageTooSmall,
+        error.RowNotFound => error.RowNotFound,
+        error.ValueOutOfBounds => error.ValueOutOfBounds,
+        error.VarintOverflow => error.VarintOverflow,
+        error.VarintTooSmall => error.VarintTooSmall,
+        else => error.UnsupportedSql,
+    };
+}
+
+fn buildProjectionMaskFromProjections(
+    projections: []const ast.Projection,
+    source: Source,
+    mask: *record.ProjectionMask,
+) SqlError!bool {
+    for (projections) |p| switch (p) {
+        .star => {
+            if (source.info.columns.len > record.MAX_INLINE_VALUES) return false;
+            for (source.info.columns, 0..) |_, idx| mask.set(idx);
+        },
+        .table_star => |qname| {
+            if (!source.matches(qname)) return error.TableNotFound;
+            if (source.info.columns.len > record.MAX_INLINE_VALUES) return false;
+            for (source.info.columns, 0..) |_, idx| mask.set(idx);
+        },
+        .column => |col| {
+            if (col.ref.qualifier) |q| {
+                if (!source.matches(q)) return error.ColumnNotFound;
+            }
+            if (asciiEql(col.ref.name, "rowid")) continue;
+            const idx = columnIndex(source.info, col.ref.name) orelse return error.ColumnNotFound;
+            if (idx >= record.MAX_INLINE_VALUES) return false;
+            mask.set(idx);
+        },
+        .expr, .count_star, .aggregate => unreachable,
+    };
+    return true;
 }
 
 /// Streaming path for single-table aggregate queries (SUM, COUNT,
@@ -1197,18 +1221,30 @@ const ResolvedColumn = struct {
 };
 
 const InstrOp = enum(u8) {
-    push_col,   // a = index into cols[], b = unused
-    push_null,  // stack[sp++] = .null
-    push_int,   // a = index into ints[]
-    push_text,  // a = index into texts[]
-    eq, ne, lt, le, gt, ge, // binary compare — pops 2, pushes int(0/1)
-    add, sub, mul, div, mod, // binary arith
-    concat,     // string concat
-    like, not_like,
-    and_, or_,  // logical — short-circuit NOT applied (pre-evaluated both sides)
-    not_,       // unary logical not
-    is_null, is_not_null,
-    neg,        // unary arithmetic negation
+    push_col, // a = index into cols[], b = unused
+    push_null, // stack[sp++] = .null
+    push_int, // a = index into ints[]
+    push_text, // a = index into texts[]
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge, // binary compare — pops 2, pushes int(0/1)
+    add,
+    sub,
+    mul,
+    div,
+    mod, // binary arith
+    concat, // string concat
+    like,
+    not_like,
+    and_,
+    or_, // logical — short-circuit NOT applied (pre-evaluated both sides)
+    not_, // unary logical not
+    is_null,
+    is_not_null,
+    neg, // unary arithmetic negation
 };
 
 const Instr = struct {
@@ -1222,7 +1258,7 @@ const Instr = struct {
 pub const CompiledExpr = struct {
     instrs: []Instr,
     ints: []i64,
-    texts: [][]const u8,   // borrowed from arena
+    texts: [][]const u8, // borrowed from arena
     cols: []ResolvedColumn,
 
     pub fn deinit(self: *CompiledExpr, alloc: std.mem.Allocator) void {
@@ -1354,10 +1390,20 @@ const CompileCtx = struct {
 
 fn binOpToInstr(op: ast.BinOp) InstrOp {
     return switch (op) {
-        .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
-        .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod,
+        .eq => .eq,
+        .ne => .ne,
+        .lt => .lt,
+        .le => .le,
+        .gt => .gt,
+        .ge => .ge,
+        .add => .add,
+        .sub => .sub,
+        .mul => .mul,
+        .div => .div,
+        .mod => .mod,
         .concat => .concat,
-        .like => .like, .not_like => .not_like,
+        .like => .like,
+        .not_like => .not_like,
         else => unreachable,
     };
 }
@@ -1477,7 +1523,14 @@ pub fn evalCompiled(compiled: *const CompiledExpr, tuple: []const SourcedRow, sc
 }
 
 fn arithInstrToBinOp(op: InstrOp) ast.BinOp {
-    return switch (op) { .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod, else => unreachable };
+    return switch (op) {
+        .add => .add,
+        .sub => .sub,
+        .mul => .mul,
+        .div => .div,
+        .mod => .mod,
+        else => unreachable,
+    };
 }
 
 inline fn vmPush(buf: []record.Value, sp: *usize, v: record.Value) void {

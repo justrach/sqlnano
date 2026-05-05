@@ -60,7 +60,7 @@ Both engines compiled `-O3`/`ReleaseFast`, same fixture (`CREATE TABLE t(id INTE
 
 ### Reads — hot-cache vs cold-cache, both engines apples-to-apples
 
-Both engines now use the OS page cache (sqlnano via `mmap` + `MADV_WILLNEED` for sequential scans; SQLite via its built-in pager + `pread`). 1M-row table, 12 MB on disk.
+Both engines now use the OS page cache (sqlnano via `mmap` + access-pattern hints; SQLite via its built-in pager + `pread`). 1M-row table, 12 MB on disk.
 
 **Hot CPU cache** (data already in L2/L3 from a prior tight-loop run — best-case throughput, not realistic single-query speed):
 
@@ -80,7 +80,7 @@ Both engines now use the OS page cache (sqlnano via `mmap` + `MADV_WILLNEED` for
 The hot-cache COUNT(*) numbers are real measurements but reflect L2 cache speed, not "speed of one query against a fresh database". The cold-cache row above is closer to what you'll see for an actual query — and even there sqlnano stays ahead because:
 
 - `countBtreeEntries` reads only b-tree page headers, not row payloads, and simple `COUNT(*)` can choose a smaller covering index b-tree with the same cardinality.
-- `MADV_WILLNEED` on bench-read tells the kernel to start prefetching the file as soon as we know the query is a scan.
+- Sequential mmap hints keep scan access predictable without eagerly faulting the whole file into RSS.
 - mmap + zero-syscall reads avoid the `pread` ⇒ kernel ⇒ userspace memcpy that SQLite's pager pays per page.
 
 **What makes it fast:**

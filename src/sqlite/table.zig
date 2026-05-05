@@ -101,6 +101,21 @@ pub fn scanTableForEachAlloc(
     try scanTableForEachAllocPage(reader, root_page, allocator, ctx, onRow);
 }
 
+/// Projection-aware table scan. `mask` flags the column indexes the
+/// caller consumes. Unselected columns are skipped, and overflow pages
+/// are only read when selected columns actually spill past the local
+/// cell payload.
+pub fn scanTableForEachProjected(
+    reader: page.PageReader,
+    root_page: u32,
+    allocator: std.mem.Allocator,
+    mask: record.ProjectionMask,
+    ctx: anytype,
+    comptime onRow: fn (ctx: @TypeOf(ctx), rowid: i64, values: []const record.Value) anyerror!void,
+) anyerror!void {
+    try scanTableForEachProjectedPage(reader, root_page, allocator, mask, ctx, onRow);
+}
+
 fn scanTableForEachPage(
     reader: page.PageReader,
     page_number: u32,
@@ -171,6 +186,69 @@ fn scanTableForEachAllocPage(
             }
             const right = header.right_most_pointer orelse return error.InvalidTableCell;
             try scanTableForEachAllocPage(reader, right, allocator, ctx, onRow);
+        },
+        else => return error.UnsupportedTableBTree,
+    }
+}
+
+fn scanTableForEachProjectedPage(
+    reader: page.PageReader,
+    page_number: u32,
+    allocator: std.mem.Allocator,
+    mask: record.ProjectionMask,
+    ctx: anytype,
+    comptime onRow: fn (ctx: @TypeOf(ctx), rowid: i64, values: []const record.Value) anyerror!void,
+) anyerror!void {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    switch (header.page_type) {
+        .table_leaf => {
+            var inline_rec: record.InlineRecord = undefined;
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                const prefix = try parseTableLeafCellPrefix(cell);
+
+                if (mask.isEmpty()) {
+                    inline_rec.len = 0;
+                    try onRow(ctx, prefix.rowid, inline_rec.slice());
+                    if (scanShouldStop(ctx)) return;
+                    continue;
+                }
+
+                const payload_info = btree.tableLeafPayloadInfo(prefix.payload_size, reader.usableSize());
+                if (payload_info.overflow_page == null) {
+                    if (prefix.payload_start + prefix.payload_size > cell.len) return error.InvalidTableCell;
+                    const local = cell[prefix.payload_start .. prefix.payload_start + prefix.payload_size];
+                    try record.parseInlineProjected(local, mask, &inline_rec);
+                    try onRow(ctx, prefix.rowid, inline_rec.slice());
+                } else {
+                    if (prefix.payload_start + payload_info.local_len > cell.len) return error.InvalidTableCell;
+                    const local = cell[prefix.payload_start .. prefix.payload_start + payload_info.local_len];
+                    if (record.projectedBodyFitsLocal(local, mask)) {
+                        try record.parseInlineProjected(local, mask, &inline_rec);
+                        try onRow(ctx, prefix.rowid, inline_rec.slice());
+                    } else {
+                        const row = try parseTableLeafCellWithReader(reader, cell, allocator);
+                        defer row.deinit(allocator);
+                        try onRow(ctx, row.rowid, row.values);
+                    }
+                }
+                if (scanShouldStop(ctx)) return;
+            }
+        },
+        .table_interior => {
+            var i: usize = 0;
+            while (i < header.cell_count) : (i += 1) {
+                const cell = try header.cell(ref, i);
+                if (cell.len < 5) return error.InvalidTableCell;
+                const left_child = readU32(cell[0..4]);
+                _ = try parseVarint(cell[4..]);
+                try scanTableForEachProjectedPage(reader, left_child, allocator, mask, ctx, onRow);
+                if (scanShouldStop(ctx)) return;
+            }
+            const right = header.right_most_pointer orelse return error.InvalidTableCell;
+            try scanTableForEachProjectedPage(reader, right, allocator, mask, ctx, onRow);
         },
         else => return error.UnsupportedTableBTree,
     }
@@ -747,6 +825,95 @@ test "scan table foreach alloc reads overflow payload" {
 
     try std.testing.expectEqual(@as(usize, 1), ctx.count);
     try std.testing.expectEqual(@as(usize, 597), ctx.blob_len);
+}
+
+test "scan table foreach projected skips overflow chain when projection is local" {
+    const page_size = 512;
+    var bytes = [_]u8{0} ** (page_size * 2);
+    initTestHeader(bytes[0..], page_size, 2);
+
+    const blob_len: usize = 600;
+    const blob_serial: u64 = blob_len * 2 + 12;
+    const header_size_bytes: u8 = 1 + 1 + 1 + 1 + 1 + 2;
+
+    var payload: [800]u8 = undefined;
+    var ppos: usize = 0;
+    payload[ppos] = header_size_bytes;
+    ppos += 1;
+    payload[ppos] = 1;
+    ppos += 1;
+    payload[ppos] = 23;
+    ppos += 1;
+    payload[ppos] = 1;
+    ppos += 1;
+    payload[ppos] = 27;
+    ppos += 1;
+    ppos += encodeVarintTest(payload[ppos..], blob_serial);
+    try std.testing.expectEqual(@as(usize, header_size_bytes), ppos);
+
+    payload[ppos] = 0x11;
+    ppos += 1;
+    @memcpy(payload[ppos..][0..5], "ALICE");
+    ppos += 5;
+    payload[ppos] = 0x22;
+    ppos += 1;
+    @memcpy(payload[ppos..][0..7], "CHARLIE");
+    ppos += 7;
+    @memset(payload[ppos..][0..blob_len], 0xab);
+    ppos += blob_len;
+
+    const payload_info = btree.tableLeafPayloadInfo(ppos, page_size);
+    try std.testing.expect(payload_info.overflow_page != null);
+    try std.testing.expect(payload_info.local_len >= header_size_bytes + 1 + 5 + 1 + 7);
+
+    var cell_buf: [600]u8 = undefined;
+    var cpos: usize = 0;
+    cpos += encodeVarintTest(cell_buf[cpos..], ppos);
+    cpos += encodeVarintTest(cell_buf[cpos..], 1);
+    @memcpy(cell_buf[cpos..][0..payload_info.local_len], payload[0..payload_info.local_len]);
+    cpos += payload_info.local_len;
+    writeU32Test(cell_buf[cpos..][0..4], 0xffffffff);
+    cpos += 4;
+
+    const page_base = 100;
+    const cell_off = page_size - cpos;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.table_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 1;
+    writeU16Test(bytes[page_base + 5 ..][0..2], @intCast(cell_off));
+    writeU16Test(bytes[page_base + 8 ..][0..2], @intCast(cell_off));
+    @memcpy(bytes[cell_off..][0..cpos], cell_buf[0..cpos]);
+
+    @memset(bytes[page_size..], 0xff);
+
+    const reader = try page.PageReader.init(&bytes);
+    var mask = record.ProjectionMask.empty();
+    mask.set(1);
+    mask.set(3);
+
+    const Ctx = struct {
+        count: usize = 0,
+        col1_text: []const u8 = "",
+        col3_text: []const u8 = "",
+
+        fn onRow(ctx: *@This(), rowid: i64, values: []const record.Value) !void {
+            try std.testing.expectEqual(@as(i64, 1), rowid);
+            try std.testing.expectEqual(@as(usize, 4), values.len);
+            try std.testing.expect(values[0] == .null);
+            try std.testing.expect(values[1] == .text);
+            try std.testing.expect(values[2] == .null);
+            try std.testing.expect(values[3] == .text);
+            ctx.col1_text = values[1].text;
+            ctx.col3_text = values[3].text;
+            ctx.count += 1;
+        }
+    };
+    var ctx: Ctx = .{};
+    try scanTableForEachProjected(reader, 1, std.testing.allocator, mask, &ctx, Ctx.onRow);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.count);
+    try std.testing.expectEqualStrings("ALICE", ctx.col1_text);
+    try std.testing.expectEqualStrings("CHARLIE", ctx.col3_text);
 }
 
 fn initTestHeader(bytes: []u8, comptime page_size: u16, page_count: u32) void {
