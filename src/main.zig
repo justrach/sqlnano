@@ -584,7 +584,8 @@ fn selectSqlCountStar(
     if (stmt.where_expr != null or stmt.joins.len != 0 or stmt.projections.len != 1 or stmt.projections[0] != .count_star) return false;
 
     const entry = schema.findTable(stmt.table_name) orelse return error.TableNotFound;
-    const n = try sqlnano.sqlite.table_mod.countRows(reader, @intCast(entry.root_page));
+    const count_root = try sqlnano.sqlite.sql_mod.bestCountRootForTable(reader, schema, entry);
+    const n = (try sqlnano.sqlite.table_mod.countBtreeEntries(reader, count_root)).entries;
     const label = stmt.projections[0].count_star.alias orelse "COUNT(*)";
 
     try writer.print("table: {s}\n", .{entry.name});
@@ -865,12 +866,16 @@ const HydrateFilterContext = struct {
     filters: []const HydrateFilter,
     rowid_sets: []const RowidFilterSet,
     residual_filter_count: usize,
+    residual_filter_mask: ?sqlnano.sqlite.record_mod.ProjectionMask,
     allocator: std.mem.Allocator,
 
     fn accept(self: *@This(), candidate: sqlnano.sqlite.fts5_mod.ResultRow) anyerror!bool {
         if (!rowidMatchesSets(@intCast(candidate.rowid), self.rowid_sets)) return false;
         if (self.residual_filter_count == 0) return true;
-        const row = (try sqlnano.sqlite.table_mod.findRowByRowid(self.reader, self.info.root_page, @intCast(candidate.rowid), self.allocator)) orelse return false;
+        const row = (if (self.residual_filter_mask) |mask|
+            try sqlnano.sqlite.table_mod.findRowByRowidProjected(self.reader, self.info.root_page, @intCast(candidate.rowid), self.allocator, mask)
+        else
+            try sqlnano.sqlite.table_mod.findRowByRowid(self.reader, self.info.root_page, @intCast(candidate.rowid), self.allocator)) orelse return false;
         defer row.deinit(self.allocator);
         return rowMatchesHydrateFilters(row, self.filters);
     }
@@ -906,6 +911,7 @@ fn ftsSearch(
     const rowid_sets = try buildIndexedFilterSets(init.gpa, reader, schema, info, filters);
     defer freeRowidFilterSets(init.gpa, rowid_sets);
     const residual_filter_count = countResidualFilters(filters);
+    const residual_filter_mask = hydrateFilterMask(filters);
 
     const result = (if (filters.len == 0)
         sqlnano.sqlite.fts5_mod.search(reader, schema, table_name, query, .{
@@ -919,6 +925,7 @@ fn ftsSearch(
             .filters = filters,
             .rowid_sets = rowid_sets,
             .residual_filter_count = residual_filter_count,
+            .residual_filter_mask = residual_filter_mask,
             .allocator = init.gpa,
         };
         break :blk sqlnano.sqlite.fts5_mod.searchFiltered(reader, schema, table_name, query, .{
@@ -962,9 +969,13 @@ fn writeHydratedFtsJson(
         result.avg_doc_len,
     });
 
+    const selected_mask = columnIndexMask(selected_columns);
     var emitted: usize = 0;
     for (result.rows) |hit| {
-        const row = (try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, @intCast(hit.rowid), allocator)) orelse continue;
+        const row = (if (selected_mask) |mask|
+            try sqlnano.sqlite.table_mod.findRowByRowidProjected(reader, info.root_page, @intCast(hit.rowid), allocator, mask)
+        else
+            try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, @intCast(hit.rowid), allocator)) orelse continue;
         defer row.deinit(allocator);
 
         if (emitted != 0) try writer.writeAll(",");
@@ -1414,9 +1425,7 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     }
 
     const projected_scan_mask: ?sqlnano.sqlite.record_mod.ProjectionMask =
-        if (stmt.where_expr == null and stmt.joins.len == 0 and
-        streamingProjectionsSupported(stmt) and
-        streamingProjectionColumnsExist(stmt, info))
+        if (stmt.joins.len == 0 and streamingProjectionsSupported(stmt) and streamingProjectionColumnsExist(stmt, info))
             streamingProjectionMask(stmt, info)
         else
             null;
@@ -1429,7 +1438,7 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
             if (is_count_projection) {
                 if (try sqlnano.sqlite.table_mod.rowidExists(reader, info.root_page, id)) total_rows += 1;
             } else {
-                if (try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, id, init.gpa)) |found| {
+                if (try findBenchRowByRowid(reader, info.root_page, id, init.gpa, projected_scan_mask)) |found| {
                     total_rows += 1;
                     found.deinit(init.gpa);
                 }
@@ -1439,7 +1448,7 @@ fn benchRead(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
                 total_rows += ids.len;
             } else {
                 for (ids) |id| {
-                    if (try sqlnano.sqlite.table_mod.findRowByRowid(reader, info.root_page, id, init.gpa)) |found| {
+                    if (try findBenchRowByRowid(reader, info.root_page, id, init.gpa, projected_scan_mask)) |found| {
                         total_rows += 1;
                         found.deinit(init.gpa);
                     }
@@ -1848,6 +1857,25 @@ fn rowMatchesHydrateFilters(row: sqlnano.sqlite.TableRow, filters: []const Hydra
     return true;
 }
 
+fn hydrateFilterMask(filters: []const HydrateFilter) ?sqlnano.sqlite.record_mod.ProjectionMask {
+    var mask = sqlnano.sqlite.record_mod.ProjectionMask.empty();
+    for (filters) |filter| {
+        if (filter.indexed) continue;
+        if (filter.column_index >= sqlnano.sqlite.record_mod.MAX_INLINE_VALUES) return null;
+        mask.set(filter.column_index);
+    }
+    return mask;
+}
+
+fn columnIndexMask(indexes: []const usize) ?sqlnano.sqlite.record_mod.ProjectionMask {
+    var mask = sqlnano.sqlite.record_mod.ProjectionMask.empty();
+    for (indexes) |idx| {
+        if (idx >= sqlnano.sqlite.record_mod.MAX_INLINE_VALUES) return null;
+        mask.set(idx);
+    }
+    return mask;
+}
+
 fn buildIndexedFilterSets(
     allocator: std.mem.Allocator,
     reader: sqlnano.sqlite.PageReader,
@@ -1959,6 +1987,19 @@ fn compareValueText(value: sqlnano.sqlite.Value, text: []const u8) ?bool {
 fn rowValue(row: sqlnano.sqlite.TableRow, column_index: usize) sqlnano.sqlite.Value {
     if (column_index >= row.values.len) return .null;
     return row.values[column_index];
+}
+
+fn findBenchRowByRowid(
+    reader: sqlnano.sqlite.PageReader,
+    root_page: u32,
+    rowid: i64,
+    allocator: std.mem.Allocator,
+    mask: ?sqlnano.sqlite.record_mod.ProjectionMask,
+) !?sqlnano.sqlite.TableRow {
+    return if (mask) |projection_mask|
+        try sqlnano.sqlite.table_mod.findRowByRowidProjected(reader, root_page, rowid, allocator, projection_mask)
+    else
+        try sqlnano.sqlite.table_mod.findRowByRowid(reader, root_page, rowid, allocator);
 }
 
 fn columnIndex(info: sqlnano.sqlite.TableInfo, name: []const u8) ?usize {

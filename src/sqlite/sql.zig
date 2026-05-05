@@ -536,13 +536,9 @@ fn streamSingleTable(
             var tuple_buf: [1]SourcedRow = undefined;
             var have_tuple = false;
             if (c.compiled_where != null or !c.simple_projection) {
-                // Build a synthetic 1-element tuple for tuple-shaped
-                // predicates / expression projections. Simple column
-                // projections below borrow `values` directly.
-                const arena_values = try c.ascratch.alloc(record.Value, values.len);
-                @memcpy(arena_values, values);
-                const row_in_arena = table.Row{ .rowid = rowid, .values = arena_values };
-                tuple_buf[0] = .{ .source_index = 0, .row = row_in_arena };
+                // Evaluation is synchronous, so the tuple can borrow the
+                // scanner's row view instead of copying it per row.
+                tuple_buf[0] = .{ .source_index = 0, .row = .{ .rowid = rowid, .values = @constCast(values) } };
                 have_tuple = true;
             }
             if (c.compiled_where) |*cw| {
@@ -559,8 +555,11 @@ fn streamSingleTable(
     }.call;
 
     var mask = record.ProjectionMask.empty();
-    var mask_safe = simple_projection and stmt.where_expr == null and sources.len == 1;
+    var mask_safe = simple_projection and sources.len == 1;
     if (mask_safe) mask_safe = try buildProjectionMaskFromProjections(stmt.projections, sources[0], &mask);
+    if (mask_safe) {
+        if (compiled_where) |cw| mask_safe = addCompiledExprColumnsToMask(cw, 0, &mask);
+    }
 
     if (mask_safe) {
         table.scanTableForEachProjected(reader, info.root_page, allocator, mask, &ctx, onRow) catch |err| {
@@ -640,6 +639,15 @@ fn buildProjectionMaskFromProjections(
         },
         .expr, .count_star, .aggregate => unreachable,
     };
+    return true;
+}
+
+fn addCompiledExprColumnsToMask(compiled: CompiledExpr, source_index: u8, mask: *record.ProjectionMask) bool {
+    for (compiled.cols) |col| {
+        if (col.source_index != source_index) return false;
+        if (col.column_index >= record.MAX_INLINE_VALUES) return false;
+        mask.set(col.column_index);
+    }
     return true;
 }
 
@@ -727,9 +735,7 @@ fn streamSingleTableAgg(
         fn call(c: *Ctx2, rowid: i64, values: []const record.Value) SqlError!void {
             // WHERE filter.
             if (c.compiled_where) |cw| {
-                const arena_values = try c.ascratch.alloc(record.Value, values.len);
-                @memcpy(arena_values, values);
-                const row = table.Row{ .rowid = rowid, .values = arena_values };
+                const row = table.Row{ .rowid = rowid, .values = @constCast(values) };
                 var tuple_buf: [1]SourcedRow = .{.{ .source_index = 0, .row = row }};
                 if (!isTruthy(try evalCompiled(cw, &tuple_buf, c.ascratch))) return;
             }
@@ -1954,6 +1960,10 @@ fn buildFromSingleTable(
     }
 
     const limit = stmt.limit orelse std.math.maxInt(i64);
+    const simple_projection = projectionsAreSimpleSingleSource(stmt.projections);
+    var row_mask = record.ProjectionMask.empty();
+    var projected_fetch = simple_projection and sources.len == 1;
+    if (projected_fetch) projected_fetch = try buildProjectionMaskFromProjections(stmt.projections, sources[0], &row_mask);
 
     // COUNT(*) path short-circuits enumerating projections per row.
     var has_count = false;
@@ -1986,25 +1996,30 @@ fn buildFromSingleTable(
             scratch_alloc: std.mem.Allocator,
             sources_inner: []const Source,
             stmt_inner: SelectStatement,
+            columns_inner: []const ResultColumn,
+            simple_projection_inner: bool,
             row: table.Row,
             rows_out: *std.ArrayList(ResultRow),
         ) SqlError!void {
             var tuple_buf: [1]SourcedRow = .{.{ .source_index = 0, .row = row }};
-            const values = try projectTuple(out_alloc, stmt_inner.projections, sources_inner, &tuple_buf, &.{}, scratch_alloc);
+            const values = if (simple_projection_inner)
+                try projectSingleSourceRow(out_alloc, stmt_inner.projections, sources_inner[0], row.rowid, row.values, columns_inner)
+            else
+                try projectTuple(out_alloc, stmt_inner.projections, sources_inner, &tuple_buf, columns_inner, scratch_alloc);
             try rows_out.append(out_alloc, .{ .rowid = row.rowid, .values = values });
         }
     }.call;
 
     if (direct_rowid) |rid| {
-        if (try table.findRowByRowid(reader, info.root_page, rid, ascratch)) |found| {
-            try pushRow(allocator, ascratch, sources, stmt, found, &rows);
+        if (try findRowByRowidMaybeProjected(reader, info.root_page, rid, ascratch, projected_fetch, row_mask)) |found| {
+            try pushRow(allocator, ascratch, sources, stmt, columns, simple_projection, found, &rows);
         }
     } else if (indexed_rowids) |rids| {
         var emitted: i64 = 0;
         for (rids) |rid| {
             if (emitted >= limit) break;
-            if (try table.findRowByRowid(reader, info.root_page, rid, ascratch)) |found| {
-                try pushRow(allocator, ascratch, sources, stmt, found, &rows);
+            if (try findRowByRowidMaybeProjected(reader, info.root_page, rid, ascratch, projected_fetch, row_mask)) |found| {
+                try pushRow(allocator, ascratch, sources, stmt, columns, simple_projection, found, &rows);
                 emitted += 1;
             }
         }
@@ -2015,6 +2030,20 @@ fn buildFromSingleTable(
         .table_info = try cloneTableInfo(allocator, info),
         .rows = try rows.toOwnedSlice(allocator),
     };
+}
+
+fn findRowByRowidMaybeProjected(
+    reader: page.PageReader,
+    root_page: u32,
+    rowid: i64,
+    allocator: std.mem.Allocator,
+    projected_fetch: bool,
+    mask: record.ProjectionMask,
+) SqlError!?table.Row {
+    return if (projected_fetch)
+        try table.findRowByRowidProjected(reader, root_page, rowid, allocator, mask)
+    else
+        try table.findRowByRowid(reader, root_page, rowid, allocator);
 }
 
 fn cloneNamedValues(values: []const catalog.NamedValue, allocator: std.mem.Allocator) SqlError![]catalog.NamedValue {

@@ -313,6 +313,16 @@ pub fn findRowByRowid(reader: page.PageReader, root_page: u32, wanted_rowid: i64
     return findRowInPage(reader, root_page, wanted_rowid, allocator);
 }
 
+pub fn findRowByRowidProjected(
+    reader: page.PageReader,
+    root_page: u32,
+    wanted_rowid: i64,
+    allocator: std.mem.Allocator,
+    mask: record.ProjectionMask,
+) TableError!?Row {
+    return findRowInPageProjected(reader, root_page, wanted_rowid, allocator, mask);
+}
+
 pub fn rowidExists(reader: page.PageReader, root_page: u32, wanted_rowid: i64) TableError!bool {
     return rowidExistsInPage(reader, root_page, wanted_rowid);
 }
@@ -362,6 +372,24 @@ fn findRowInPage(reader: page.PageReader, page_number: u32, wanted_rowid: i64, a
     };
 }
 
+fn findRowInPageProjected(
+    reader: page.PageReader,
+    page_number: u32,
+    wanted_rowid: i64,
+    allocator: std.mem.Allocator,
+    mask: record.ProjectionMask,
+) TableError!?Row {
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    if (!header.page_type.isTable()) return error.UnsupportedTableBTree;
+
+    return switch (header.page_type) {
+        .table_leaf => try findRowInLeafProjected(reader, ref, header, wanted_rowid, allocator, mask),
+        .table_interior => try findRowInInteriorProjected(reader, ref, header, wanted_rowid, allocator, mask),
+        else => error.UnsupportedTableBTree,
+    };
+}
+
 fn rowidExistsInPage(reader: page.PageReader, page_number: u32, wanted_rowid: i64) TableError!bool {
     const ref = try reader.page(page_number);
     const header = try btree.PageHeader.parse(ref);
@@ -387,6 +415,31 @@ fn findRowInLeaf(reader: page.PageReader, ref: page.PageRef, header: btree.PageH
             lo = mid + 1;
         } else {
             return try parseTableLeafCellWithReader(reader, cell, allocator);
+        }
+    }
+    return null;
+}
+
+fn findRowInLeafProjected(
+    reader: page.PageReader,
+    ref: page.PageRef,
+    header: btree.PageHeader,
+    wanted_rowid: i64,
+    allocator: std.mem.Allocator,
+    mask: record.ProjectionMask,
+) TableError!?Row {
+    var lo: usize = 0;
+    var hi: usize = header.cell_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const cell = try header.cell(ref, mid);
+        const prefix = try parseTableLeafCellPrefix(cell);
+        if (wanted_rowid < prefix.rowid) {
+            hi = mid;
+        } else if (wanted_rowid > prefix.rowid) {
+            lo = mid + 1;
+        } else {
+            return try parseTableLeafCellProjectedWithReader(reader, cell, allocator, mask);
         }
     }
     return null;
@@ -434,6 +487,39 @@ fn findRowInInterior(reader: page.PageReader, ref: page.PageRef, header: btree.P
 
     const right = header.right_most_pointer orelse return error.InvalidTableCell;
     return try findRowInPage(reader, right, wanted_rowid, allocator);
+}
+
+fn findRowInInteriorProjected(
+    reader: page.PageReader,
+    ref: page.PageRef,
+    header: btree.PageHeader,
+    wanted_rowid: i64,
+    allocator: std.mem.Allocator,
+    mask: record.ProjectionMask,
+) TableError!?Row {
+    var lo: usize = 0;
+    var hi: usize = header.cell_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const cell = try header.cell(ref, mid);
+        if (cell.len < 5) return error.InvalidTableCell;
+        const sep = try parseVarint(cell[4..]);
+        if (wanted_rowid <= @as(i64, @intCast(sep.value))) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    if (lo < header.cell_count) {
+        const cell = try header.cell(ref, lo);
+        if (cell.len < 5) return error.InvalidTableCell;
+        const left_child = readU32(cell[0..4]);
+        return try findRowInPageProjected(reader, left_child, wanted_rowid, allocator, mask);
+    }
+
+    const right = header.right_most_pointer orelse return error.InvalidTableCell;
+    return try findRowInPageProjected(reader, right, wanted_rowid, allocator, mask);
 }
 
 fn rowidExistsInInterior(reader: page.PageReader, ref: page.PageRef, header: btree.PageHeader, wanted_rowid: i64) TableError!bool {
@@ -548,6 +634,41 @@ fn parseTableLeafCellWithReader(reader: page.PageReader, cell: []const u8, alloc
         .values = rec.values,
         .owned_payload = payload,
     };
+}
+
+fn parseTableLeafCellProjectedWithReader(reader: page.PageReader, cell: []const u8, allocator: std.mem.Allocator, mask: record.ProjectionMask) TableError!Row {
+    const prefix = try parseTableLeafCellPrefix(cell);
+    if (mask.isEmpty()) {
+        return .{
+            .rowid = prefix.rowid,
+            .values = try allocator.alloc(record.Value, 0),
+        };
+    }
+
+    const payload_info = btree.tableLeafPayloadInfo(prefix.payload_size, reader.usableSize());
+    if (prefix.payload_start + payload_info.local_len > cell.len) return error.InvalidTableCell;
+
+    var inline_rec: record.InlineRecord = undefined;
+    if (payload_info.overflow_page == null) {
+        if (prefix.payload_start + prefix.payload_size > cell.len) return error.InvalidTableCell;
+        const local = cell[prefix.payload_start .. prefix.payload_start + prefix.payload_size];
+        try record.parseInlineProjected(local, mask, &inline_rec);
+        return .{
+            .rowid = prefix.rowid,
+            .values = try allocator.dupe(record.Value, inline_rec.slice()),
+        };
+    }
+
+    const local = cell[prefix.payload_start .. prefix.payload_start + payload_info.local_len];
+    if (record.projectedBodyFitsLocal(local, mask)) {
+        try record.parseInlineProjected(local, mask, &inline_rec);
+        return .{
+            .rowid = prefix.rowid,
+            .values = try allocator.dupe(record.Value, inline_rec.slice()),
+        };
+    }
+
+    return try parseTableLeafCellWithReader(reader, cell, allocator);
 }
 
 const TableLeafCellPrefix = struct {
@@ -914,6 +1035,16 @@ test "scan table foreach projected skips overflow chain when projection is local
     try std.testing.expectEqual(@as(usize, 1), ctx.count);
     try std.testing.expectEqualStrings("ALICE", ctx.col1_text);
     try std.testing.expectEqualStrings("CHARLIE", ctx.col3_text);
+
+    const found = (try findRowByRowidProjected(reader, 1, 1, std.testing.allocator, mask)) orelse return error.RowNotFound;
+    defer found.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), found.values.len);
+    try std.testing.expect(found.values[0] == .null);
+    try std.testing.expect(found.values[1] == .text);
+    try std.testing.expect(found.values[2] == .null);
+    try std.testing.expect(found.values[3] == .text);
+    try std.testing.expectEqualStrings("ALICE", found.values[1].text);
+    try std.testing.expectEqualStrings("CHARLIE", found.values[3].text);
 }
 
 fn initTestHeader(bytes: []u8, comptime page_size: u16, page_count: u32) void {
