@@ -239,6 +239,39 @@ pub fn rowidExists(reader: page.PageReader, root_page: u32, wanted_rowid: i64) T
     return rowidExistsInPage(reader, root_page, wanted_rowid);
 }
 
+/// Walk the rowid b-tree from `root_page` along the leftmost
+/// (`find_max=false`) or rightmost (`find_max=true`) edge and return
+/// that leaf cell's rowid. This is O(tree depth) and does not decode
+/// or allocate row payloads.
+pub fn extremalRowid(reader: page.PageReader, root_page: u32, find_max: bool) TableError!?i64 {
+    var p = root_page;
+    while (true) {
+        const ref = try reader.page(p);
+        const header = try btree.PageHeader.parse(ref);
+        switch (header.page_type) {
+            .table_leaf => {
+                if (header.cell_count == 0) return null;
+                const idx: usize = if (find_max) header.cell_count - 1 else 0;
+                const cell = try header.cell(ref, idx);
+                const prefix = try parseTableLeafCellPrefix(cell);
+                return prefix.rowid;
+            },
+            .table_interior => {
+                if (find_max) {
+                    p = header.right_most_pointer orelse return error.InvalidTableCell;
+                } else if (header.cell_count == 0) {
+                    p = header.right_most_pointer orelse return error.InvalidTableCell;
+                } else {
+                    const cell = try header.cell(ref, 0);
+                    if (cell.len < 5) return error.InvalidTableCell;
+                    p = readU32(cell[0..4]);
+                }
+            },
+            else => return error.UnsupportedTableBTree,
+        }
+    }
+}
+
 fn findRowInPage(reader: page.PageReader, page_number: u32, wanted_rowid: i64, allocator: std.mem.Allocator) TableError!?Row {
     const ref = try reader.page(page_number);
     const header = try btree.PageHeader.parse(ref);
@@ -547,6 +580,45 @@ test "rowidExists checks leaf keys without decoding payload" {
     try std.testing.expect(try rowidExists(reader, 1, 3));
     try std.testing.expect(try rowidExists(reader, 1, 9));
     try std.testing.expect(!(try rowidExists(reader, 1, 4)));
+}
+
+test "extremalRowid returns null for empty leaf root" {
+    var bytes = [_]u8{0} ** 4096;
+    initTestHeader(bytes[0..], 4096, 1);
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.table_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 0;
+    writeU16Test(bytes[page_base + 5 ..][0..2], 0);
+
+    const reader = try page.PageReader.init(&bytes);
+    try std.testing.expectEqual(@as(?i64, null), try extremalRowid(reader, 1, false));
+    try std.testing.expectEqual(@as(?i64, null), try extremalRowid(reader, 1, true));
+}
+
+test "extremalRowid returns first and last rowid from leaf root" {
+    var bytes = [_]u8{0} ** 4096;
+    initTestHeader(bytes[0..], 4096, 1);
+
+    const page_base = 100;
+    bytes[page_base + 0] = @intFromEnum(btree.PageType.table_leaf);
+    bytes[page_base + 3] = 0;
+    bytes[page_base + 4] = 2;
+
+    const cell_1 = [_]u8{ 5, 3, 3, 1, 1, 10, 20 };
+    const cell_2 = [_]u8{ 5, 9, 3, 1, 1, 30, 40 };
+    const cell_2_off = 4096 - cell_2.len;
+    const cell_1_off = cell_2_off - cell_1.len;
+    writeU16Test(bytes[page_base + 5 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 8 ..][0..2], @intCast(cell_1_off));
+    writeU16Test(bytes[page_base + 10 ..][0..2], @intCast(cell_2_off));
+    @memcpy(bytes[cell_1_off..][0..cell_1.len], &cell_1);
+    @memcpy(bytes[cell_2_off..][0..cell_2.len], &cell_2);
+
+    const reader = try page.PageReader.init(&bytes);
+    try std.testing.expectEqual(@as(?i64, 3), try extremalRowid(reader, 1, false));
+    try std.testing.expectEqual(@as(?i64, 9), try extremalRowid(reader, 1, true));
 }
 
 test "count btree entries handles index leaf pages" {

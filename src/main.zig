@@ -431,28 +431,29 @@ fn inspectDatabase(init: std.process.Init, writer: *std.Io.Writer, path: []const
             try printColumns(writer, info.columns);
             try writer.print("\n", .{});
 
-            const tbl = sqlnano.sqlite.scanTable(reader, @intCast(entry.root_page), init.gpa) catch |err| {
+            const row_stats = sqlnano.sqlite.table_mod.countBtreeEntries(reader, @intCast(entry.root_page)) catch |err| {
                 try writer.print("  rows: unavailable ({s})\n", .{@errorName(err)});
                 continue;
             };
-            defer tbl.deinit(init.gpa);
-            try writer.print("  rows: {d}\n", .{tbl.rows.len});
-            const preview_count = @min(tbl.rows.len, 5);
-            for (tbl.rows[0..preview_count]) |row| {
-                const projected = try sqlnano.sqlite.projectRow(info, row, init.gpa);
-                defer projected.deinit(init.gpa);
-                try writer.print("  row {d}: ", .{row.rowid});
-                try printNamedValues(writer, projected.values);
-                try writer.print("\n", .{});
+            try writer.print("  rows: {d}\n", .{row_stats.entries});
+            const preview_count: usize = @intCast(@min(row_stats.entries, 5));
+            if (preview_count != 0) {
+                var preview_ctx = InspectPreviewCtx{
+                    .writer = writer,
+                    .info = info,
+                    .allocator = init.gpa,
+                    .limit = preview_count,
+                };
+                try sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &preview_ctx, InspectPreviewCtx.onRow);
             }
-            if (tbl.rows.len > preview_count) try writer.print("  ... {d} more rows\n", .{tbl.rows.len - preview_count});
+            const preview_count_u64: u64 = @intCast(preview_count);
+            if (row_stats.entries > preview_count_u64) try writer.print("  ... {d} more rows\n", .{row_stats.entries - preview_count_u64});
         } else if (entry.isIndex() and entry.root_page > 0) {
-            const idx = sqlnano.sqlite.scanIndex(reader, @intCast(entry.root_page), init.gpa) catch |err| {
+            const idx_stats = sqlnano.sqlite.table_mod.countBtreeEntries(reader, @intCast(entry.root_page)) catch |err| {
                 try writer.print("  index_entries: unavailable ({s})\n", .{@errorName(err)});
                 continue;
             };
-            defer idx.deinit(init.gpa);
-            try writer.print("  index_entries: {d}\n", .{idx.entries.len});
+            try writer.print("  index_entries: {d}\n", .{idx_stats.entries});
         }
     }
 }
@@ -469,21 +470,67 @@ fn selectTable(init: std.process.Init, writer: *std.Io.Writer, path: []const u8,
     const entry = schema.findTable(table_name) orelse return error.TableNotFound;
     var info = try sqlnano.sqlite.tableInfo(entry, init.gpa);
     defer info.deinit(init.gpa);
-    const tbl = try sqlnano.sqlite.scanTable(reader, @intCast(entry.root_page), init.gpa);
-    defer tbl.deinit(init.gpa);
+    const row_stats = try sqlnano.sqlite.table_mod.countBtreeEntries(reader, info.root_page);
 
     try writer.print("table: {s}\n", .{entry.name});
     try writer.print("columns: ", .{});
     try printColumns(writer, info.columns);
     try writer.print("\n", .{});
-    try writer.print("rows: {d}\n", .{tbl.rows.len});
-    for (tbl.rows) |row| {
-        const projected = try sqlnano.sqlite.projectRow(info, row, init.gpa);
-        defer projected.deinit(init.gpa);
-        try writer.print("{d}: ", .{row.rowid});
-        try printNamedValues(writer, projected.values);
-        try writer.print("\n", .{});
+    try writer.print("rows: {d}\n", .{row_stats.entries});
+    var ctx = SelectTableCtx{
+        .writer = writer,
+        .info = info,
+        .allocator = init.gpa,
+    };
+    try sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &ctx, SelectTableCtx.onRow);
+}
+
+const InspectPreviewCtx = struct {
+    writer: *std.Io.Writer,
+    info: sqlnano.sqlite.TableInfo,
+    allocator: std.mem.Allocator,
+    limit: usize,
+    emitted: usize = 0,
+    stop_after: bool = false,
+
+    fn onRow(ctx: *@This(), rowid: i64, values: []const sqlnano.sqlite.Value) !void {
+        if (ctx.emitted >= ctx.limit) {
+            ctx.stop_after = true;
+            return;
+        }
+        try printProjectedRow(ctx.writer, ctx.info, rowid, values, ctx.allocator, "  row ");
+        ctx.emitted += 1;
+        if (ctx.emitted >= ctx.limit) ctx.stop_after = true;
     }
+};
+
+const SelectTableCtx = struct {
+    writer: *std.Io.Writer,
+    info: sqlnano.sqlite.TableInfo,
+    allocator: std.mem.Allocator,
+
+    fn onRow(ctx: *@This(), rowid: i64, values: []const sqlnano.sqlite.Value) !void {
+        try printProjectedRow(ctx.writer, ctx.info, rowid, values, ctx.allocator, "");
+    }
+};
+
+fn printProjectedRow(
+    writer: *std.Io.Writer,
+    info: sqlnano.sqlite.TableInfo,
+    rowid: i64,
+    values: []const sqlnano.sqlite.Value,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) !void {
+    const row = struct {
+        rowid: i64,
+        values: []const sqlnano.sqlite.Value,
+    }{ .rowid = rowid, .values = values };
+    const projected = try sqlnano.sqlite.projectRow(info, row, allocator);
+    defer projected.deinit(allocator);
+    try writer.print("{s}{d}: ", .{ prefix, rowid });
+    try printNamedValues(writer, projected.values);
+    try writer.print("\n", .{});
 }
 
 fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, query: []const u8) !void {
@@ -496,6 +543,7 @@ fn selectSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, q
     defer schema.deinit(init.gpa);
     if (try selectSqlFts5(init, writer, path, reader, schema, query)) return;
     if (try selectSqlCountStar(init, writer, reader, schema, query)) return;
+    if (try selectSqlStreamingSimple(init, writer, reader, schema, query)) return;
     const result = try sqlnano.sqlite.executeSelect(reader, schema, query, init.gpa);
     defer result.deinit(init.gpa);
 
@@ -542,6 +590,174 @@ fn selectSqlCountStar(
     try writer.print("rows: 1\n", .{});
     try writer.print("-: [{s}={d}]\n", .{ label, n });
     return true;
+}
+
+fn selectSqlStreamingSimple(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    reader: sqlnano.sqlite.PageReader,
+    schema: sqlnano.sqlite.Schema,
+    query: []const u8,
+) !bool {
+    const stmt = sqlnano.sqlite.parseSelect(query, init.gpa) catch |err| switch (err) {
+        error.UnsupportedSql => return false,
+        else => return err,
+    };
+    defer stmt.deinit(init.gpa);
+
+    if (stmt.where_expr != null or stmt.joins.len != 0) return false;
+    if (!streamingProjectionsSupported(stmt)) return false;
+
+    const entry = schema.findTable(stmt.table_name) orelse return error.TableNotFound;
+    var info = try sqlnano.sqlite.tableInfo(entry, init.gpa);
+    defer info.deinit(init.gpa);
+
+    if (stmt.order_by) |ob| {
+        if (!isNaturalRowidAscOrderLocal(ob, info, stmt.table_name, stmt.table_alias)) return false;
+    }
+    if (!streamingProjectionColumnsExist(stmt, info)) return false;
+
+    const stats = try sqlnano.sqlite.table_mod.countBtreeEntries(reader, info.root_page);
+    const limit_rows: u64 = if (stmt.limit) |lim|
+        if (lim <= 0) 0 else @intCast(lim)
+    else
+        std.math.maxInt(u64);
+    const rows_to_emit = @min(stats.entries, limit_rows);
+
+    try writer.print("table: {s}\n", .{entry.name});
+    try writer.writeAll("columns: [");
+    try printStreamingProjectionColumns(writer, stmt, info);
+    try writer.writeAll("]\n");
+    try writer.print("rows: {d}\n", .{rows_to_emit});
+
+    if (rows_to_emit == 0) return true;
+    var ctx = SelectSqlStreamCtx{
+        .writer = writer,
+        .stmt = stmt,
+        .info = info,
+        .limit = rows_to_emit,
+    };
+    try sqlnano.sqlite.table_mod.scanTableForEachAlloc(reader, info.root_page, init.gpa, &ctx, SelectSqlStreamCtx.onRow);
+    return true;
+}
+
+const SelectSqlStreamCtx = struct {
+    writer: *std.Io.Writer,
+    stmt: sqlnano.sqlite.SelectStatement,
+    info: sqlnano.sqlite.TableInfo,
+    limit: u64,
+    emitted: u64 = 0,
+    stop_after: bool = false,
+
+    fn onRow(ctx: *@This(), rowid: i64, values: []const sqlnano.sqlite.Value) !void {
+        if (ctx.emitted >= ctx.limit) {
+            ctx.stop_after = true;
+            return;
+        }
+        try ctx.writer.print("{d}: ", .{rowid});
+        try printStreamingProjectionValues(ctx.writer, ctx.stmt, ctx.info, rowid, values);
+        try ctx.writer.writeAll("\n");
+        ctx.emitted += 1;
+        if (ctx.emitted >= ctx.limit) ctx.stop_after = true;
+    }
+};
+
+fn streamingProjectionsSupported(stmt: sqlnano.sqlite.SelectStatement) bool {
+    for (stmt.projections) |projection| switch (projection) {
+        .star, .table_star, .column => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn streamingProjectionColumnsExist(stmt: sqlnano.sqlite.SelectStatement, info: sqlnano.sqlite.TableInfo) bool {
+    for (stmt.projections) |projection| switch (projection) {
+        .star => {},
+        .table_star => |qualifier| {
+            if (!streamingQualifierMatches(qualifier, stmt.table_name, stmt.table_alias)) return false;
+        },
+        .column => |col| {
+            if (col.ref.qualifier) |q| {
+                if (!streamingQualifierMatches(q, stmt.table_name, stmt.table_alias)) return false;
+            }
+            if (!std.ascii.eqlIgnoreCase(col.ref.name, "rowid") and columnIndex(info, col.ref.name) == null) return false;
+        },
+        else => return false,
+    };
+    return true;
+}
+
+fn streamingQualifierMatches(qualifier: []const u8, table_name: []const u8, table_alias: ?[]const u8) bool {
+    if (table_alias) |alias| {
+        if (std.ascii.eqlIgnoreCase(qualifier, alias)) return true;
+    }
+    return std.ascii.eqlIgnoreCase(qualifier, table_name);
+}
+
+fn printStreamingProjectionColumns(
+    writer: *std.Io.Writer,
+    stmt: sqlnano.sqlite.SelectStatement,
+    info: sqlnano.sqlite.TableInfo,
+) !void {
+    var first = true;
+    for (stmt.projections) |projection| switch (projection) {
+        .star, .table_star => {
+            for (info.columns) |column| {
+                if (!first) try writer.writeAll(", ");
+                first = false;
+                try writer.print("{s}", .{column.name});
+            }
+        },
+        .column => |col| {
+            if (!first) try writer.writeAll(", ");
+            first = false;
+            try writer.print("{s}", .{col.alias orelse col.ref.name});
+        },
+        else => unreachable,
+    };
+}
+
+fn printStreamingProjectionValues(
+    writer: *std.Io.Writer,
+    stmt: sqlnano.sqlite.SelectStatement,
+    info: sqlnano.sqlite.TableInfo,
+    rowid: i64,
+    values: []const sqlnano.sqlite.Value,
+) !void {
+    var first = true;
+    try writer.writeAll("[");
+    for (stmt.projections) |projection| switch (projection) {
+        .star, .table_star => {
+            for (info.columns, 0..) |column, i| {
+                if (!first) try writer.writeAll(", ");
+                first = false;
+                try writer.print("{s}=", .{column.name});
+                try printValue(writer, valueAtColumn(info, i, rowid, values));
+            }
+        },
+        .column => |col| {
+            if (!first) try writer.writeAll(", ");
+            first = false;
+            const name = col.alias orelse col.ref.name;
+            try writer.print("{s}=", .{name});
+            if (std.ascii.eqlIgnoreCase(col.ref.name, "rowid")) {
+                try printValue(writer, .{ .integer = rowid });
+            } else {
+                const idx = columnIndex(info, col.ref.name).?;
+                try printValue(writer, valueAtColumn(info, idx, rowid, values));
+            }
+        },
+        else => unreachable,
+    };
+    try writer.writeAll("]");
+}
+
+fn valueAtColumn(info: sqlnano.sqlite.TableInfo, index: usize, rowid: i64, values: []const sqlnano.sqlite.Value) sqlnano.sqlite.Value {
+    var value: sqlnano.sqlite.Value = if (index < values.len) values[index] else .null;
+    if (info.integer_primary_key_index) |ipk| {
+        if (index == ipk and value == .null) value = .{ .integer = rowid };
+    }
+    return value;
 }
 
 fn ftsMatch(

@@ -502,7 +502,7 @@ pub const Connection = struct {
     /// to a full scan only on a cache miss.
     fn resolveRowidShared(
         self: *Connection,
-        scratch: Allocator,
+        _: Allocator,
         reader: page.PageReader,
         _: schema.Schema,
         info: catalog.TableInfo,
@@ -521,8 +521,8 @@ pub const Connection = struct {
         };
 
         if (!is_auto) {
-            // Explicit rowid — cache can't help; defer to the scan-based
-            // resolver, which also checks for duplicates.
+            // Explicit rowid — cache can't help; defer to the resolver,
+            // which checks duplicates with a b-tree point lookup.
             const rid = try resolveInsertRowid(self.gpa, &self.image, table_name, values);
             return .{ .rowid = rid, .is_auto = false };
         }
@@ -531,26 +531,22 @@ pub const Connection = struct {
             return .{ .rowid = cached, .is_auto = true };
         }
 
-        // Cold path: one scan to find the current max rowid, then cache.
-        const scanned = try table.scanTable(reader, info.root_page, scratch);
-        var max: i64 = 0;
-        for (scanned.rows) |row| max = @max(max, row.rowid);
+        // Cold path: walk the right edge to find the current max rowid,
+        // then cache. No row payloads are decoded or retained.
+        const max = (try table.extremalRowid(reader, info.root_page, true)) orelse 0;
         return .{ .rowid = max + 1, .is_auto = true };
     }
 
     /// True iff `rowid` is strictly greater than every rowid currently
     /// in `info.root_page`'s tree — i.e. the append-only fast paths
-    /// are safe. Reuses the rowid cache when populated (O(1)); only
-    /// scans the table on a cache miss. Called only for explicit
-    /// rowids, which are rare in practice.
+    /// are safe. Reuses the rowid cache when populated (O(1)), or
+    /// walks the right b-tree edge on a cache miss.
     fn explicitRowidExtendsTable(self: *Connection, reader: page.PageReader, info: catalog.TableInfo, rowid: i64) bool {
-        _ = reader;
         if (self.next_rowid_cache.get(info.name)) |cached| {
             return rowid >= cached;
         }
-        // Conservative: no cache yet → fall through to the slow path,
-        // which doesn't care about ordering.
-        return false;
+        const max = table.extremalRowid(reader, info.root_page, true) catch return false;
+        return if (max) |m| rowid > m else true;
     }
 
     fn bumpRowidCache(self: *Connection, table_name: []const u8, last_rowid: i64) !void {
@@ -1979,26 +1975,23 @@ fn resolveInsertRowid(gpa: Allocator, image: *MappedFile, table_name: []const u8
     if (values.len != info.columns.len) return error.ColumnCountMismatch;
     if (info.root_page == 1) return error.UnsupportedInsert;
 
-    const scanned = try table.scanTable(reader, info.root_page, gpa);
-    defer scanned.deinit(gpa);
-
     var rowid: i64 = 1;
     if (info.integer_primary_key_index) |ipk| {
         switch (values[ipk]) {
             .integer => |explicit| {
                 if (explicit <= 0) return error.UnsupportedRowid;
                 rowid = explicit;
-                for (scanned.rows) |row| {
-                    if (row.rowid == rowid) return error.DuplicateRowid;
-                }
+                if (try table.rowidExists(reader, info.root_page, rowid)) return error.DuplicateRowid;
             },
             .null => {
-                for (scanned.rows) |row| rowid = @max(rowid, row.rowid + 1);
+                const max = (try table.extremalRowid(reader, info.root_page, true)) orelse 0;
+                rowid = max + 1;
             },
             else => return error.UnsupportedRowid,
         }
     } else {
-        for (scanned.rows) |row| rowid = @max(rowid, row.rowid + 1);
+        const max = (try table.extremalRowid(reader, info.root_page, true)) orelse 0;
+        rowid = max + 1;
     }
     return rowid;
 }
@@ -2430,7 +2423,7 @@ fn dropLeafCell(
     if (tail_start < tail_end) {
         std.mem.copyForwards(
             u8,
-            bytes[ptr_off..tail_end - 2],
+            bytes[ptr_off .. tail_end - 2],
             bytes[tail_start..tail_end],
         );
     }
@@ -3866,7 +3859,6 @@ fn parseInlineVarint(buf: []const u8, pos: *usize) ?u64 {
     pos.* += 9;
     return v;
 }
-
 
 test "encode record for insert" {
     const entry = schema.SchemaEntry{
