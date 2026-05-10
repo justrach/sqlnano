@@ -164,6 +164,28 @@ pub fn countEntriesForFirstColumnEquals(
     return try countEntriesForFirstColumnEqualsPage(reader, root_page, value, allocator);
 }
 
+/// Count index entries whose first indexed column falls inside a range.
+/// Reuses the generic range walker but avoids materialising a rowid list.
+pub fn countEntriesForFirstColumnRange(
+    reader: page.PageReader,
+    root_page: u32,
+    low: IndexBound,
+    high: IndexBound,
+    allocator: std.mem.Allocator,
+) IndexError!u64 {
+    const Counter = struct {
+        count: u64 = 0,
+
+        fn tick(self: *@This(), _: IndexEntryView) IndexError!void {
+            self.count = try addCount(self.count, 1);
+        }
+    };
+
+    var counter: Counter = .{};
+    try walkIndexFirstColumnRange(reader, root_page, .{ .low = low, .high = high }, allocator, &counter, Counter.tick);
+    return counter.count;
+}
+
 /// Walk an index in ascending or descending first-column order over a
 /// range `[low, high]`, invoking `onMatch` per matching entry. The
 /// callback's `entry.values` and `entry.first_value` borrow from the
@@ -1079,6 +1101,45 @@ test "countEntriesForFirstColumnEquals returns matching leaf count without alloc
     try std.testing.expectEqual(
         @as(u64, 0),
         try countEntriesForFirstColumnEquals(reader, 1, .{ .text = "carol" }, allocator),
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+}
+
+test "countEntriesForFirstColumnRange returns matching leaf count without rowid allocation" {
+    var bytes = [_]u8{0} ** 4096;
+    initIndexTestHeader(bytes[0..], 4096, 1);
+
+    const cells = [_][]const u8{
+        &.{ 5, 3, 1, 1, 5, 5 },
+        &.{ 5, 3, 1, 1, 7, 7 },
+        &.{ 5, 3, 1, 1, 8, 8 },
+        &.{ 5, 3, 1, 1, 9, 9 },
+    };
+    writeIndexLeafPageTest(bytes[0..], 0, 100, 4096, &cells);
+
+    const reader = try page.PageReader.init(&bytes);
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing_allocator.allocator();
+
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        try countEntriesForFirstColumnRange(
+            reader,
+            1,
+            .{ .inclusive = .{ .integer = 7 } },
+            .{ .inclusive = .{ .integer = 8 } },
+            allocator,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        try countEntriesForFirstColumnRange(
+            reader,
+            1,
+            .{ .exclusive = .{ .integer = 7 } },
+            .{ .exclusive = .{ .integer = 9 } },
+            allocator,
+        ),
     );
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }

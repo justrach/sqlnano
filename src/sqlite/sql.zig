@@ -182,11 +182,11 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         return try buildPureCountResult(allocator, primary_info, primary_entry, db_schema, reader, stmt.projections[0]);
     }
 
-    // --- Filtered COUNT(*) shortcut for point/index equality.
+    // --- Filtered COUNT(*) shortcut for indexed predicates.
     // The general indexed fast path hydrates table rows after getting
     // rowids, which is useful for SELECT * but wasted for COUNT(*).
     // Count directly from the table key/index hit count when the
-    // predicate shape is exact and single-table.
+    // predicate shape is indexable and single-table.
     if (stmt.joins.len == 0 and
         stmt.projections.len == 1 and
         stmt.projections[0] == .count_star and
@@ -199,6 +199,16 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         }
         if (asIndexableEq(where_expr)) |ieq| {
             if (try indexedCountForColumn(reader, db_schema, primary_info, ieq.column_name, ieq.value, ascratch)) |n| {
+                return try buildCountResult(allocator, primary_info, stmt.projections[0], n);
+            }
+        }
+        if (asIndexableRange(where_expr)) |range_pred| {
+            if (try indexedCountForRange(reader, db_schema, primary_info, range_pred, ascratch)) |n| {
+                return try buildCountResult(allocator, primary_info, stmt.projections[0], n);
+            }
+        }
+        if (try asIndexableIn(where_expr, ascratch)) |in_pred| {
+            if (try indexedCountForIn(reader, db_schema, primary_info, in_pred, ascratch)) |n| {
                 return try buildCountResult(allocator, primary_info, stmt.projections[0], n);
             }
         }
@@ -2754,6 +2764,49 @@ pub fn indexedCountForColumn(
     return try index_mod.countEntriesForFirstColumnEquals(reader, @intCast(index_entry.root_page), lookup, allocator);
 }
 
+pub fn indexedCountForRange(
+    reader: page.PageReader,
+    db_schema: schema.Schema,
+    info: catalog.TableInfo,
+    range: IndexableRange,
+    allocator: std.mem.Allocator,
+) SqlError!?u64 {
+    if (asciiEql(range.column_name, "rowid")) return null;
+    const index_entry = findIndexForColumn(db_schema, info, range.column_name) orelse return null;
+    return try index_mod.countEntriesForFirstColumnRange(
+        reader,
+        @intCast(index_entry.root_page),
+        range.low,
+        range.high,
+        allocator,
+    );
+}
+
+pub fn indexedCountForIn(
+    reader: page.PageReader,
+    db_schema: schema.Schema,
+    info: catalog.TableInfo,
+    in_pred: IndexableIn,
+    allocator: std.mem.Allocator,
+) SqlError!?u64 {
+    if (asciiEql(in_pred.column_name, "rowid")) return null;
+    const index_entry = findIndexForColumn(db_schema, info, in_pred.column_name) orelse return null;
+    var total: u64 = 0;
+    for (in_pred.items, 0..) |lit, i| {
+        var seen = false;
+        for (in_pred.items[0..i]) |prev| {
+            if (literalEql(prev, lit)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        const n = try index_mod.countEntriesForFirstColumnEquals(reader, @intCast(index_entry.root_page), literalToLookup(lit), allocator);
+        total = std.math.add(u64, total, n) catch return error.Overflow;
+    }
+    return total;
+}
+
 fn findIndexForColumn(db_schema: schema.Schema, info: catalog.TableInfo, column_name: []const u8) ?schema.SchemaEntry {
     for (db_schema.entries) |entry| {
         if (!entry.isIndex() or entry.root_page <= 0) continue;
@@ -2982,6 +3035,20 @@ fn literalMatches(value: record.Value, literal: Literal) bool {
     };
 }
 
+fn literalEql(a: Literal, b: Literal) bool {
+    return switch (a) {
+        .null => b == .null,
+        .integer => |ai| switch (b) {
+            .integer => |bi| ai == bi,
+            else => false,
+        },
+        .text => |at| switch (b) {
+            .text => |bt| std.mem.eql(u8, at, bt),
+            else => false,
+        },
+    };
+}
+
 fn mapParseError(err: parser_mod.ParseError) SqlError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -3120,6 +3187,41 @@ test "covering index scan slab frees duplicated text payloads" {
     try testing.expect(!result.rows[0].values_owned);
     try testing.expectEqualStrings("Alice", result.rows[0].values[0].value.text);
     try testing.expectEqualStrings("Alice", result.rows[1].values[0].value.text);
+}
+
+test "filtered count uses indexed range and in-list counts" {
+    try skipIfNoSqlite();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmpDbPath(testing.allocator, tmp, "count-indexed.db");
+    defer testing.allocator.free(db_path);
+
+    try buildSqliteFixture(db_path,
+        \\CREATE TABLE t(id INTEGER PRIMARY KEY, year INTEGER, name TEXT);
+        \\CREATE INDEX idx_t_year ON t(year);
+        \\INSERT INTO t(id, year, name) VALUES
+        \\  (1, 2019, 'a'),
+        \\  (2, 2020, 'b'),
+        \\  (3, 2021, 'c'),
+        \\  (4, 2021, 'd'),
+        \\  (5, 2022, 'e'),
+        \\  (6, 2023, 'f');
+    );
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, db_path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    const reader = try page.PageReader.init(bytes);
+    const db_schema = try schema.readSchema(reader, testing.allocator);
+    defer db_schema.deinit(testing.allocator);
+
+    const range_result = try executeSelect(reader, db_schema, "SELECT COUNT(*) FROM t WHERE year BETWEEN 2020 AND 2022", testing.allocator);
+    defer range_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 4), range_result.rows[0].values[0].value.integer);
+
+    const in_result = try executeSelect(reader, db_schema, "SELECT COUNT(*) FROM t WHERE year IN (2020, 2021, 2021, 2024)", testing.allocator);
+    defer in_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 3), in_result.rows[0].values[0].value.integer);
 }
 
 test "findIndexForColumn skips partial indexes" {
