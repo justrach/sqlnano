@@ -206,7 +206,7 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
     };
 
     // --- Fast path: single-table, WHERE is either `rowid = N` or an
-    // indexed-column equality. ---
+    // indexed-column equality / range / IN-list. ---
     if (!has_non_count_agg and sources.items.len == 1 and stmt.where_expr != null) {
         const natural_rowid_order = if (stmt.order_by) |ob| isNaturalRowidAscOrder(ob, sources.items[0]) else false;
         if (asSimpleRowidEq(stmt.where_expr.?)) |rid| {
@@ -225,6 +225,89 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
                     try indexedRowidsForColumn(reader, db_schema, primary_info, ieq.column_name, ieq.value, ascratch);
                 if (rowids) |rids| {
                     return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
+                }
+            }
+            // Range predicates (BETWEEN, <, <=, >, >=, AND-ed comparisons)
+            // walk the indexed b-tree directly instead of full-scanning the
+            // table. Returned rowids feed the same hydration path as the
+            // equality fast path.
+            if (asIndexableRange(stmt.where_expr.?)) |range_pred| {
+                if (!asciiEql(range_pred.column_name, "rowid")) {
+                    const limit_hint: ?usize = if (stmt.limit) |l|
+                        (if (l > 0 and l < 1_000_000) @as(usize, @intCast(l)) else null)
+                    else
+                        null;
+                    if (try indexedRowidsForRange(reader, db_schema, primary_info, range_pred, limit_hint, ascratch)) |rids| {
+                        return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
+                    }
+                }
+            }
+            // `col IN (lit, lit, ...)` becomes N equality probes into the
+            // index — much cheaper than a full table scan even for short
+            // lists since each probe is O(log n) page reads.
+            if (try asIndexableIn(stmt.where_expr.?, ascratch)) |in_pred| {
+                const limit_hint: ?usize = if (stmt.limit) |l|
+                    (if (l > 0 and l < 1_000_000) @as(usize, @intCast(l)) else null)
+                else
+                    null;
+                if (try indexedRowidsForIn(reader, db_schema, primary_info, in_pred, limit_hint, ascratch)) |rids| {
+                    return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
+                }
+            }
+        }
+    }
+
+    // --- Covering index scan: when projections are limited to the
+    // indexed first column and/or rowid, the index entry already has
+    // every value the caller needs. Walk the index directly and emit
+    // rows without any table-side b-tree probes. Saves the per-rowid
+    // hydration cost the equality/range/IN paths above pay.
+    if (!has_non_count_agg and sources.items.len == 1) {
+        if (try tryCoveringIndexScan(reader, db_schema, primary_info, stmt, sources.items, allocator, ascratch)) |result| {
+            return result;
+        }
+    }
+
+    // --- Indexed ORDER BY [DESC] LIMIT N: walk the index in order to
+    // collect at most N rowids, hydrate, project. Avoids materialising
+    // every row + a sort. Optionally accepts a range WHERE on the same
+    // indexed column. ---
+    if (!has_non_count_agg and
+        sources.items.len == 1 and
+        stmt.order_by != null and
+        stmt.limit != null and
+        stmt.limit.? > 0 and stmt.limit.? < 1_000_000)
+    {
+        const ob = stmt.order_by.?;
+        if (ob.column.qualifier == null or sources.items[0].matches(ob.column.qualifier.?)) {
+            if (!asciiEql(ob.column.name, "rowid")) {
+                if (findIndexForColumn(db_schema, primary_info, ob.column.name)) |index_entry| {
+                    var range_opts: IndexableRange = .{
+                        .column_name = ob.column.name,
+                        .low = .none,
+                        .high = .none,
+                    };
+                    var range_ok = true;
+                    if (stmt.where_expr) |w| {
+                        if (asIndexableRange(w)) |r| {
+                            if (asciiEql(r.column_name, ob.column.name)) {
+                                range_opts = r;
+                            } else range_ok = false;
+                        } else range_ok = false;
+                    }
+                    if (range_ok) {
+                        const limit_n: usize = @intCast(stmt.limit.?);
+                        const rids = try collectIndexOrderedRowids(
+                            reader,
+                            @intCast(index_entry.root_page),
+                            range_opts.low,
+                            range_opts.high,
+                            ob.descending,
+                            limit_n,
+                            ascratch,
+                        );
+                        return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
+                    }
                 }
             }
         }
@@ -1919,6 +2002,464 @@ fn asSimpleRowidEq(expr: *ast.Expr) ?i64 {
         .integer => |v| v,
         else => null,
     };
+}
+
+/// Recognise `col <op> literal` (or its mirror) where `op` is one of
+/// `=`, `<`, `<=`, `>`, `>=`. Returns the column name, op, and literal.
+fn asColumnLiteralCmp(expr: *ast.Expr) ?struct {
+    column_name: []const u8,
+    op: ast.BinOp,
+    value: Literal,
+} {
+    if (expr.* != .binary) return null;
+    const b = expr.binary;
+    const op = switch (b.op) {
+        .eq, .lt, .le, .gt, .ge => b.op,
+        else => return null,
+    };
+    if (b.lhs.* == .column and b.rhs.* == .literal) {
+        if (b.lhs.column.qualifier != null) return null;
+        return .{ .column_name = b.lhs.column.name, .op = op, .value = b.rhs.literal };
+    }
+    if (b.lhs.* == .literal and b.rhs.* == .column) {
+        if (b.rhs.column.qualifier != null) return null;
+        const flipped: ast.BinOp = switch (op) {
+            .eq => .eq,
+            .lt => .gt,
+            .le => .ge,
+            .gt => .lt,
+            .ge => .le,
+            else => unreachable,
+        };
+        return .{ .column_name = b.rhs.column.name, .op = flipped, .value = b.lhs.literal };
+    }
+    return null;
+}
+
+fn literalToLookup(lit: Literal) index_mod.LookupValue {
+    return switch (lit) {
+        .null => .null,
+        .integer => |v| .{ .integer = v },
+        .text => |v| .{ .text = v },
+    };
+}
+
+const IndexableRange = struct {
+    column_name: []const u8,
+    low: index_mod.IndexBound,
+    high: index_mod.IndexBound,
+};
+
+/// Recognise predicates of the form `col [op] lit`, `col BETWEEN a AND
+/// b`, or two such comparisons AND-ed together (`col >= a AND col < b`).
+/// Returns the column and the resulting low/high bounds, or null if
+/// the shape doesn't fit.
+fn asIndexableRange(expr: *ast.Expr) ?IndexableRange {
+    if (expr.* == .between) {
+        const bt = expr.between;
+        if (bt.negated) return null;
+        if (bt.value.* != .column or bt.value.column.qualifier != null) return null;
+        if (bt.low.* != .literal or bt.high.* != .literal) return null;
+        return .{
+            .column_name = bt.value.column.name,
+            .low = .{ .inclusive = literalToLookup(bt.low.literal) },
+            .high = .{ .inclusive = literalToLookup(bt.high.literal) },
+        };
+    }
+
+    if (asColumnLiteralCmp(expr)) |c| {
+        const lookup = literalToLookup(c.value);
+        return switch (c.op) {
+            .eq => .{ .column_name = c.column_name, .low = .{ .inclusive = lookup }, .high = .{ .inclusive = lookup } },
+            .lt => .{ .column_name = c.column_name, .low = .none, .high = .{ .exclusive = lookup } },
+            .le => .{ .column_name = c.column_name, .low = .none, .high = .{ .inclusive = lookup } },
+            .gt => .{ .column_name = c.column_name, .low = .{ .exclusive = lookup }, .high = .none },
+            .ge => .{ .column_name = c.column_name, .low = .{ .inclusive = lookup }, .high = .none },
+            else => null,
+        };
+    }
+
+    if (expr.* == .binary and expr.binary.op == .and_) {
+        const left = asIndexableRange(expr.binary.lhs) orelse return null;
+        const right = asIndexableRange(expr.binary.rhs) orelse return null;
+        if (!asciiEql(left.column_name, right.column_name)) return null;
+        // Take the tighter of each side.
+        const merged_low = mergeLow(left.low, right.low);
+        const merged_high = mergeHigh(left.high, right.high);
+        return .{ .column_name = left.column_name, .low = merged_low, .high = merged_high };
+    }
+
+    return null;
+}
+
+fn boundValue(b: index_mod.IndexBound) ?index_mod.LookupValue {
+    return switch (b) {
+        .none => null,
+        .inclusive, .exclusive => |v| v,
+    };
+}
+
+fn lookupCmp(a: index_mod.LookupValue, b: index_mod.LookupValue) ?std.math.Order {
+    return switch (a) {
+        .integer => |ai| switch (b) {
+            .integer => |bi| std.math.order(ai, bi),
+            else => null,
+        },
+        .text => |at| switch (b) {
+            .text => |bt| std.mem.order(u8, at, bt),
+            else => null,
+        },
+        .null => switch (b) {
+            .null => .eq,
+            else => null,
+        },
+    };
+}
+
+fn mergeLow(a: index_mod.IndexBound, b: index_mod.IndexBound) index_mod.IndexBound {
+    const av = boundValue(a) orelse return b;
+    const bv = boundValue(b) orelse return a;
+    const cmp = lookupCmp(av, bv) orelse return a;
+    if (cmp == .lt) return b;
+    if (cmp == .gt) return a;
+    // Equal values; pick the stricter (exclusive) form.
+    return if (a == .exclusive or b == .exclusive) .{ .exclusive = av } else .{ .inclusive = av };
+}
+
+fn mergeHigh(a: index_mod.IndexBound, b: index_mod.IndexBound) index_mod.IndexBound {
+    const av = boundValue(a) orelse return b;
+    const bv = boundValue(b) orelse return a;
+    const cmp = lookupCmp(av, bv) orelse return a;
+    if (cmp == .gt) return b;
+    if (cmp == .lt) return a;
+    return if (a == .exclusive or b == .exclusive) .{ .exclusive = av } else .{ .inclusive = av };
+}
+
+const IndexableIn = struct {
+    column_name: []const u8,
+    items: []Literal,
+};
+
+/// Recognise `col IN (lit, lit, ...)` (non-negated). Returns the column
+/// and the literal list. The returned slice is allocated in `allocator`.
+fn asIndexableIn(expr: *ast.Expr, allocator: std.mem.Allocator) SqlError!?IndexableIn {
+    if (expr.* != .in_list) return null;
+    const il = expr.in_list;
+    if (il.negated) return null;
+    if (il.value.* != .column or il.value.column.qualifier != null) return null;
+    if (il.items.len == 0) return null;
+    const items = try allocator.alloc(Literal, il.items.len);
+    for (il.items, 0..) |it, i| {
+        if (it.* != .literal) return null;
+        items[i] = it.literal;
+    }
+    return IndexableIn{ .column_name = il.value.column.name, .items = items };
+}
+
+/// Resolve a range predicate to a sorted list of rowids by walking the
+/// index. Returns null when no usable index exists for the column.
+pub fn indexedRowidsForRange(
+    reader: page.PageReader,
+    db_schema: schema.Schema,
+    info: catalog.TableInfo,
+    range: IndexableRange,
+    limit: ?usize,
+    allocator: std.mem.Allocator,
+) SqlError!?[]i64 {
+    if (asciiEql(range.column_name, "rowid")) return null;
+    const index_entry = findIndexForColumn(db_schema, info, range.column_name) orelse return null;
+    return try index_mod.rowidsForFirstColumnRange(
+        reader,
+        @intCast(index_entry.root_page),
+        range.low,
+        range.high,
+        limit,
+        allocator,
+    );
+}
+
+/// Attempt a covering-index scan. Returns null when the query shape
+/// or projection list isn't covered by an available index. When this
+/// path fires we serve the entire result from index entries and never
+/// touch the table b-tree.
+///
+/// The covered shapes are: every projection is either `rowid` (or the
+/// integer primary key column) or the first indexed column; the WHERE
+/// clause is either absent or a range/equality/IN-list over that same
+/// indexed column; the ORDER BY (if any) is on the indexed column or
+/// rowid (rowid order is implicit only when WHERE collapses to a
+/// single value of the indexed column).
+fn tryCoveringIndexScan(
+    reader: page.PageReader,
+    db_schema: schema.Schema,
+    info: catalog.TableInfo,
+    stmt: SelectStatement,
+    sources: []const Source,
+    allocator: std.mem.Allocator,
+    ascratch: std.mem.Allocator,
+) SqlError!?QueryResult {
+    if (stmt.joins.len != 0) return null;
+    if (stmt.projections.len == 0) return null;
+
+    // Pull a candidate indexed column out of WHERE (eq/range/IN) or
+    // ORDER BY. All branches must agree on the same column.
+    var indexed_col: ?[]const u8 = null;
+    var range_pred: ?IndexableRange = null;
+    var in_pred: ?IndexableIn = null;
+
+    if (stmt.where_expr) |w| {
+        if (asIndexableRange(w)) |r| {
+            indexed_col = r.column_name;
+            range_pred = r;
+        } else if (try asIndexableIn(w, ascratch)) |il| {
+            indexed_col = il.column_name;
+            in_pred = il;
+        } else return null;
+    }
+
+    var descending = false;
+    if (stmt.order_by) |ob| {
+        if (ob.column.qualifier != null and !sources[0].matches(ob.column.qualifier.?)) return null;
+        if (asciiEql(ob.column.name, "rowid")) {
+            // ASC rowid only is natural — we'd need to re-sort the
+            // index walk by rowid otherwise. Bail out for non-natural
+            // orderings.
+            if (ob.descending) return null;
+            // Rowid ordering only safe if WHERE is equality on the
+            // indexed col (so all rowids are within one index bucket
+            // and come out in ascending order from the index).
+            if (range_pred) |rp| {
+                if (!isEqualityRange(rp)) return null;
+            } else if (in_pred != null) {
+                return null;
+            }
+        } else {
+            if (indexed_col) |c| {
+                if (!asciiEql(c, ob.column.name)) return null;
+            } else {
+                indexed_col = ob.column.name;
+            }
+            if (in_pred != null) return null; // IN can't satisfy an order-by without a sort.
+            descending = ob.descending;
+        }
+    }
+
+    const col_name = indexed_col orelse return null;
+    if (asciiEql(col_name, "rowid")) return null;
+
+    const index_entry = findIndexForColumn(db_schema, info, col_name) orelse return null;
+    const ipk_col_name: ?[]const u8 = if (info.integer_primary_key_index) |ipk| info.columns[ipk].name else null;
+
+    // Verify every projection is rowid or the indexed column.
+    for (stmt.projections) |p| {
+        switch (p) {
+            .column => |col| {
+                if (col.ref.qualifier != null and !sources[0].matches(col.ref.qualifier.?)) return null;
+                const name = col.ref.name;
+                if (asciiEql(name, "rowid")) continue;
+                if (ipk_col_name) |pk| if (asciiEql(name, pk)) continue;
+                if (asciiEql(name, col_name)) continue;
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    const limit_n: usize = if (stmt.limit) |l|
+        (if (l > 0) @as(usize, @intCast(l)) else return null)
+    else
+        std.math.maxInt(usize);
+
+    const columns = try buildResultColumns(allocator, stmt.projections, sources);
+    errdefer allocator.free(columns);
+
+    var rows: std.ArrayList(ResultRow) = .empty;
+    errdefer {
+        for (rows.items) |r| r.deinit(allocator);
+        rows.deinit(allocator);
+    }
+
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        rows: *std.ArrayList(ResultRow),
+        projections: []const ast.Projection,
+        columns: []const ResultColumn,
+        col_name: []const u8,
+        ipk_col_name: ?[]const u8,
+        limit: usize,
+        emitted: usize,
+        stop_after: bool,
+        oom: bool,
+
+        fn emit(self: *@This(), entry: index_mod.IndexEntryView) index_mod.IndexError!void {
+            if (self.emitted >= self.limit) {
+                self.stop_after = true;
+                return;
+            }
+            const out = self.allocator.alloc(ResultCell, self.projections.len) catch {
+                self.oom = true;
+                self.stop_after = true;
+                return error.OutOfMemory;
+            };
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |c| switch (c.value) {
+                    .text => |t| self.allocator.free(t),
+                    .blob => |b| self.allocator.free(b),
+                    else => {},
+                };
+                self.allocator.free(out);
+            }
+            for (self.projections, 0..) |p, i| {
+                const col = p.column;
+                const name = col.ref.name;
+                const is_rowid = asciiEql(name, "rowid") or (self.ipk_col_name != null and asciiEql(name, self.ipk_col_name.?));
+                const v_src: record.Value = if (is_rowid)
+                    .{ .integer = entry.rowid }
+                else
+                    entry.first_value;
+                const v_owned = dupValue(self.allocator, v_src) catch {
+                    self.oom = true;
+                    self.stop_after = true;
+                    return error.OutOfMemory;
+                };
+                out[i] = .{ .name = self.columns[i].name, .value = v_owned };
+                initialized += 1;
+            }
+            self.rows.append(self.allocator, .{ .rowid = entry.rowid, .values = out }) catch {
+                self.oom = true;
+                self.stop_after = true;
+                return error.OutOfMemory;
+            };
+            self.emitted += 1;
+            if (self.emitted >= self.limit) self.stop_after = true;
+        }
+    };
+
+    var collector: Collector = .{
+        .allocator = allocator,
+        .rows = &rows,
+        .projections = stmt.projections,
+        .columns = columns,
+        .col_name = col_name,
+        .ipk_col_name = ipk_col_name,
+        .limit = limit_n,
+        .emitted = 0,
+        .stop_after = false,
+        .oom = false,
+    };
+
+    const root_page: u32 = @intCast(index_entry.root_page);
+
+    if (in_pred) |ip| {
+        for (ip.items) |lit| {
+            if (collector.stop_after) break;
+            const lookup = literalToLookup(lit);
+            try index_mod.walkIndexFirstColumnRange(
+                reader,
+                root_page,
+                .{ .low = .{ .inclusive = lookup }, .high = .{ .inclusive = lookup } },
+                ascratch,
+                &collector,
+                Collector.emit,
+            );
+        }
+    } else {
+        const low: index_mod.IndexBound = if (range_pred) |rp| rp.low else .none;
+        const high: index_mod.IndexBound = if (range_pred) |rp| rp.high else .none;
+        try index_mod.walkIndexFirstColumnRange(
+            reader,
+            root_page,
+            .{ .low = low, .high = high, .reverse = descending },
+            ascratch,
+            &collector,
+            Collector.emit,
+        );
+    }
+
+    if (collector.oom) return error.OutOfMemory;
+
+    return .{
+        .columns = columns,
+        .table_info = try cloneTableInfo(allocator, info),
+        .rows = try rows.toOwnedSlice(allocator),
+    };
+}
+
+fn isEqualityRange(r: IndexableRange) bool {
+    const lv = boundValue(r.low) orelse return false;
+    const hv = boundValue(r.high) orelse return false;
+    if (r.low != .inclusive or r.high != .inclusive) return false;
+    const cmp = lookupCmp(lv, hv) orelse return false;
+    return cmp == .eq;
+}
+
+/// Walk an index b-tree in ascending or descending first-column order
+/// and collect at most `limit` rowids. Used for indexed
+/// `ORDER BY indexed_col [DESC] LIMIT N` plans.
+pub fn collectIndexOrderedRowids(
+    reader: page.PageReader,
+    root_page: u32,
+    low: index_mod.IndexBound,
+    high: index_mod.IndexBound,
+    descending: bool,
+    limit: usize,
+    allocator: std.mem.Allocator,
+) SqlError![]i64 {
+    const Collector = struct {
+        list: std.ArrayList(i64),
+        allocator: std.mem.Allocator,
+        limit: usize,
+        stop_after: bool,
+
+        fn append(self: *@This(), entry: index_mod.IndexEntryView) index_mod.IndexError!void {
+            try self.list.append(self.allocator, entry.rowid);
+            if (self.list.items.len >= self.limit) self.stop_after = true;
+        }
+    };
+    var collector: Collector = .{
+        .list = .empty,
+        .allocator = allocator,
+        .limit = limit,
+        .stop_after = false,
+    };
+    errdefer collector.list.deinit(allocator);
+    try index_mod.walkIndexFirstColumnRange(
+        reader,
+        root_page,
+        .{ .low = low, .high = high, .reverse = descending },
+        allocator,
+        &collector,
+        Collector.append,
+    );
+    return try collector.list.toOwnedSlice(allocator);
+}
+
+/// Resolve `col IN (...)` to a deduplicated rowid list, in input order.
+pub fn indexedRowidsForIn(
+    reader: page.PageReader,
+    db_schema: schema.Schema,
+    info: catalog.TableInfo,
+    in_pred: IndexableIn,
+    limit: ?usize,
+    allocator: std.mem.Allocator,
+) SqlError!?[]i64 {
+    if (asciiEql(in_pred.column_name, "rowid")) return null;
+    const index_entry = findIndexForColumn(db_schema, info, in_pred.column_name) orelse return null;
+    var out: std.ArrayList(i64) = .empty;
+    errdefer out.deinit(allocator);
+    for (in_pred.items) |lit| {
+        const lookup = literalToLookup(lit);
+        const rids = try index_mod.rowidsForFirstColumnEquals(reader, @intCast(index_entry.root_page), lookup, allocator);
+        defer allocator.free(rids);
+        for (rids) |rid| {
+            try out.append(allocator, rid);
+            if (limit) |lim| if (out.items.len >= lim) {
+                return try out.toOwnedSlice(allocator);
+            };
+        }
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 fn isNaturalRowidAscOrder(order_by: ast.OrderBy, source: Source) bool {

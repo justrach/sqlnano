@@ -59,6 +59,31 @@ pub const LookupValue = union(enum) {
     text: []const u8,
 };
 
+/// One end of a range predicate over the first index column. `none`
+/// means "unbounded on this side"; the other variants pin the bound
+/// to a literal value, optionally including the value itself.
+pub const IndexBound = union(enum) {
+    none,
+    inclusive: LookupValue,
+    exclusive: LookupValue,
+};
+
+pub const RangeOptions = struct {
+    low: IndexBound = .none,
+    high: IndexBound = .none,
+    /// Walk in descending order (`ORDER BY indexed_col DESC`).
+    reverse: bool = false,
+};
+
+/// View of an index entry handed to range walk callbacks. `values`
+/// borrows from the page (or, if the cell spilled to overflow pages,
+/// from a transient allocation that lives until callback return).
+pub const IndexEntryView = struct {
+    rowid: i64,
+    first_value: record.Value,
+    values: []const record.Value,
+};
+
 const IndexCellView = struct {
     values: []const record.Value,
     owned: ?IndexEntry = null,
@@ -139,6 +164,60 @@ pub fn countEntriesForFirstColumnEquals(
     return try countEntriesForFirstColumnEqualsPage(reader, root_page, value, allocator);
 }
 
+/// Walk an index in ascending or descending first-column order over a
+/// range `[low, high]`, invoking `onMatch` per matching entry. The
+/// callback's `entry.values` and `entry.first_value` borrow from the
+/// page (or a per-cell scratch allocation) and become invalid after
+/// the callback returns — clone before stashing.
+///
+/// Set a `stop_after: bool` field on `ctx`'s pointee to short-circuit
+/// the walk after enough rows; matches `scanTableForEach`'s pattern.
+pub fn walkIndexFirstColumnRange(
+    reader: page.PageReader,
+    root_page: u32,
+    opts: RangeOptions,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    comptime onMatch: fn (ctx: @TypeOf(ctx), entry: IndexEntryView) IndexError!void,
+) IndexError!void {
+    try walkIndexRangePage(reader, root_page, opts, allocator, ctx, onMatch);
+}
+
+/// Convenience wrapper: collect rowids from a range walk. Forward order
+/// only; pass `limit` to stop early. `null` returns all matches.
+pub fn rowidsForFirstColumnRange(
+    reader: page.PageReader,
+    root_page: u32,
+    low: IndexBound,
+    high: IndexBound,
+    limit: ?usize,
+    allocator: std.mem.Allocator,
+) IndexError![]i64 {
+    var collector: RowidCollector = .{
+        .allocator = allocator,
+        .rowids = .empty,
+        .limit = limit,
+        .stop_after = false,
+    };
+    errdefer collector.rowids.deinit(allocator);
+    try walkIndexFirstColumnRange(reader, root_page, .{ .low = low, .high = high }, allocator, &collector, RowidCollector.append);
+    return try collector.rowids.toOwnedSlice(allocator);
+}
+
+const RowidCollector = struct {
+    allocator: std.mem.Allocator,
+    rowids: std.ArrayList(i64),
+    limit: ?usize,
+    stop_after: bool,
+
+    fn append(self: *RowidCollector, entry: IndexEntryView) IndexError!void {
+        try self.rowids.append(self.allocator, entry.rowid);
+        if (self.limit) |lim| if (self.rowids.items.len >= lim) {
+            self.stop_after = true;
+        };
+    }
+};
+
 /// Return the first non-NULL first-column value from the left or right
 /// edge of an index b-tree. This is the direct b-tree-reader version
 /// of SQLite's MIN/MAX index-edge shortcut.
@@ -178,6 +257,192 @@ fn scanIndexPage(reader: page.PageReader, page_number: u32, allocator: std.mem.A
         const entry = try parseIndexCellWithReader(reader, cell, allocator);
         errdefer entry.deinit(allocator);
         try entries.append(allocator, entry);
+    }
+}
+
+/// True if `value` is at or above the low bound of `opts`.
+fn pastLow(value: record.Value, opts: RangeOptions) bool {
+    return switch (opts.low) {
+        .none => true,
+        .inclusive => |lv| compareValueToLookup(value, lv) >= 0,
+        .exclusive => |lv| compareValueToLookup(value, lv) > 0,
+    };
+}
+
+/// True if `value` is strictly above the high bound (i.e. out of
+/// range on the upper side, including the case `exclusive == value`).
+fn pastHigh(value: record.Value, opts: RangeOptions) bool {
+    return switch (opts.high) {
+        .none => false,
+        .inclusive => |hv| compareValueToLookup(value, hv) > 0,
+        .exclusive => |hv| compareValueToLookup(value, hv) >= 0,
+    };
+}
+
+fn entryInRange(value: record.Value, opts: RangeOptions) bool {
+    return pastLow(value, opts) and !pastHigh(value, opts);
+}
+
+fn rangeWalkStopRequested(ctx: anytype) bool {
+    const info = @typeInfo(@TypeOf(ctx));
+    if (info != .pointer) return false;
+    const child = info.pointer.child;
+    if (@typeInfo(child) != .@"struct") return false;
+    if (@hasField(child, "stop_after")) return ctx.stop_after;
+    return false;
+}
+
+fn walkIndexRangePage(
+    reader: page.PageReader,
+    page_number: u32,
+    opts: RangeOptions,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    comptime onMatch: fn (ctx: @TypeOf(ctx), entry: IndexEntryView) IndexError!void,
+) IndexError!void {
+    if (rangeWalkStopRequested(ctx)) return;
+    const ref = try reader.page(page_number);
+    const header = try btree.PageHeader.parse(ref);
+    if (!header.page_type.isIndex()) return error.UnsupportedIndexBTree;
+
+    if (header.page_type == .index_leaf) {
+        return walkIndexRangeLeaf(reader, ref, header, opts, allocator, ctx, onMatch);
+    }
+
+    if (opts.reverse) {
+        const right = header.right_most_pointer orelse return error.InvalidIndexCell;
+        try walkIndexRangePage(reader, right, opts, allocator, ctx, onMatch);
+        if (rangeWalkStopRequested(ctx)) return;
+
+        var i = header.cell_count;
+        while (i > 0) {
+            i -= 1;
+            const cell = try header.cell(ref, i);
+            if (cell.len < 4) return error.InvalidIndexCell;
+            const left_child = readU32(cell[0..4]);
+            var inline_rec: record.InlineRecord = undefined;
+            const entry = try parseIndexCellView(reader, cell[4..], allocator, &inline_rec);
+            defer entry.deinit(allocator);
+            const sep_first = if (entry.values.len > 0) entry.values[0] else .null;
+            const sep_above = pastHigh(sep_first, opts);
+            const sep_below = !pastLow(sep_first, opts);
+            if (entryInRange(sep_first, opts)) {
+                if (rowidFromValues(entry.values)) |rid| {
+                    try onMatch(ctx, .{ .rowid = rid, .first_value = sep_first, .values = entry.values });
+                    if (rangeWalkStopRequested(ctx)) return;
+                }
+            }
+            if (!sep_above and !sep_below) {
+                try walkIndexRangePage(reader, left_child, opts, allocator, ctx, onMatch);
+                if (rangeWalkStopRequested(ctx)) return;
+            } else if (!sep_above and sep_below) {
+                // sep is below low — nothing in left_child is in range.
+            } else if (sep_above) {
+                // sep is above high; left_child entries are <= sep, may include in-range.
+                try walkIndexRangePage(reader, left_child, opts, allocator, ctx, onMatch);
+                if (rangeWalkStopRequested(ctx)) return;
+            }
+            if (sep_below) return;
+        }
+        return;
+    }
+
+    var i: usize = 0;
+    while (i < header.cell_count) : (i += 1) {
+        if (rangeWalkStopRequested(ctx)) return;
+        const cell = try header.cell(ref, i);
+        if (cell.len < 4) return error.InvalidIndexCell;
+        const left_child = readU32(cell[0..4]);
+        var inline_rec: record.InlineRecord = undefined;
+        const entry = try parseIndexCellView(reader, cell[4..], allocator, &inline_rec);
+        defer entry.deinit(allocator);
+        const sep_first = if (entry.values.len > 0) entry.values[0] else .null;
+        const sep_below = !pastLow(sep_first, opts);
+        const sep_above = pastHigh(sep_first, opts);
+
+        if (!sep_below) {
+            try walkIndexRangePage(reader, left_child, opts, allocator, ctx, onMatch);
+            if (rangeWalkStopRequested(ctx)) return;
+        }
+        if (entryInRange(sep_first, opts)) {
+            if (rowidFromValues(entry.values)) |rid| {
+                try onMatch(ctx, .{ .rowid = rid, .first_value = sep_first, .values = entry.values });
+                if (rangeWalkStopRequested(ctx)) return;
+            }
+        }
+        if (sep_above) return;
+    }
+
+    const right = header.right_most_pointer orelse return error.InvalidIndexCell;
+    try walkIndexRangePage(reader, right, opts, allocator, ctx, onMatch);
+}
+
+fn walkIndexRangeLeaf(
+    reader: page.PageReader,
+    ref: page.PageRef,
+    header: btree.PageHeader,
+    opts: RangeOptions,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    comptime onMatch: fn (ctx: @TypeOf(ctx), entry: IndexEntryView) IndexError!void,
+) IndexError!void {
+    if (header.cell_count == 0) return;
+
+    // Binary-search for the first cell at or above the low bound.
+    var lo_idx: usize = 0;
+    if (opts.low != .none) {
+        var lo: usize = 0;
+        var hi: usize = header.cell_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const cell = try header.cell(ref, mid);
+            const first = try parseFirstIndexValueView(reader, cell, allocator);
+            defer first.deinit(allocator);
+            if (!pastLow(first.value, opts)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo_idx = lo;
+    }
+
+    if (opts.reverse) {
+        // Walk descending starting from the upper edge — skipping cells
+        // that are above the high bound — and stop once we drop below
+        // the low bound.
+        var i = header.cell_count;
+        while (i > lo_idx) {
+            i -= 1;
+            if (rangeWalkStopRequested(ctx)) return;
+            const cell = try header.cell(ref, i);
+            var inline_rec: record.InlineRecord = undefined;
+            const entry = try parseIndexCellView(reader, cell, allocator, &inline_rec);
+            defer entry.deinit(allocator);
+            const sep_first = if (entry.values.len > 0) entry.values[0] else .null;
+            if (pastHigh(sep_first, opts)) continue;
+            if (!pastLow(sep_first, opts)) break;
+            if (rowidFromValues(entry.values)) |rid| {
+                try onMatch(ctx, .{ .rowid = rid, .first_value = sep_first, .values = entry.values });
+                if (rangeWalkStopRequested(ctx)) return;
+            }
+        }
+        return;
+    }
+
+    var i = lo_idx;
+    while (i < header.cell_count) : (i += 1) {
+        if (rangeWalkStopRequested(ctx)) return;
+        const cell = try header.cell(ref, i);
+        var inline_rec: record.InlineRecord = undefined;
+        const entry = try parseIndexCellView(reader, cell, allocator, &inline_rec);
+        defer entry.deinit(allocator);
+        const sep_first = if (entry.values.len > 0) entry.values[0] else .null;
+        if (pastHigh(sep_first, opts)) break;
+        if (!pastLow(sep_first, opts)) continue;
+        if (rowidFromValues(entry.values)) |rid| {
+            try onMatch(ctx, .{ .rowid = rid, .first_value = sep_first, .values = entry.values });
+        }
     }
 }
 
