@@ -17,6 +17,7 @@ A tiny embeddable SQL engine with a SQLite `.db` compatibility track. Written in
 - **Native WAL** (`*-snwal`) — group commit, configurable `synchronous=full/normal/off`, crash recovery on reopen, torn-WAL fuzzed on every byte offset
 - **`mmap`-backed DB image + incremental `msync`** — `Connection` mmaps the data file once and mutates the mapping directly. The OS page cache decides what's resident; cold pages stay on disk, hot pages stay in RAM, and a 65 MB database queried for one row uses **2 MB RSS**, not 65 MB. On checkpoint we `msync` only the pages the fast-path inserts dirtied. This is what makes throughput flat past 1M rows without forcing you to load the whole file into memory
 - **SQLite-compatible b-trees** — multi-leaf table splits validated by `PRAGMA integrity_check` end-to-end, rowid tables, single-leaf indexes, payload overflow reads
+- **Real-world indexed reads** — on a 2.6 GB Singapore legal corpus, prepared `SELECT` plans now beat SQLite on the full heavy query set, including range, `IN`, indexed `ORDER BY`, direct indexed `COUNT(*)`, covering reads, and indexed `MIN/MAX`
 - **Single static binary** — no runtime, no extensions, Zig 0.16
 - **SSPL + author exception** license — same shape as MongoDB/Redis Stack, with full permissive use by the justrach namespace
 
@@ -83,6 +84,31 @@ The hot-cache COUNT(*) numbers are real measurements but reflect L2 cache speed,
 - Sequential mmap hints keep scan access predictable without eagerly faulting the whole file into RSS.
 - mmap + zero-syscall reads avoid the `pread` ⇒ kernel ⇒ userspace memcpy that SQLite's pager pays per page.
 
+### Real-world indexed reads — sgjudge.db
+
+Latest 2.6 GB Singapore legal corpus (`10,600` judgments, `34,456` Hansard
+speeches), warm OS cache, `sqlnano` `ReleaseFast`. SQLite timings use Python
+`sqlite3` with the cursor statement cache; sqlnano uses `bench-query`, which
+prepares the SELECT once and runs the executor in-process for each iteration.
+
+| Query shape | SQLite | sqlnano | ratio |
+|-------------|-------:|--------:|------:|
+| `SELECT year ... BETWEEN ... LIMIT 1000` (covering) | 161.2 µs | **29.2 µs** | **5.51×** |
+| `MAX(year)` via indexed edge | 1.9 µs | **0.1 µs** | **17.34×** |
+| `MAX(decision_date)` via indexed edge | 2.1 µs | **0.2 µs** | **13.64×** |
+| `speaker = ? LIMIT 500` (covering text index) | 100.0 µs | **30.2 µs** | **3.31×** |
+| `year BETWEEN 2010 AND 2025 LIMIT 1000` | 812.9 µs | **250.8 µs** | **3.24×** |
+| `year IN (2020..2025) LIMIT 1000` | 768.5 µs | **261.3 µs** | **2.94×** |
+| `ORDER BY year LIMIT 1000` | 785.4 µs | **259.2 µs** | **3.03×** |
+| `COUNT(*) WHERE court='SGHC'` | 315.2 µs | **102.7 µs** | **3.07×** |
+| `COUNT(*) WHERE year BETWEEN 2010 AND 2025` | 255.4 µs | **108.9 µs** | **2.34×** |
+
+The fast paths behind those numbers are deliberately narrow: prepared
+schema-aware SELECT plans, direct index-edge MIN/MAX, direct indexed COUNT for
+equality/range/IN predicates, index-range walks with early LIMIT stop,
+covering-index result slabs, and projected row hydration when a table lookup is
+still required.
+
 **What makes it fast:**
 
 - **Native WAL** with group commit, one `fsync(2)` per op on `synchronous=full`, zero fsyncs per op on `synchronous=normal` (durability boundary = checkpoint)
@@ -137,6 +163,7 @@ sqlnano bench-write /tmp/t.db t 10000 off
 # Read benchmarks
 sqlnano bench-read /tmp/t.db "SELECT * FROM t WHERE rowid = 5000" 100000
 sqlnano bench-read /tmp/t.db "SELECT * FROM t" 1000
+sqlnano bench-query /tmp/t.db "SELECT MAX(n) FROM t" 100000
 ```
 
 ### FTS5 search
@@ -255,7 +282,7 @@ zig build test
 zig build test -Doptimize=ReleaseFast
 ```
 
-85 tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
+90+ tests: header/page/btree/record parsers, WAL group-commit + crash recovery + torn-WAL fuzz,
 table/index creation, table rename/add-column/drop, table multi-leaf split verified by
 `PRAGMA integrity_check`, end-to-end INSERT/UPDATE/DELETE through `Connection`.
 
@@ -324,6 +351,7 @@ License: [Server Side Public License v1, with an author exception for justrach](
 | `sqlnano fts-search <db> <fts5_table> <content_table> <term> [limit] [columns] [weights] [filters...]` | Search and hydrate ranked JSON rows |
 | `sqlnano exec <db> "<SQL>"`                          | Run CREATE/ALTER/DROP/INSERT/UPDATE/DELETE       |
 | `sqlnano bench-read <db> "<SQL>" <N>`                | Benchmark the hot read path (`N` iterations)     |
+| `sqlnano bench-query <db> "<SQL>" <N>`               | Benchmark prepared SELECT executor latency       |
 | `sqlnano bench-write <db> <table> <N> [full\|normal\|off]` | Benchmark durable inserts via a long-lived `Connection` |
 | `sqlnano wal-status <db>`                            | Inspect the `*-snwal` sidecar                     |
 | `sqlnano wal-checkpoint <db>`                        | Replay + compact the WAL                          |

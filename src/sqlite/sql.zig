@@ -94,6 +94,8 @@ pub const QueryResult = struct {
     /// Fast deinit hint for result sets whose cells contain only scalar
     /// values and therefore do not own text/blob payloads.
     values_have_owned_payloads: bool = true,
+    columns_owned: bool = true,
+    table_info_owned: bool = true,
 
     pub fn deinit(self: QueryResult, allocator: std.mem.Allocator) void {
         for (self.rows) |row| {
@@ -102,8 +104,8 @@ pub const QueryResult = struct {
         }
         allocator.free(self.rows);
         if (self.cell_slab) |slab| allocator.free(slab);
-        allocator.free(self.columns);
-        self.table_info.deinit(allocator);
+        if (self.columns_owned) allocator.free(self.columns);
+        if (self.table_info_owned) self.table_info.deinit(allocator);
     }
 };
 
@@ -138,14 +140,151 @@ const SourcedRow = struct {
     row: table.Row,
 };
 
+pub const PreparedSelect = struct {
+    allocator: std.mem.Allocator,
+    sql: []u8,
+    stmt: SelectStatement,
+    plan: PreparedSelectPlan = .generic,
+
+    pub fn deinit(self: *PreparedSelect) void {
+        self.plan.deinit(self.allocator);
+        self.stmt.deinit(self.allocator);
+        self.allocator.free(self.sql);
+    }
+};
+
+const PreparedSelectPlan = union(enum) {
+    generic,
+    indexed_minmax: PreparedIndexedMinMax,
+
+    fn deinit(self: PreparedSelectPlan, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .generic => {},
+            .indexed_minmax => |plan| {
+                allocator.free(plan.columns);
+                plan.table_info.deinit(allocator);
+            },
+        }
+    }
+};
+
+const PreparedIndexedMinMax = struct {
+    table_info: catalog.TableInfo,
+    columns: []ResultColumn,
+    index_root: u32,
+    reverse: bool,
+};
+
+pub fn prepareSelect(sql: []const u8, allocator: std.mem.Allocator) SqlError!PreparedSelect {
+    const sql_copy = try allocator.dupe(u8, sql);
+    errdefer allocator.free(sql_copy);
+
+    const stmt = try parseSelect(sql_copy, allocator);
+    errdefer stmt.deinit(allocator);
+
+    return .{
+        .allocator = allocator,
+        .sql = sql_copy,
+        .stmt = stmt,
+    };
+}
+
+pub fn prepareSelectForSchema(db_schema: schema.Schema, sql: []const u8, allocator: std.mem.Allocator) SqlError!PreparedSelect {
+    var prepared = try prepareSelect(sql, allocator);
+    errdefer prepared.deinit();
+    prepared.plan = try buildPreparedSelectPlan(db_schema, prepared.stmt, allocator);
+    return prepared;
+}
+
+pub fn executePreparedSelect(reader: page.PageReader, db_schema: schema.Schema, prepared: *const PreparedSelect, allocator: std.mem.Allocator) SqlError!QueryResult {
+    return switch (prepared.plan) {
+        .generic => executeSelectStatement(reader, db_schema, prepared.stmt, allocator),
+        .indexed_minmax => |plan| executePreparedIndexedMinMax(reader, plan, allocator),
+    };
+}
+
 pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []const u8, allocator: std.mem.Allocator) SqlError!QueryResult {
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+    const stmt = try parseSelect(sql, parse_arena.allocator());
+    return executeSelectStatement(reader, db_schema, stmt, allocator);
+}
+
+fn buildPreparedSelectPlan(db_schema: schema.Schema, stmt: SelectStatement, allocator: std.mem.Allocator) SqlError!PreparedSelectPlan {
+    if (stmt.where_expr != null or stmt.joins.len != 0 or stmt.projections.len != 1) return .generic;
+    if (stmt.projections[0] != .aggregate) return .generic;
+
+    const ag = stmt.projections[0].aggregate;
+    if (ag.func != .min and ag.func != .max) return .generic;
+    if (asciiEql(ag.column.name, "rowid")) return .generic;
+
+    const primary_entry = db_schema.findTable(stmt.table_name) orelse return error.TableNotFound;
+    var primary_info = try catalog.tableInfo(primary_entry, allocator);
+    var consume_info = false;
+    defer if (!consume_info) primary_info.deinit(allocator);
+
+    const primary_source = Source{ .info = primary_info, .alias = stmt.table_alias };
+    if (ag.column.qualifier) |q| {
+        if (!primary_source.matches(q)) return .generic;
+    }
+
+    const index_entry = findIndexForColumn(db_schema, primary_info, ag.column.name) orelse return .generic;
+    const sources = [_]Source{primary_source};
+    const columns = try buildResultColumns(allocator, stmt.projections, sources[0..]);
+    errdefer allocator.free(columns);
+
+    const plan = PreparedIndexedMinMax{
+        .table_info = primary_info,
+        .columns = columns,
+        .index_root = @intCast(index_entry.root_page),
+        .reverse = ag.func == .max,
+    };
+    consume_info = true;
+    return .{ .indexed_minmax = plan };
+}
+
+fn executePreparedIndexedMinMax(reader: page.PageReader, plan: PreparedIndexedMinMax, allocator: std.mem.Allocator) SqlError!QueryResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ascratch = arena.allocator();
+
+    const edge = try index_mod.firstNonNullFirstColumnEdgeValue(
+        reader,
+        plan.index_root,
+        plan.reverse,
+        ascratch,
+    );
+
+    var value: record.Value = .null;
+    if (edge) |edge_value| {
+        defer edge_value.deinit(ascratch);
+        value = try dupValue(allocator, edge_value.value);
+    }
+    errdefer freeValue(allocator, value);
+
+    var values = try allocator.alloc(ResultCell, 1);
+    errdefer allocator.free(values);
+    values[0] = .{ .name = plan.columns[0].name, .value = value };
+
+    var rows = try allocator.alloc(ResultRow, 1);
+    errdefer allocator.free(rows);
+    rows[0] = .{ .rowid = -1, .values = values };
+
+    return .{
+        .columns = plan.columns,
+        .table_info = plan.table_info,
+        .rows = rows,
+        .columns_owned = false,
+        .table_info_owned = false,
+    };
+}
+
+fn executeSelectStatement(reader: page.PageReader, db_schema: schema.Schema, stmt: SelectStatement, allocator: std.mem.Allocator) SqlError!QueryResult {
     // One arena for every transient allocation made during this query
-    // — AST nodes, parsed Schema view, per-source TableInfo, the
-    // scanned tables themselves (each with its per-row []Value), the
-    // intermediate tuple lists, sort context, and any concat/LIKE
-    // strings produced during expression evaluation. The arena is
-    // freed in bulk at function exit, which collapses what used to
-    // be O(rows + tuples + ast nodes) gpa free() calls into one.
+    // — parsed Schema view, per-source TableInfo, scanned tables
+    // themselves (each with its per-row []Value), intermediate tuple
+    // lists, sort context, and any concat/LIKE strings produced during
+    // expression evaluation. The arena is freed in bulk at function exit.
     //
     // The caller's `allocator` is still used for everything that
     // lives past the call: `QueryResult.columns`, `QueryResult.rows`,
@@ -153,9 +292,6 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const ascratch = arena.allocator();
-
-    const stmt = try parseSelect(sql, ascratch);
-    // No `defer stmt.deinit(ascratch)` — the arena owns everything.
 
     // --- Resolve every FROM / JOIN table into a Source list. ---
     var sources: std.ArrayList(Source) = .empty;
@@ -3222,6 +3358,41 @@ test "filtered count uses indexed range and in-list counts" {
     const in_result = try executeSelect(reader, db_schema, "SELECT COUNT(*) FROM t WHERE year IN (2020, 2021, 2021, 2024)", testing.allocator);
     defer in_result.deinit(testing.allocator);
     try testing.expectEqual(@as(i64, 3), in_result.rows[0].values[0].value.integer);
+}
+
+test "prepared select can execute repeatedly without reparsing" {
+    try skipIfNoSqlite();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmpDbPath(testing.allocator, tmp, "prepared-select.db");
+    defer testing.allocator.free(db_path);
+
+    try buildSqliteFixture(db_path,
+        \\CREATE TABLE t(id INTEGER PRIMARY KEY, year INTEGER, name TEXT);
+        \\CREATE INDEX idx_t_year ON t(year);
+        \\INSERT INTO t(id, year, name) VALUES
+        \\  (1, 2020, 'a'),
+        \\  (2, 2021, 'b'),
+        \\  (3, 2022, 'c');
+    );
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, db_path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    const reader = try page.PageReader.init(bytes);
+    const db_schema = try schema.readSchema(reader, testing.allocator);
+    defer db_schema.deinit(testing.allocator);
+
+    var prepared = try prepareSelectForSchema(db_schema, "SELECT MAX(year) FROM t", testing.allocator);
+    defer prepared.deinit();
+
+    const first = try executePreparedSelect(reader, db_schema, &prepared, testing.allocator);
+    defer first.deinit(testing.allocator);
+    const second = try executePreparedSelect(reader, db_schema, &prepared, testing.allocator);
+    defer second.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i64, 2022), first.rows[0].values[0].value.integer);
+    try testing.expectEqual(@as(i64, 2022), second.rows[0].values[0].value.integer);
 }
 
 test "findIndexForColumn skips partial indexes" {

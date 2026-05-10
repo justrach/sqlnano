@@ -365,6 +365,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  sqlnano exec <database.db> "DROP TABLE t"  Drop a simple tail-allocated rowid table
         \\  sqlnano exec <database.db> "INSERT INTO t VALUES (...)"  Append a simple row
         \\  sqlnano bench-read <database.db> "SELECT * FROM t WHERE rowid = 1" <N>  Benchmark hot read path
+        \\  sqlnano bench-query <database.db> "SELECT MAX(x) FROM t" <N>  Benchmark prepared SELECT path
         \\  sqlnano bench-write <database.db> <table> <N>  Benchmark durable inserts via a long-lived Connection
         \\  sqlnano bench-delete <database.db> <table> <N>  Benchmark durable deletes via a long-lived Connection
         \\  sqlnano wal-status <database.db>               Inspect the sidecar WAL (`<db>-snwal`)
@@ -1266,11 +1267,11 @@ fn execSql(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, sql
     }
 }
 
-/// General-purpose query benchmark — runs `executeSelect` N times and
-/// reports per-iteration nanoseconds. Unlike `bench-read` this routes
-/// through the full SELECT executor (joins, aggregates, ORDER BY,
-/// arbitrary WHERE), so it's the apples-to-apples way to compare
-/// query latency vs SQLite's prepared-statement step loop.
+/// General-purpose query benchmark — prepares once, then runs the SELECT
+/// executor N times and reports per-iteration nanoseconds. Unlike
+/// `bench-read` this routes through the full SELECT executor (joins,
+/// aggregates, ORDER BY, arbitrary WHERE), so it's the apples-to-apples
+/// way to compare query latency vs SQLite's prepared-statement step loop.
 fn benchQuery(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, query: []const u8, iterations_text: []const u8) !void {
     const iterations = try std.fmt.parseInt(usize, iterations_text, 10);
     if (iterations == 0) return error.InvalidIterationCount;
@@ -1283,12 +1284,15 @@ fn benchQuery(init: std.process.Init, writer: *std.Io.Writer, path: []const u8, 
     const schema = try sqlnano.sqlite.readSchema(reader, init.gpa);
     defer schema.deinit(init.gpa);
 
+    var prepared = try sqlnano.sqlite.prepareSelectForSchema(schema, query, init.gpa);
+    defer prepared.deinit();
+
     var sink: i64 = 0;
     var rows_total: usize = 0;
     const start = std.Io.Clock.awake.now(init.io).toNanoseconds();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const result = try sqlnano.sqlite.sql_mod.executeSelect(reader, schema, query, init.gpa);
+        const result = try sqlnano.sqlite.executePreparedSelect(reader, schema, &prepared, init.gpa);
         defer result.deinit(init.gpa);
         rows_total += result.rows.len;
         // Touch every cell so the optimizer can't elide column decoding,
