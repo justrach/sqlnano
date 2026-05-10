@@ -55,18 +55,23 @@ pub const ResultRow = struct {
     /// to a single underlying rowid.
     rowid: i64,
     values: []ResultCell,
+    values_owned: bool = true,
 
     pub fn deinit(self: ResultRow, allocator: std.mem.Allocator) void {
-        for (self.values) |value| {
-            switch (value.value) {
-                .text => |text| allocator.free(text),
-                .blob => |blob| allocator.free(blob),
-                else => {},
-            }
-        }
-        allocator.free(self.values);
+        freeResultCellPayloads(self.values, allocator);
+        if (self.values_owned) allocator.free(self.values);
     }
 };
+
+fn freeResultCellPayloads(values: []const ResultCell, allocator: std.mem.Allocator) void {
+    for (values) |value| {
+        switch (value.value) {
+            .text => |text| allocator.free(text),
+            .blob => |blob| allocator.free(blob),
+            else => {},
+        }
+    }
+}
 
 /// Column metadata for the result set. For single-table `SELECT *`
 /// this collapses to the underlying `TableInfo.columns`; for JOIN
@@ -83,10 +88,20 @@ pub const QueryResult = struct {
     /// Consumers that don't need it can ignore it.
     table_info: catalog.TableInfo,
     rows: []ResultRow,
+    /// Optional contiguous storage for every row's `values` slice. When
+    /// present, individual rows borrow their cell slices from this slab.
+    cell_slab: ?[]ResultCell = null,
+    /// Fast deinit hint for result sets whose cells contain only scalar
+    /// values and therefore do not own text/blob payloads.
+    values_have_owned_payloads: bool = true,
 
     pub fn deinit(self: QueryResult, allocator: std.mem.Allocator) void {
-        for (self.rows) |row| row.deinit(allocator);
+        for (self.rows) |row| {
+            if (self.values_have_owned_payloads) freeResultCellPayloads(row.values, allocator);
+            if (row.values_owned) allocator.free(row.values);
+        }
         allocator.free(self.rows);
+        if (self.cell_slab) |slab| allocator.free(slab);
         allocator.free(self.columns);
         self.table_info.deinit(allocator);
     }
@@ -205,6 +220,17 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
         break;
     };
 
+    // --- Covering index scan: when projections are limited to the
+    // indexed first column and/or rowid, the index entry already has
+    // every value the caller needs. Try this before the indexed-rowid
+    // hydration fast path so covered WHERE range / equality / IN queries
+    // never bounce through table lookups.
+    if (!has_non_count_agg and sources.items.len == 1) {
+        if (try tryCoveringIndexScan(reader, db_schema, primary_info, stmt, sources.items, allocator, ascratch)) |result| {
+            return result;
+        }
+    }
+
     // --- Fast path: single-table, WHERE is either `rowid = N` or an
     // indexed-column equality / range / IN-list. ---
     if (!has_non_count_agg and sources.items.len == 1 and stmt.where_expr != null) {
@@ -254,17 +280,6 @@ pub fn executeSelect(reader: page.PageReader, db_schema: schema.Schema, sql: []c
                     return try buildFromSingleTable(reader, db_schema, stmt, sources.items, &sources, primary_info, null, rids, allocator, ascratch);
                 }
             }
-        }
-    }
-
-    // --- Covering index scan: when projections are limited to the
-    // indexed first column and/or rowid, the index entry already has
-    // every value the caller needs. Walk the index directly and emit
-    // rows without any table-side b-tree probes. Saves the per-rowid
-    // hydration cost the equality/range/IN paths above pay.
-    if (!has_non_count_agg and sources.items.len == 1) {
-        if (try tryCoveringIndexScan(reader, db_schema, primary_info, stmt, sources.items, allocator, ascratch)) |result| {
-            return result;
         }
     }
 
@@ -2178,6 +2193,13 @@ pub fn indexedRowidsForRange(
     );
 }
 
+const CoveringValueSource = enum {
+    rowid,
+    first_indexed_value,
+};
+
+const max_covering_slab_rows = 100_000;
+
 /// Attempt a covering-index scan. Returns null when the query shape
 /// or projection list isn't covered by an available index. When this
 /// path fires we serve the entire result from index entries and never
@@ -2250,15 +2272,28 @@ fn tryCoveringIndexScan(
     const index_entry = findIndexForColumn(db_schema, info, col_name) orelse return null;
     const ipk_col_name: ?[]const u8 = if (info.integer_primary_key_index) |ipk| info.columns[ipk].name else null;
 
-    // Verify every projection is rowid or the indexed column.
-    for (stmt.projections) |p| {
+    // Verify every projection is rowid or the indexed column, and compile
+    // that into a tiny source map so emit() does no name matching per row.
+    const value_sources = try ascratch.alloc(CoveringValueSource, stmt.projections.len);
+    for (stmt.projections, 0..) |p, i| {
         switch (p) {
             .column => |col| {
                 if (col.ref.qualifier != null and !sources[0].matches(col.ref.qualifier.?)) return null;
                 const name = col.ref.name;
-                if (asciiEql(name, "rowid")) continue;
-                if (ipk_col_name) |pk| if (asciiEql(name, pk)) continue;
-                if (asciiEql(name, col_name)) continue;
+                if (asciiEql(name, "rowid")) {
+                    value_sources[i] = .rowid;
+                    continue;
+                }
+                if (ipk_col_name) |pk| {
+                    if (asciiEql(name, pk)) {
+                        value_sources[i] = .rowid;
+                        continue;
+                    }
+                }
+                if (asciiEql(name, col_name)) {
+                    value_sources[i] = .first_indexed_value;
+                    continue;
+                }
                 return null;
             },
             else => return null,
@@ -2273,19 +2308,33 @@ fn tryCoveringIndexScan(
     const columns = try buildResultColumns(allocator, stmt.projections, sources);
     errdefer allocator.free(columns);
 
+    var cell_slab: ?[]ResultCell = null;
+    errdefer if (cell_slab) |slab| allocator.free(slab);
+
     var rows: std.ArrayList(ResultRow) = .empty;
     errdefer {
-        for (rows.items) |r| r.deinit(allocator);
+        for (rows.items) |r| {
+            freeResultCellPayloads(r.values, allocator);
+            if (r.values_owned) allocator.free(r.values);
+        }
         rows.deinit(allocator);
+    }
+
+    if (limit_n != std.math.maxInt(usize) and limit_n <= max_covering_slab_rows) {
+        if (stmt.projections.len > std.math.maxInt(usize) / limit_n) return error.OutOfMemory;
+        const cell_count = limit_n * stmt.projections.len;
+        cell_slab = try allocator.alloc(ResultCell, cell_count);
+        try rows.ensureTotalCapacity(allocator, limit_n);
     }
 
     const Collector = struct {
         allocator: std.mem.Allocator,
         rows: *std.ArrayList(ResultRow),
-        projections: []const ast.Projection,
+        value_sources: []const CoveringValueSource,
         columns: []const ResultColumn,
-        col_name: []const u8,
-        ipk_col_name: ?[]const u8,
+        cell_slab: ?[]ResultCell,
+        cell_slab_used: usize,
+        has_owned_payloads: bool,
         limit: usize,
         emitted: usize,
         stop_after: bool,
@@ -2296,37 +2345,47 @@ fn tryCoveringIndexScan(
                 self.stop_after = true;
                 return;
             }
-            const out = self.allocator.alloc(ResultCell, self.projections.len) catch {
+            const slab_start = self.cell_slab_used;
+            const out: []ResultCell = if (self.cell_slab) |slab| blk: {
+                const end = slab_start + self.value_sources.len;
+                if (end > slab.len) {
+                    self.stop_after = true;
+                    return;
+                }
+                self.cell_slab_used = end;
+                break :blk slab[slab_start..end];
+            } else self.allocator.alloc(ResultCell, self.value_sources.len) catch {
                 self.oom = true;
                 self.stop_after = true;
                 return error.OutOfMemory;
             };
             var initialized: usize = 0;
             errdefer {
-                for (out[0..initialized]) |c| switch (c.value) {
-                    .text => |t| self.allocator.free(t),
-                    .blob => |b| self.allocator.free(b),
-                    else => {},
-                };
-                self.allocator.free(out);
+                freeResultCellPayloads(out[0..initialized], self.allocator);
+                if (self.cell_slab == null) {
+                    self.allocator.free(out);
+                } else {
+                    self.cell_slab_used = slab_start;
+                }
             }
-            for (self.projections, 0..) |p, i| {
-                const col = p.column;
-                const name = col.ref.name;
-                const is_rowid = asciiEql(name, "rowid") or (self.ipk_col_name != null and asciiEql(name, self.ipk_col_name.?));
-                const v_src: record.Value = if (is_rowid)
-                    .{ .integer = entry.rowid }
-                else
-                    entry.first_value;
+            for (self.value_sources, 0..) |source, i| {
+                const v_src: record.Value = switch (source) {
+                    .rowid => .{ .integer = entry.rowid },
+                    .first_indexed_value => entry.first_value,
+                };
                 const v_owned = dupValue(self.allocator, v_src) catch {
                     self.oom = true;
                     self.stop_after = true;
                     return error.OutOfMemory;
                 };
+                switch (v_owned) {
+                    .text, .blob => self.has_owned_payloads = true,
+                    else => {},
+                }
                 out[i] = .{ .name = self.columns[i].name, .value = v_owned };
                 initialized += 1;
             }
-            self.rows.append(self.allocator, .{ .rowid = entry.rowid, .values = out }) catch {
+            self.rows.append(self.allocator, .{ .rowid = entry.rowid, .values = out, .values_owned = self.cell_slab == null }) catch {
                 self.oom = true;
                 self.stop_after = true;
                 return error.OutOfMemory;
@@ -2339,10 +2398,11 @@ fn tryCoveringIndexScan(
     var collector: Collector = .{
         .allocator = allocator,
         .rows = &rows,
-        .projections = stmt.projections,
+        .value_sources = value_sources,
         .columns = columns,
-        .col_name = col_name,
-        .ipk_col_name = ipk_col_name,
+        .cell_slab = cell_slab,
+        .cell_slab_used = 0,
+        .has_owned_payloads = false,
         .limit = limit_n,
         .emitted = 0,
         .stop_after = false,
@@ -2383,6 +2443,8 @@ fn tryCoveringIndexScan(
         .columns = columns,
         .table_info = try cloneTableInfo(allocator, info),
         .rows = try rows.toOwnedSlice(allocator),
+        .cell_slab = cell_slab,
+        .values_have_owned_payloads = if (cell_slab != null) collector.has_owned_payloads else true,
     };
 }
 
@@ -2960,9 +3022,104 @@ fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+const testing = std.testing;
+
+fn skipIfNoSqlite() !void {
+    const result = std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "sqlite3", "-version" },
+    }) catch return error.SkipZigTest;
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.SkipZigTest;
+}
+
+fn buildSqliteFixture(db_path: []const u8, schema_sql: []const u8) !void {
+    const result = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "sqlite3", db_path, schema_sql },
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.SqliteFixtureFailed;
+}
+
+fn tmpDbPath(allocator: std.mem.Allocator, tmp: testing.TmpDir, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
 test "parse indexed column from create index" {
     try std.testing.expectEqualStrings("name", parseFirstIndexColumn("CREATE INDEX idx_users_name ON users(name)").?);
     try std.testing.expectEqualStrings("user name", parseFirstIndexColumn("CREATE INDEX idx ON users(\"user name\")").?);
+}
+
+test "covering index scan uses scalar slab for bounded integer output" {
+    try skipIfNoSqlite();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmpDbPath(testing.allocator, tmp, "covering-int.db");
+    defer testing.allocator.free(db_path);
+
+    try buildSqliteFixture(db_path,
+        \\CREATE TABLE t(id INTEGER PRIMARY KEY, year INTEGER, name TEXT);
+        \\CREATE INDEX idx_t_year ON t(year);
+        \\INSERT INTO t(id, year, name) VALUES
+        \\  (1, 2020, 'a'),
+        \\  (2, 2021, 'b'),
+        \\  (3, 2022, 'c'),
+        \\  (4, 2023, 'd');
+    );
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, db_path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    const reader = try page.PageReader.init(bytes);
+    const db_schema = try schema.readSchema(reader, testing.allocator);
+    defer db_schema.deinit(testing.allocator);
+
+    const result = try executeSelect(reader, db_schema, "SELECT id, year FROM t WHERE year BETWEEN 2020 AND 2022 LIMIT 3", testing.allocator);
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(result.cell_slab != null);
+    try testing.expect(!result.values_have_owned_payloads);
+    try testing.expectEqual(@as(usize, 3), result.rows.len);
+    try testing.expect(!result.rows[0].values_owned);
+    try testing.expectEqual(@as(i64, 1), result.rows[0].values[0].value.integer);
+    try testing.expectEqual(@as(i64, 2020), result.rows[0].values[1].value.integer);
+    try testing.expectEqual(@as(i64, 3), result.rows[2].values[0].value.integer);
+    try testing.expectEqual(@as(i64, 2022), result.rows[2].values[1].value.integer);
+}
+
+test "covering index scan slab frees duplicated text payloads" {
+    try skipIfNoSqlite();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmpDbPath(testing.allocator, tmp, "covering-text.db");
+    defer testing.allocator.free(db_path);
+
+    try buildSqliteFixture(db_path,
+        \\CREATE TABLE people(id INTEGER PRIMARY KEY, speaker TEXT, body TEXT);
+        \\CREATE INDEX idx_people_speaker ON people(speaker);
+        \\INSERT INTO people(id, speaker, body) VALUES
+        \\  (1, 'Alice', 'first'),
+        \\  (2, 'Alice', 'second'),
+        \\  (3, 'Bob', 'third');
+    );
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, db_path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    const reader = try page.PageReader.init(bytes);
+    const db_schema = try schema.readSchema(reader, testing.allocator);
+    defer db_schema.deinit(testing.allocator);
+
+    const result = try executeSelect(reader, db_schema, "SELECT speaker FROM people WHERE speaker = 'Alice' LIMIT 2", testing.allocator);
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(result.cell_slab != null);
+    try testing.expect(result.values_have_owned_payloads);
+    try testing.expectEqual(@as(usize, 2), result.rows.len);
+    try testing.expect(!result.rows[0].values_owned);
+    try testing.expectEqualStrings("Alice", result.rows[0].values[0].value.text);
+    try testing.expectEqualStrings("Alice", result.rows[1].values[0].value.text);
 }
 
 test "findIndexForColumn skips partial indexes" {
