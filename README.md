@@ -93,21 +93,24 @@ prepares the SELECT once and runs the executor in-process for each iteration.
 
 | Query shape | SQLite | sqlnano | ratio |
 |-------------|-------:|--------:|------:|
-| `SELECT year ... BETWEEN ... LIMIT 1000` (covering) | 161.2 µs | **29.2 µs** | **5.51×** |
-| `MAX(year)` via indexed edge | 1.9 µs | **0.1 µs** | **17.34×** |
-| `MAX(decision_date)` via indexed edge | 2.1 µs | **0.2 µs** | **13.64×** |
-| `speaker = ? LIMIT 500` (covering text index) | 100.0 µs | **30.2 µs** | **3.31×** |
-| `year BETWEEN 2010 AND 2025 LIMIT 1000` | 812.9 µs | **250.8 µs** | **3.24×** |
-| `year IN (2020..2025) LIMIT 1000` | 768.5 µs | **261.3 µs** | **2.94×** |
-| `ORDER BY year LIMIT 1000` | 785.4 µs | **259.2 µs** | **3.03×** |
-| `COUNT(*) WHERE court='SGHC'` | 315.2 µs | **102.7 µs** | **3.07×** |
-| `COUNT(*) WHERE year BETWEEN 2010 AND 2025` | 255.4 µs | **108.9 µs** | **2.34×** |
+| `MAX(year)` via indexed edge | 1.9 µs | **0.1 µs** | **17.12×** |
+| `MAX(decision_date)` via indexed edge | 2.0 µs | **0.2 µs** | **12.31×** |
+| `SELECT year ... BETWEEN ... LIMIT 1000` (covering) | 165.9 µs | **29.4 µs** | **5.65×** |
+| `year BETWEEN 2010 AND 2025 LIMIT 5000` | 4,376.6 µs | **1,185.0 µs** | **3.69×** |
+| `speaker = ? LIMIT 500` (covering text index) | 97.3 µs | **28.4 µs** | **3.43×** |
+| `year BETWEEN 2010 AND 2025 LIMIT 1000` | 819.9 µs | **239.5 µs** | **3.42×** |
+| `ORDER BY year LIMIT 1000` | 783.4 µs | **233.3 µs** | **3.36×** |
+| `year IN (2020..2025) LIMIT 1000` | 784.0 µs | **241.2 µs** | **3.25×** |
+| `COUNT(*) WHERE court='SGHC'` | 302.6 µs | **99.2 µs** | **3.05×** |
+| `COUNT(*) WHERE year BETWEEN 2010 AND 2025` | 254.3 µs | **106.1 µs** | **2.40×** |
+| `court='SGHC' LIMIT 1000` | 816.1 µs | **371.1 µs** | **2.20×** |
+| `ORDER BY year DESC LIMIT 100` | 49.0 µs | **30.3 µs** | **1.62×** |
 
 The fast paths behind those numbers are deliberately narrow: prepared
 schema-aware SELECT plans, direct index-edge MIN/MAX, direct indexed COUNT for
 equality/range/IN predicates, index-range walks with early LIMIT stop,
-covering-index result slabs, and projected row hydration when a table lookup is
-still required.
+covering-index result slabs, hydrated result slabs, and projected row hydration
+when a table lookup is still required.
 
 **What makes it fast:**
 

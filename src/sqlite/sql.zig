@@ -2069,35 +2069,63 @@ fn projectSingleSourceRow(
     values: []const record.Value,
     columns: []const ResultColumn,
 ) SqlError![]ResultCell {
-    var out: std.ArrayList(ResultCell) = .empty;
-    errdefer {
-        for (out.items) |c| switch (c.value) {
-            .text => |t| allocator.free(t),
-            .blob => |b| allocator.free(b),
-            else => {},
-        };
-        out.deinit(allocator);
-    }
-    try out.ensureTotalCapacity(allocator, columns.len);
+    const out = try allocator.alloc(ResultCell, columns.len);
+    errdefer allocator.free(out);
+    _ = try fillSingleSourceRowCells(allocator, projections, source, rowid, values, columns, out);
+    return out;
+}
+
+fn fillSingleSourceRowCells(
+    allocator: std.mem.Allocator,
+    projections: []const ast.Projection,
+    source: Source,
+    rowid: i64,
+    values: []const record.Value,
+    columns: []const ResultColumn,
+    out: []ResultCell,
+) SqlError!bool {
+    if (out.len != columns.len) return error.InvalidSelect;
+
+    var out_idx: usize = 0;
+    var initialized: usize = 0;
+    var has_owned_payloads = false;
+    errdefer freeResultCellPayloads(out[0..initialized], allocator);
 
     for (projections) |p| switch (p) {
         .star => {
             for (source.info.columns, 0..) |c, idx| {
+                if (out_idx >= out.len) return error.InvalidSelect;
                 const v = rowColumnValue(source.info, rowid, values, idx);
-                out.appendAssumeCapacity(.{ .name = c.name, .value = try dupValue(allocator, v) });
+                const v_owned = try dupValue(allocator, v);
+                switch (v_owned) {
+                    .text, .blob => has_owned_payloads = true,
+                    else => {},
+                }
+                out[out_idx] = .{ .name = c.name, .value = v_owned };
+                out_idx += 1;
+                initialized = out_idx;
             }
         },
         .table_star => |qname| {
             if (!source.matches(qname)) return error.TableNotFound;
             for (source.info.columns, 0..) |c, idx| {
+                if (out_idx >= out.len) return error.InvalidSelect;
                 const v = rowColumnValue(source.info, rowid, values, idx);
-                out.appendAssumeCapacity(.{ .name = c.name, .value = try dupValue(allocator, v) });
+                const v_owned = try dupValue(allocator, v);
+                switch (v_owned) {
+                    .text, .blob => has_owned_payloads = true,
+                    else => {},
+                }
+                out[out_idx] = .{ .name = c.name, .value = v_owned };
+                out_idx += 1;
+                initialized = out_idx;
             }
         },
         .column => |col| {
             if (col.ref.qualifier) |q| {
                 if (!source.matches(q)) return error.ColumnNotFound;
             }
+            if (out_idx >= out.len) return error.InvalidSelect;
             const v = if (asciiEql(col.ref.name, "rowid"))
                 record.Value{ .integer = rowid }
             else blk: {
@@ -2105,12 +2133,20 @@ fn projectSingleSourceRow(
                 break :blk rowColumnValue(source.info, rowid, values, idx);
             };
             const label = col.alias orelse col.ref.name;
-            out.appendAssumeCapacity(.{ .name = label, .value = try dupValue(allocator, v) });
+            const v_owned = try dupValue(allocator, v);
+            switch (v_owned) {
+                .text, .blob => has_owned_payloads = true,
+                else => {},
+            }
+            out[out_idx] = .{ .name = label, .value = v_owned };
+            out_idx += 1;
+            initialized = out_idx;
         },
         .expr, .count_star, .aggregate => unreachable,
     };
 
-    return try out.toOwnedSlice(allocator);
+    if (out_idx != out.len) return error.InvalidSelect;
+    return has_owned_payloads;
 }
 
 fn rowColumnValue(info: catalog.TableInfo, rowid: i64, values: []const record.Value, idx: usize) record.Value {
@@ -2702,6 +2738,9 @@ fn buildFromSingleTable(
     const columns = try buildResultColumns(allocator, stmt.projections, sources);
     errdefer allocator.free(columns);
 
+    var cell_slab: ?[]ResultCell = null;
+    errdefer if (cell_slab) |slab| allocator.free(slab);
+
     var rows: std.ArrayList(ResultRow) = .empty;
     errdefer {
         for (rows.items) |r| r.deinit(allocator);
@@ -2738,6 +2777,24 @@ fn buildFromSingleTable(
         };
     }
 
+    var cell_slab_used: usize = 0;
+    var slab_has_owned_payloads = false;
+    if (simple_projection and columns.len > 0) {
+        const row_capacity: usize = if (direct_rowid != null)
+            (if (limit > 0) 1 else 0)
+        else if (indexed_rowids) |rids|
+            (if (limit > 0) @min(rids.len, @as(usize, @intCast(limit))) else 0)
+        else
+            0;
+        if (row_capacity > 0) {
+            try rows.ensureTotalCapacity(allocator, row_capacity);
+            if (row_capacity <= max_covering_slab_rows) {
+                if (columns.len > std.math.maxInt(usize) / row_capacity) return error.OutOfMemory;
+                cell_slab = try allocator.alloc(ResultCell, row_capacity * columns.len);
+            }
+        }
+    }
+
     // Helper: project one backing-table row through the projection list.
     const pushRow = struct {
         fn call(
@@ -2749,26 +2806,59 @@ fn buildFromSingleTable(
             simple_projection_inner: bool,
             row: table.Row,
             rows_out: *std.ArrayList(ResultRow),
+            cell_slab_inner: ?[]ResultCell,
+            cell_slab_used_inner: *usize,
+            slab_has_owned_payloads_inner: *bool,
         ) SqlError!void {
+            if (simple_projection_inner) {
+                if (cell_slab_inner) |slab| {
+                    const slab_start = cell_slab_used_inner.*;
+                    const end = slab_start + columns_inner.len;
+                    if (end > slab.len) return error.OutOfMemory;
+                    const out = slab[slab_start..end];
+                    cell_slab_used_inner.* = end;
+                    var filled = false;
+                    errdefer {
+                        if (filled) freeResultCellPayloads(out, out_alloc);
+                        cell_slab_used_inner.* = slab_start;
+                    }
+                    const has_owned = try fillSingleSourceRowCells(out_alloc, stmt_inner.projections, sources_inner[0], row.rowid, row.values, columns_inner, out);
+                    filled = true;
+                    try rows_out.append(out_alloc, .{ .rowid = row.rowid, .values = out, .values_owned = false });
+                    if (has_owned) slab_has_owned_payloads_inner.* = true;
+                    return;
+                }
+                const values = try projectSingleSourceRow(out_alloc, stmt_inner.projections, sources_inner[0], row.rowid, row.values, columns_inner);
+                errdefer {
+                    freeResultCellPayloads(values, out_alloc);
+                    out_alloc.free(values);
+                }
+                try rows_out.append(out_alloc, .{ .rowid = row.rowid, .values = values });
+                return;
+            }
+
             var tuple_buf: [1]SourcedRow = .{.{ .source_index = 0, .row = row }};
-            const values = if (simple_projection_inner)
-                try projectSingleSourceRow(out_alloc, stmt_inner.projections, sources_inner[0], row.rowid, row.values, columns_inner)
-            else
-                try projectTuple(out_alloc, stmt_inner.projections, sources_inner, &tuple_buf, columns_inner, scratch_alloc);
+            const values = try projectTuple(out_alloc, stmt_inner.projections, sources_inner, &tuple_buf, columns_inner, scratch_alloc);
+            errdefer {
+                freeResultCellPayloads(values, out_alloc);
+                out_alloc.free(values);
+            }
             try rows_out.append(out_alloc, .{ .rowid = row.rowid, .values = values });
         }
     }.call;
 
     if (direct_rowid) |rid| {
-        if (try findRowByRowidMaybeProjected(reader, info.root_page, rid, ascratch, projected_fetch, row_mask)) |found| {
-            try pushRow(allocator, ascratch, sources, stmt, columns, simple_projection, found, &rows);
+        if (limit > 0) {
+            if (try findRowByRowidMaybeProjected(reader, info.root_page, rid, ascratch, projected_fetch, row_mask)) |found| {
+                try pushRow(allocator, ascratch, sources, stmt, columns, simple_projection, found, &rows, cell_slab, &cell_slab_used, &slab_has_owned_payloads);
+            }
         }
     } else if (indexed_rowids) |rids| {
         var emitted: i64 = 0;
         for (rids) |rid| {
             if (emitted >= limit) break;
             if (try findRowByRowidMaybeProjected(reader, info.root_page, rid, ascratch, projected_fetch, row_mask)) |found| {
-                try pushRow(allocator, ascratch, sources, stmt, columns, simple_projection, found, &rows);
+                try pushRow(allocator, ascratch, sources, stmt, columns, simple_projection, found, &rows, cell_slab, &cell_slab_used, &slab_has_owned_payloads);
                 emitted += 1;
             }
         }
@@ -2778,6 +2868,8 @@ fn buildFromSingleTable(
         .columns = columns,
         .table_info = try cloneTableInfo(allocator, info),
         .rows = try rows.toOwnedSlice(allocator),
+        .cell_slab = cell_slab,
+        .values_have_owned_payloads = if (cell_slab != null) slab_has_owned_payloads else true,
     };
 }
 
@@ -3323,6 +3415,55 @@ test "covering index scan slab frees duplicated text payloads" {
     try testing.expect(!result.rows[0].values_owned);
     try testing.expectEqualStrings("Alice", result.rows[0].values[0].value.text);
     try testing.expectEqualStrings("Alice", result.rows[1].values[0].value.text);
+}
+
+test "hydrated indexed scan reuses scalar result slab" {
+    try skipIfNoSqlite();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmpDbPath(testing.allocator, tmp, "hydrated-slab.db");
+    defer testing.allocator.free(db_path);
+
+    try buildSqliteFixture(db_path,
+        \\CREATE TABLE t(id INTEGER PRIMARY KEY, year INTEGER, rank INTEGER, name TEXT);
+        \\CREATE INDEX idx_t_year ON t(year);
+        \\INSERT INTO t(id, year, rank, name) VALUES
+        \\  (1, 2020, 10, 'a'),
+        \\  (2, 2021, 20, 'b'),
+        \\  (3, 2022, 30, 'c'),
+        \\  (4, 2023, 40, 'd');
+    );
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, db_path, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(bytes);
+    const reader = try page.PageReader.init(bytes);
+    const db_schema = try schema.readSchema(reader, testing.allocator);
+    defer db_schema.deinit(testing.allocator);
+
+    const result = try executeSelect(reader, db_schema, "SELECT id, year, rank FROM t WHERE year BETWEEN 2020 AND 2022 LIMIT 3", testing.allocator);
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(result.cell_slab != null);
+    try testing.expect(!result.values_have_owned_payloads);
+    try testing.expectEqual(@as(usize, 3), result.rows.len);
+    try testing.expect(!result.rows[0].values_owned);
+    try testing.expectEqual(@as(i64, 1), result.rows[0].values[0].value.integer);
+    try testing.expectEqual(@as(i64, 2020), result.rows[0].values[1].value.integer);
+    try testing.expectEqual(@as(i64, 10), result.rows[0].values[2].value.integer);
+    try testing.expectEqual(@as(i64, 3), result.rows[2].values[0].value.integer);
+    try testing.expectEqual(@as(i64, 2022), result.rows[2].values[1].value.integer);
+    try testing.expectEqual(@as(i64, 30), result.rows[2].values[2].value.integer);
+
+    const text_result = try executeSelect(reader, db_schema, "SELECT id, year, name FROM t WHERE year BETWEEN 2020 AND 2021 LIMIT 2", testing.allocator);
+    defer text_result.deinit(testing.allocator);
+
+    try testing.expect(text_result.cell_slab != null);
+    try testing.expect(text_result.values_have_owned_payloads);
+    try testing.expectEqual(@as(usize, 2), text_result.rows.len);
+    try testing.expect(!text_result.rows[0].values_owned);
+    try testing.expectEqualStrings("a", text_result.rows[0].values[2].value.text);
+    try testing.expectEqualStrings("b", text_result.rows[1].values[2].value.text);
 }
 
 test "filtered count uses indexed range and in-list counts" {
